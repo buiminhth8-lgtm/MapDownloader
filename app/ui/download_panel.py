@@ -1,0 +1,242 @@
+"""下载配置面板。
+
+只负责"把用户输入收集成结构化数据"（``get_form_data``）以及把用户的动作
+以信号形式抛出去。真正的计算、下载、打包都在 ``app.geo`` /
+``app.downloader`` / ``app.package`` 中实现，本文件不写任何业务逻辑。
+
+Slice 0 范围：UI 与数据读取；按钮仅发信号，由 MainWindow 决定如何响应。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import Signal, Slot
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.config.settings import (
+    DEFAULT_MAX_ZOOM,
+    DEFAULT_MIN_ZOOM,
+    DEFAULT_OUTPUT_DIR,
+    MAX_SUPPORTED_ZOOM,
+    MIN_SUPPORTED_ZOOM,
+)
+from app.models.map_layer import LAYER_DISPLAY_NAMES, MapLayerType
+
+#: 地图类型下拉框只放"底图"，中文注记由独立复选框控制
+_BASE_LAYER_CHOICES: tuple[MapLayerType, ...] = (
+    MapLayerType.VECTOR,
+    MapLayerType.IMAGE,
+)
+
+#: 动作标识，与 MainWindow 的响应逻辑一一对应
+ACTION_CALCULATE = "calculate"
+ACTION_START = "start"
+ACTION_PAUSE = "pause"
+ACTION_RESUME = "resume"
+
+
+class DownloadPanel(QGroupBox):
+    """地图配置 / 下载区域。"""
+
+    #: 用户点击了某个动作按钮，参数为 ``ACTION_*`` 之一
+    action_requested = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__("地图配置 / 下载区域", parent)
+
+        self._build_general_form()
+        self._build_area_form()
+        self._build_output_form()
+        self._build_buttons()
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(self._general_form)
+        layout.addWidget(self._area_group)
+        layout.addLayout(self._output_form)
+        layout.addLayout(self._button_row)
+        layout.addStretch(1)
+
+    # ------------------------------------------------------------------ #
+    # 构建子区域
+    # ------------------------------------------------------------------ #
+    def _build_general_form(self) -> None:
+        self._token_edit = QLineEdit(self)
+        self._token_edit.setPlaceholderText("天地图服务密钥（tk），例如 abcd...")
+        self._token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self._show_token_check = QCheckBox("显示", self)
+        self._show_token_check.setToolTip("临时显示明文 Token")
+
+        token_row = QHBoxLayout()
+        token_row.addWidget(self._token_edit, 1)
+        token_row.addWidget(self._show_token_check)
+
+        self._map_type_combo = QComboBox(self)
+        for layer in _BASE_LAYER_CHOICES:
+            self._map_type_combo.addItem(LAYER_DISPLAY_NAMES[layer], layer)
+
+        self._labels_check = QCheckBox("下载中文注记图层", self)
+        self._labels_check.setChecked(True)
+
+        self._general_form = QFormLayout()
+        self._general_form.addRow("Token", token_row)
+        self._general_form.addRow("地图类型", self._map_type_combo)
+        self._general_form.addRow("中文注记", self._labels_check)
+
+        self._show_token_check.toggled.connect(self._on_show_token_toggled)
+
+    def _build_area_form(self) -> None:
+        self._west_spin = self._make_lon_spin(-180.0, 180.0, 116.0)
+        self._south_spin = self._make_lat_spin(-90.0, 90.0, 39.0)
+        self._east_spin = self._make_lon_spin(-180.0, 180.0, 117.0)
+        self._north_spin = self._make_lat_spin(-90.0, 90.0, 40.0)
+
+        self._min_zoom_spin = QSpinBox(self)
+        self._min_zoom_spin.setRange(MIN_SUPPORTED_ZOOM, MAX_SUPPORTED_ZOOM)
+        self._min_zoom_spin.setValue(DEFAULT_MIN_ZOOM)
+
+        self._max_zoom_spin = QSpinBox(self)
+        self._max_zoom_spin.setRange(MIN_SUPPORTED_ZOOM, MAX_SUPPORTED_ZOOM)
+        self._max_zoom_spin.setValue(DEFAULT_MAX_ZOOM)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("West", self), 0, 0)
+        grid.addWidget(self._west_spin, 0, 1)
+        grid.addWidget(QLabel("East", self), 0, 2)
+        grid.addWidget(self._east_spin, 0, 3)
+        grid.addWidget(QLabel("South", self), 1, 0)
+        grid.addWidget(self._south_spin, 1, 1)
+        grid.addWidget(QLabel("North", self), 1, 2)
+        grid.addWidget(self._north_spin, 1, 3)
+        grid.addWidget(QLabel("Min Zoom", self), 2, 0)
+        grid.addWidget(self._min_zoom_spin, 2, 1)
+        grid.addWidget(QLabel("Max Zoom", self), 2, 2)
+        grid.addWidget(self._max_zoom_spin, 2, 3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+
+        self._area_group = QGroupBox("下载范围（WGS84 经纬度）", self)
+        self._area_group.setLayout(grid)
+
+    def _build_output_form(self) -> None:
+        self._output_edit = QLineEdit(str(DEFAULT_OUTPUT_DIR), self)
+        self._output_edit.setPlaceholderText("离线包输出目录")
+
+        self._browse_button = QPushButton("浏览…", self)
+
+        output_row = QHBoxLayout()
+        output_row.addWidget(self._output_edit, 1)
+        output_row.addWidget(self._browse_button)
+
+        self._output_form = QFormLayout()
+        self._output_form.addRow("输出目录", output_row)
+
+        self._browse_button.clicked.connect(self._on_browse_clicked)
+
+    def _build_buttons(self) -> None:
+        self._calculate_button = QPushButton("计算", self)
+        self._start_button = QPushButton("开始下载", self)
+        self._pause_button = QPushButton("暂停", self)
+        self._resume_button = QPushButton("继续", self)
+
+        self._action_buttons: dict[str, QPushButton] = {
+            ACTION_CALCULATE: self._calculate_button,
+            ACTION_START: self._start_button,
+            ACTION_PAUSE: self._pause_button,
+            ACTION_RESUME: self._resume_button,
+        }
+
+        self._button_row = QHBoxLayout()
+        for action, button in self._action_buttons.items():
+            button.setProperty("action_id", action)
+            button.clicked.connect(
+                lambda _checked=False, a=action: self.action_requested.emit(a)
+            )
+            self._button_row.addWidget(button)
+
+    # ------------------------------------------------------------------ #
+    # 控件工厂
+    # ------------------------------------------------------------------ #
+    def _make_lon_spin(self, low: float, high: float, value: float) -> QDoubleSpinBox:
+        """经度输入框（-180 ~ 180，6 位小数）。"""
+        spin = QDoubleSpinBox(self)
+        spin.setRange(low, high)
+        spin.setDecimals(6)
+        spin.setSingleStep(0.001)
+        spin.setValue(value)
+        return spin
+
+    def _make_lat_spin(self, low: float, high: float, value: float) -> QDoubleSpinBox:
+        """纬度输入框（-90 ~ 90，6 位小数）。"""
+        return self._make_lon_spin(low, high, value)
+
+    # ------------------------------------------------------------------ #
+    # 对外接口
+    # ------------------------------------------------------------------ #
+    def get_form_data(self) -> dict:
+        """读取当前表单内容。
+
+        Returns:
+            dict，键与含义::
+
+                token           str            天地图密钥
+                map_type        MapLayerType   底图图层枚举成员
+                with_labels     bool           是否下载中文注记
+                west            float          西边界经度
+                south           float          南边界纬度
+                east            float          东边界经度
+                north           float          北边界纬度
+                min_zoom        int            最小缩放级别
+                max_zoom        int            最大缩放级别
+                output_dir      pathlib.Path   输出目录
+        """
+        return {
+            "token": self._token_edit.text().strip(),
+            "map_type": self._map_type_combo.currentData() or MapLayerType.VECTOR,
+            "with_labels": self._labels_check.isChecked(),
+            "west": self._west_spin.value(),
+            "south": self._south_spin.value(),
+            "east": self._east_spin.value(),
+            "north": self._north_spin.value(),
+            "min_zoom": self._min_zoom_spin.value(),
+            "max_zoom": self._max_zoom_spin.value(),
+            "output_dir": Path(self._output_edit.text().strip()),
+        }
+
+    @property
+    def action_buttons(self) -> dict[str, QPushButton]:
+        """动作按钮字典（只读用途，如测试点击或后续禁用/启用）。"""
+        return dict(self._action_buttons)
+
+    # ------------------------------------------------------------------ #
+    # 内部槽
+    # ------------------------------------------------------------------ #
+    @Slot(bool)
+    def _on_show_token_toggled(self, visible: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        self._token_edit.setEchoMode(mode)
+
+    @Slot()
+    def _on_browse_clicked(self) -> None:
+        current = self._output_edit.text().strip() or str(DEFAULT_OUTPUT_DIR)
+        chosen = QFileDialog.getExistingDirectory(
+            self, "选择离线包输出目录", current
+        )
+        if chosen:
+            self._output_edit.setText(chosen)
