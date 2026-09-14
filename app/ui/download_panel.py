@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Signal, Slot
+from PySide6.QtCore import QSize, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -63,6 +63,9 @@ _COORD_SPIN_MIN_WIDTH = 118
 #: 横向滚动条。这里把最小宽度收敛到"放得下 11 个字符 + 箭头"的宽度。
 _COORD_SPIN_MIN_WIDTH = 124
 
+#: 未计算时结果区展示的占位文案
+_RESULT_PLACEHOLDER = "尚未计算"
+
 
 class _CoordSpinBox(QDoubleSpinBox):
     """收窄最小宽度的经纬度输入框（见 ``_COORD_SPIN_MIN_WIDTH`` 说明）。
@@ -89,12 +92,14 @@ class DownloadPanel(QGroupBox):
         self._build_area_form()
         self._build_output_form()
         self._build_buttons()
+        self._build_result_area()
 
         layout = QVBoxLayout(self)
         layout.addLayout(self._general_form)
         layout.addWidget(self._area_group)
         layout.addLayout(self._output_form)
         layout.addLayout(self._button_row)
+        layout.addWidget(self._result_group)
         layout.addStretch(1)
 
     # ------------------------------------------------------------------ #
@@ -195,6 +200,22 @@ class DownloadPanel(QGroupBox):
             )
             self._button_row.addWidget(button)
 
+    def _build_result_area(self) -> None:
+        """瓦片计算结果区。
+
+        Slice 1 起由 MainWindow 调用 :meth:`set_calculation_result` 写入，
+        面板自身不计算任何瓦片数据（公式统一在 ``app.geo``）。
+        """
+        self._result_label = QLabel(_RESULT_PLACEHOLDER, self)
+        self._result_label.setWordWrap(True)
+        self._result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self._result_group = QGroupBox("预估结果", self)
+        group_layout = QVBoxLayout(self._result_group)
+        group_layout.addWidget(self._result_label)
+
     # ------------------------------------------------------------------ #
     # 控件工厂
     # ------------------------------------------------------------------ #
@@ -251,6 +272,34 @@ class DownloadPanel(QGroupBox):
     def action_buttons(self) -> dict[str, QPushButton]:
         """动作按钮字典（只读用途，如测试点击或后续禁用/启用）。"""
         return dict(self._action_buttons)
+
+    # ------------------------------------------------------------------ #
+    # 结果展示
+    # ------------------------------------------------------------------ #
+    def set_calculation_result(self, tile_count: int, size_text: str) -> None:
+        """展示瓦片计算成功的结果。
+
+        Args:
+            tile_count: 预计瓦片数量。
+            size_text: 已格式化好的容量文本（如 ``361.93 MB``），
+                由调用方通过 ``app.geo.format_size`` 生成。
+        """
+        self._result_label.setText(
+            f"预计瓦片：{tile_count:,}\n预计容量：{size_text}"
+        )
+
+    def set_calculation_error(self, message: str) -> None:
+        """展示计算失败原因（不弹窗，弹窗由调用方决定）。"""
+        self._result_label.setText(f"计算失败：{message}")
+
+    def clear_calculation_result(self) -> None:
+        """恢复成未计算状态。"""
+        self._result_label.setText(_RESULT_PLACEHOLDER)
+
+    @property
+    def result_label(self) -> QLabel:
+        """暴露结果标签，便于测试与后续扩展。"""
+        return self._result_label
 
     # ------------------------------------------------------------------ #
     # 内部槽

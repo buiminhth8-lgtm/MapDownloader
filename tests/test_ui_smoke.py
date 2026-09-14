@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.config import settings
+from app.geo import GeoBounds, estimate_size_bytes, estimate_tile_count, format_size
 from app.main import STARTUP_MESSAGES, _report_startup
 from app.models import MapLayerType
 from app.ui.device_panel import DevicePanel
@@ -174,3 +175,99 @@ def test_startup_messages_are_reported(window: MainWindow) -> None:
     text = window.log_panel.to_text()
     for message in STARTUP_MESSAGES:
         assert message in text
+
+
+# --------------------------------------------------------------------------- #
+# "计算" 按钮接入 Tile Math（Slice 1）
+# --------------------------------------------------------------------------- #
+def test_calculate_button_renders_estimate(window: MainWindow) -> None:
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+
+    text = window.download_panel.result_label.text()
+    assert "预计瓦片：" in text
+    assert "预计容量：" in text
+    assert "计算失败" not in text
+
+
+def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
+    """UI 展示的数字必须来自 app.geo，而不是在界面层重算。"""
+    panel = window.download_panel
+    panel._min_zoom_spin.setValue(8)
+    panel._max_zoom_spin.setValue(17)
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+
+    data = panel.get_form_data()
+    bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
+    expected_count = estimate_tile_count(bounds, 8, 17)
+    expected_size = format_size(estimate_size_bytes(expected_count))
+
+    assert panel.result_label.text() == (
+        f"预计瓦片：{expected_count:,}\n预计容量：{expected_size}"
+    )
+    assert window._status_values["tile_total"].text() == f"{expected_count:,}"
+    assert "瓦片计算完成" in window.log_panel.to_text()
+
+
+def test_calculate_logs_per_zoom_breakdown(window: MainWindow) -> None:
+    panel = window.download_panel
+    panel._min_zoom_spin.setValue(9)
+    panel._max_zoom_spin.setValue(11)
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    text = window.log_panel.to_text()
+    assert "各级瓦片数：" in text
+    for zoom in (9, 10, 11):
+        assert f"z{zoom}=" in text
+
+
+def test_calculate_without_running_the_ui_does_not_crash(window: MainWindow, monkeypatch) -> None:
+    """默认值非法时不弹模态框、不崩溃，错误信息落到结果区与日志。"""
+    monkeypatch.setattr(window, "_show_error_dialog", lambda *a, **k: None)
+    panel = window.download_panel
+    # 把东边界挪到西边界左侧，构造非法范围
+    panel._east_spin.setValue(100.0)
+
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    assert "计算失败" in panel.result_label.text()
+    assert "west 必须小于 east" in panel.result_label.text()
+    assert "瓦片计算失败" in window.log_panel.to_text()
+
+
+def test_calculate_invalid_zoom_range_reports_error(window: MainWindow, monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window, "_show_error_dialog", lambda title, message: calls.append((title, message))
+    )
+
+    panel = window.download_panel
+    panel._min_zoom_spin.setValue(17)
+    panel._max_zoom_spin.setValue(8)
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    assert "min_zoom 不能大于 max_zoom" in panel.result_label.text()
+    assert calls and calls[0][0] == "瓦片计算失败"
+
+
+def test_calculate_success_does_not_open_error_dialog(window: MainWindow, monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window, "_show_error_dialog", lambda title, message: calls.append((title, message))
+    )
+
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+
+    assert calls == []
+    assert "预计瓦片：" in window.download_panel.result_label.text()
+
+
+def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
+    """Slice 1 不能破坏 Slice 0 的其他区域。"""
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+
+    assert window.status_group.title() == "下载状态"
+    assert window.device_panel.device_list.count() == 1
+    assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
+    refresh_button, _ = window.device_panel.buttons
+    refresh_button.click()  # Slice 0 的占位动作仍然可用
+    assert "Slice 4" in window.log_panel.to_text()

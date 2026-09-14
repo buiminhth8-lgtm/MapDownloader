@@ -16,6 +16,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QApplication
 
 # 允许直接以脚本方式运行（脚本位于 scripts/ 下，需要把项目根加入 sys.path）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +46,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def pump(app: "QApplication", times: int = 3) -> None:
+    """空转事件循环若干轮。
+
+    嵌套 QGroupBox / QLabel(wordWrap) 的布局不是一轮 processEvents 就能收敛的，
+    只跑一轮会截到被压扁的控件（例如结果区第二行被裁掉）。
+    """
+    for _ in range(times):
+        app.processEvents()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -59,12 +73,12 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.show()
-    app.processEvents()
+    pump(app)
 
     _report_startup(window)
     # 触发一次占位动作，让日志区体现 UI -> 数据模型 的读取链路
     window.download_panel.action_buttons["calculate"].click()
-    app.processEvents()
+    pump(app)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     pixmap = window.grab()

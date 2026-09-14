@@ -30,6 +30,12 @@ from app.config.settings import (
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
 )
+from app.geo import (
+    GeoBounds,
+    calculate_tile_ranges,
+    estimate_size_bytes,
+    format_size,
+)
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
     ACTION_CALCULATE,
@@ -48,7 +54,7 @@ _RIGHT_COLUMN_WIDTH = 360
 
 #: 各占位动作对应的"未来实现位置"说明
 _ACTION_HINTS: dict[str, str] = {
-    ACTION_CALCULATE: "瓦片数量计算（Tile Math）将在 Slice 1 实现",
+    ACTION_CALCULATE: "按当前范围计算瓦片数量与预估容量（Slice 1 已实现）",
     ACTION_START: "瓦片下载器将在 Slice 2 实现",
     ACTION_PAUSE: "暂停 / 继续将在 Slice 2 随下载器一起实现",
     ACTION_RESUME: "暂停 / 继续将在 Slice 2 随下载器一起实现",
@@ -190,7 +196,64 @@ class MainWindow(QMainWindow):
         self.log_panel.append_log(f"触发动作：{action} — {hint}")
         if action in (ACTION_CALCULATE, ACTION_START):
             self._log_form_snapshot()
+        if action == ACTION_CALCULATE:
+            self._run_tile_math()
+            return
         self.statusBar().showMessage(hint, 5000)
+
+    # ------------------------------------------------------------------ #
+    # 槽：瓦片计算（Slice 1）
+    # ------------------------------------------------------------------ #
+    @Slot()
+    def _run_tile_math(self) -> None:
+        """把当前表单交给 ``app.geo`` 计算瓦片数量与预估容量。
+
+        本方法只做"读表单 → 调 geo → 展示"，不复制任何瓦片公式。
+        """
+        data = self.download_panel.get_form_data()
+        try:
+            bounds = GeoBounds(
+                west=data["west"],
+                south=data["south"],
+                east=data["east"],
+                north=data["north"],
+            )
+            ranges = calculate_tile_ranges(bounds, data["min_zoom"], data["max_zoom"])
+            total = sum(item.tile_count for item in ranges)
+            size_text = format_size(estimate_size_bytes(total))
+        except ValueError as exc:
+            self._report_calculation_error(str(exc))
+            return
+
+        self.download_panel.set_calculation_result(total, size_text)
+        self._status_values["tile_total"].setText(f"{total:,}")
+        self.log_panel.append_log(
+            f"瓦片计算完成：范围={bounds.as_tuple()}，"
+            f"缩放={data['min_zoom']}~{data['max_zoom']}（{len(ranges)} 级），"
+            f"预计瓦片 {total:,}，预计容量 {size_text}"
+        )
+        self.log_panel.append_log(
+            "各级瓦片数：" + "，".join(f"z{r.zoom}={r.tile_count:,}" for r in ranges)
+        )
+        self.statusBar().showMessage(f"预计瓦片 {total:,} · 预计容量 {size_text}", 8000)
+
+    def _report_calculation_error(self, message: str) -> None:
+        """统一的错误出口：结果区 + 日志 + 状态栏 + 弹窗。"""
+        self.download_panel.set_calculation_error(message)
+        self.log_panel.append_log(f"瓦片计算失败：{message}", "ERROR")
+        self.statusBar().showMessage(f"瓦片计算失败：{message}", 8000)
+        self._show_error_dialog("瓦片计算失败", message)
+
+    def _show_error_dialog(self, title: str, message: str) -> None:
+        """非模态错误提示。
+
+        刻意不用 ``QMessageBox.warning()``（它会阻塞事件循环，
+        在无头测试环境里会直接把用例挂死）；这里用 ``show()`` 走非阻塞路径，
+        错误信息同时已经落到结果区、日志和状态栏，不会被漏掉。
+        """
+        dialog = QMessageBox(QMessageBox.Icon.Warning, title, message, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
 
     def _log_form_snapshot(self) -> None:
         """把当前表单内容落到日志，验证 UI -> 数据模型 的读取链路。"""
