@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import QSize, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -49,6 +49,31 @@ ACTION_CALCULATE = "calculate"
 ACTION_START = "start"
 ACTION_PAUSE = "pause"
 ACTION_RESUME = "resume"
+
+#: 经纬度输入框的最小宽度。
+#: QDoubleSpinBox 的 minimumSizeHint 会按最大位数（``-180.000000``）+ 调节箭头
+#: 保守估算到 168px，两个一行会把左侧配置列撑到 600px 以上并挤出横向滚动条。
+#: 这里显式收窄到"够放下 ±180.000000 + 箭头"的宽度。
+_COORD_SPIN_MIN_WIDTH = 118
+
+
+#: 经纬度输入框的最小宽度。
+#: QDoubleSpinBox 的 ``minimumSizeHint`` 会按最大位数（``-180.000000``，11 字符）
+#: 加上调节箭头，保守估算到 168px；两个一行会把左侧配置列撑到 600px 以上并挤出
+#: 横向滚动条。这里把最小宽度收敛到"放得下 11 个字符 + 箭头"的宽度。
+_COORD_SPIN_MIN_WIDTH = 124
+
+
+class _CoordSpinBox(QDoubleSpinBox):
+    """收窄最小宽度的经纬度输入框（见 ``_COORD_SPIN_MIN_WIDTH`` 说明）。
+
+    注意：``setMinimumWidth()`` 无法生效，因为 ``QLayout`` 取的是
+    ``minimumSize`` 与 ``minimumSizeHint`` 的较大值，必须重写 ``minimumSizeHint``。
+    """
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt 命名约定
+        hint = super().minimumSizeHint()
+        return QSize(min(hint.width(), _COORD_SPIN_MIN_WIDTH), hint.height())
 
 
 class DownloadPanel(QGroupBox):
@@ -175,11 +200,14 @@ class DownloadPanel(QGroupBox):
     # ------------------------------------------------------------------ #
     def _make_lon_spin(self, low: float, high: float, value: float) -> QDoubleSpinBox:
         """经度输入框（-180 ~ 180，6 位小数）。"""
-        spin = QDoubleSpinBox(self)
+        spin = _CoordSpinBox(self)
         spin.setRange(low, high)
         spin.setDecimals(6)
         spin.setSingleStep(0.001)
         spin.setValue(value)
+        # 重写 minimumSizeHint 还不够：QLayout 在控件显式设置了 minimumSize 时
+        # 会优先采用它，因此这里必须同时 setMinimumWidth 才能真正收窄。
+        spin.setMinimumWidth(_COORD_SPIN_MIN_WIDTH)
         return spin
 
     def _make_lat_spin(self, low: float, high: float, value: float) -> QDoubleSpinBox:

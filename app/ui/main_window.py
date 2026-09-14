@@ -40,8 +40,11 @@ from app.ui.download_panel import (
 )
 from app.ui.log_panel import LogPanel
 
-#: 左侧配置列的建议宽度
-_LEFT_COLUMN_WIDTH = 440
+#: 左侧配置列的偏好宽度（实际取值为它与"内容最小宽度"的较大者）
+_LEFT_COLUMN_WIDTH = 460
+
+#: 右侧设备/日志列的最小宽度
+_RIGHT_COLUMN_WIDTH = 360
 
 #: 各占位动作对应的"未来实现位置"说明
 _ACTION_HINTS: dict[str, str] = {
@@ -140,7 +143,15 @@ class MainWindow(QMainWindow):
         left_scroll = QScrollArea(self)
         left_scroll.setWidgetResizable(True)
         left_scroll.setWidget(left_content)
-        left_scroll.setMinimumWidth(_LEFT_COLUMN_WIDTH)
+
+        # 左列宽度自适应：取"偏好宽度"与"内容实际最小宽度"的较大值。
+        # 控件最小宽度会随字体 / DPI / 本地化文案变化，写死常量容易出现横向滚动条。
+        left_content.layout().activate()
+        left_width = max(
+            _LEFT_COLUMN_WIDTH,
+            left_content.minimumSizeHint().width() + 2 * left_scroll.frameWidth() + 2,
+        )
+        left_scroll.setMinimumWidth(left_width)
 
         # 右列：设备（上）+ 日志（下），日志占主要空间
         right_splitter = QSplitter(Qt.Orientation.Vertical, self)
@@ -155,7 +166,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_splitter)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([_LEFT_COLUMN_WIDTH, DEFAULT_WINDOW_WIDTH - _LEFT_COLUMN_WIDTH])
+        splitter.setSizes(
+            [left_width, max(DEFAULT_WINDOW_WIDTH - left_width, _RIGHT_COLUMN_WIDTH)]
+        )
 
         self.splitter = splitter
         self.setCentralWidget(splitter)

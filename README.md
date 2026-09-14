@@ -35,6 +35,15 @@ python -m app.main
 python -m pytest
 ```
 
+测试在 Qt ``offscreen`` 平台下运行（见 `tests/conftest.py`），无需真实显示器。
+
+## 界面留档
+
+```bash
+python scripts/capture_ui.py                   # 渲染主窗口为 ui_main_window.png
+python scripts/capture_ui.py --offscreen       # 无显示环境（离屏渲染）
+```
+
 ## 目录结构
 
 ```text
@@ -52,7 +61,7 @@ tianditu-offline-tool/
 │   └── android/           ADB 设备管理与导入（Slice 4+）
 ├── tests/                  pytest 用例
 ├── docs/                   设计文档
-├── scripts/               辅助脚本
+├── scripts/capture_ui.py   界面截图留档脚本
 └── requirements.txt
 ```
 
