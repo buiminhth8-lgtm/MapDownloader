@@ -24,6 +24,31 @@ class MapLayerType(Enum):
     # 便捷属性
     # ------------------------------------------------------------------ #
     @property
+    def service_name(self) -> str:
+        """WMTS 请求中 ``LAYER`` 参数的值。
+
+        天地图把图层标识拆成两处：URL 路径用完整标识（``vec_w``），
+        ``LAYER`` 参数只用后半段（``vec``）。
+
+        >>> MapLayerType.VECTOR.service_name
+        'vec'
+        >>> MapLayerType.IMAGE_LABEL.service_name
+        'cia'
+        """
+        head, _, matrix_set = self.value.partition("_")
+        if not head or not matrix_set:
+            raise ValueError(f"图层标识格式非法：{self.value!r}，期望形如 'vec_w'")
+        return head
+
+    @property
+    def matrix_set(self) -> str:
+        """瓦片矩阵集标识（``vec_w`` 的 ``w`` 表示 Web 墨卡托）。"""
+        _, _, matrix_set = self.value.partition("_")
+        if not matrix_set:
+            raise ValueError(f"图层标识格式非法：{self.value!r}，期望形如 'vec_w'")
+        return matrix_set
+
+    @property
     def is_label(self) -> bool:
         """是否为注记（文字标注）图层。"""
         return self in (MapLayerType.VECTOR_LABEL, MapLayerType.IMAGE_LABEL)

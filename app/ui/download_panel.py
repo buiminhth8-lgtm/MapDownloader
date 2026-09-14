@@ -9,6 +9,7 @@ Slice 0 范围：UI 与数据读取；按钮仅发信号，由 MainWindow 决定
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal, Slot
@@ -49,13 +50,7 @@ ACTION_CALCULATE = "calculate"
 ACTION_START = "start"
 ACTION_PAUSE = "pause"
 ACTION_RESUME = "resume"
-
-#: 经纬度输入框的最小宽度。
-#: QDoubleSpinBox 的 minimumSizeHint 会按最大位数（``-180.000000``）+ 调节箭头
-#: 保守估算到 168px，两个一行会把左侧配置列撑到 600px 以上并挤出横向滚动条。
-#: 这里显式收窄到"够放下 ±180.000000 + 箭头"的宽度。
-_COORD_SPIN_MIN_WIDTH = 118
-
+ACTION_TEST_CONNECTION = "test_connection"
 
 #: 经纬度输入框的最小宽度。
 #: QDoubleSpinBox 的 ``minimumSizeHint`` 会按最大位数（``-180.000000``，11 字符）
@@ -65,6 +60,9 @@ _COORD_SPIN_MIN_WIDTH = 124
 
 #: 未计算时结果区展示的占位文案
 _RESULT_PLACEHOLDER = "尚未计算"
+
+#: 未做连通性测试时展示的占位文案
+_CONNECTION_PLACEHOLDER = "尚未测试"
 
 
 class _CoordSpinBox(QDoubleSpinBox):
@@ -93,6 +91,7 @@ class DownloadPanel(QGroupBox):
         self._build_output_form()
         self._build_buttons()
         self._build_result_area()
+        self._build_connection_area()
 
         layout = QVBoxLayout(self)
         layout.addLayout(self._general_form)
@@ -100,6 +99,7 @@ class DownloadPanel(QGroupBox):
         layout.addLayout(self._output_form)
         layout.addLayout(self._button_row)
         layout.addWidget(self._result_group)
+        layout.addWidget(self._connection_group)
         layout.addStretch(1)
 
     # ------------------------------------------------------------------ #
@@ -184,12 +184,17 @@ class DownloadPanel(QGroupBox):
         self._start_button = QPushButton("开始下载", self)
         self._pause_button = QPushButton("暂停", self)
         self._resume_button = QPushButton("继续", self)
+        self._test_connection_button = QPushButton("测试天地图连接", self)
+        self._test_connection_button.setToolTip(
+            "取当前范围的中心点，请求单张瓦片验证 Token 与网络（不会下载整个区域）"
+        )
 
         self._action_buttons: dict[str, QPushButton] = {
             ACTION_CALCULATE: self._calculate_button,
             ACTION_START: self._start_button,
             ACTION_PAUSE: self._pause_button,
             ACTION_RESUME: self._resume_button,
+            ACTION_TEST_CONNECTION: self._test_connection_button,
         }
 
         self._button_row = QHBoxLayout()
@@ -215,6 +220,22 @@ class DownloadPanel(QGroupBox):
         self._result_group = QGroupBox("预估结果", self)
         group_layout = QVBoxLayout(self._result_group)
         group_layout.addWidget(self._result_label)
+
+    def _build_connection_area(self) -> None:
+        """天地图服务连通性测试结果区。
+
+        与"预估结果"分开，因为二者的触发入口与生命周期不同：
+        计算结果是配置的派生值，连接结果是服务端的一次性反馈。
+        """
+        self._connection_label = QLabel(_CONNECTION_PLACEHOLDER, self)
+        self._connection_label.setWordWrap(True)
+        self._connection_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self._connection_group = QGroupBox("天地图连接", self)
+        group_layout = QVBoxLayout(self._connection_group)
+        group_layout.addWidget(self._connection_label)
 
     # ------------------------------------------------------------------ #
     # 控件工厂
@@ -300,6 +321,41 @@ class DownloadPanel(QGroupBox):
     def result_label(self) -> QLabel:
         """暴露结果标签，便于测试与后续扩展。"""
         return self._result_label
+
+    # ------------------------------------------------------------------ #
+    # 连通性测试展示（Slice 2）
+    # ------------------------------------------------------------------ #
+    def set_connection_testing(self, testing: bool) -> None:
+        """进入 / 退出"测试中"状态。
+
+        测试期间按钮禁用，避免重复发起请求；测试完成后必须调用
+        ``set_connection_testing(False)`` 恢复。
+        """
+        self._test_connection_button.setEnabled(not testing)
+        if testing:
+            self._connection_label.setText("正在测试天地图连接…")
+
+    def set_connection_result(self, lines: Sequence[str]) -> None:
+        """展示连通性测试结果（多行，每行一条信息）。"""
+        self._connection_label.setText("\n".join(lines))
+
+    def set_connection_error(self, message: str) -> None:
+        """展示连通性测试失败原因。"""
+        self._connection_label.setText(f"连接失败：{message}")
+
+    def clear_connection_result(self) -> None:
+        """恢复成未测试状态。"""
+        self._connection_label.setText(_CONNECTION_PLACEHOLDER)
+
+    @property
+    def connection_label(self) -> QLabel:
+        """暴露连通性测试结果标签。"""
+        return self._connection_label
+
+    @property
+    def test_connection_button(self) -> QPushButton:
+        """暴露"测试天地图连接"按钮。"""
+        return self._test_connection_button
 
     # ------------------------------------------------------------------ #
     # 内部槽

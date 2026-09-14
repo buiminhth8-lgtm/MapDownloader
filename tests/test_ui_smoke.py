@@ -1,29 +1,52 @@
 """GUI 冒烟测试。
 
-在 offscreen 平台下装配主窗口，覆盖 Slice 0 的验收点：
-区域齐全、默认值正确、占位按钮点击不崩、启动日志可写入。
+在 offscreen 平台下装配主窗口，覆盖：
+
+- Slice 0：区域齐全、默认值正确、占位按钮点击不崩、启动日志可写入
+- Slice 1："计算"按钮接入 Tile Math
+- Slice 2："测试天地图连接"按钮接入 Provider（网络用 MockTransport 打桩）
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+from PySide6.QtCore import QThread
 
+import app.ui.main_window as main_window_module
 from app.config import settings
-from app.geo import GeoBounds, estimate_size_bytes, estimate_tile_count, format_size
+from app.geo import (
+    GeoBounds,
+    estimate_size_bytes,
+    estimate_tile_count,
+    format_size,
+    lat_to_tile_y,
+    lon_to_tile_x,
+)
 from app.main import STARTUP_MESSAGES, _report_startup
 from app.models import MapLayerType
+from app.providers import PNG_SIGNATURE, TiandituProvider
+from app.ui.connection_check import ConnectionTestWorker
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
     ACTION_CALCULATE,
     ACTION_PAUSE,
     ACTION_RESUME,
     ACTION_START,
+    ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
+
+#: 假 Token（禁止替换为真实密钥）
+FAKE_TOKEN = "abcdefghijklmn"
+
+#: 只需文件头正确，校验逻辑按 magic bytes 判定
+FAKE_PNG = PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + b"tile-payload" * 32
 
 
 @pytest.fixture()
@@ -33,6 +56,54 @@ def window(qapp) -> MainWindow:
     yield win
     win.close()
     win.deleteLater()
+
+
+@pytest.fixture()
+def error_dialogs(monkeypatch, window: MainWindow) -> list[tuple[str, str]]:
+    """把非模态错误弹窗替换成记录器，便于断言（同时避免用例弹窗）。"""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window, "_show_error_dialog", lambda title, message: calls.append((title, message))
+    )
+    return calls
+
+
+def _png_handler(
+    status_code: int = 200,
+    content: bytes = FAKE_PNG,
+    content_type: str = "image/png",
+    delay: float = 0.0,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if delay:
+            time.sleep(delay)
+        return httpx.Response(
+            status_code, content=content, headers={"content-type": content_type}
+        )
+
+    return handler
+
+
+def _stub_transport(monkeypatch, handler) -> None:
+    """让 MainWindow 内部创建的 Provider 走 MockTransport（不触网）。"""
+
+    def factory(token: str, *args: object, **kwargs: object) -> TiandituProvider:
+        return TiandituProvider(token, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(main_window_module, "TiandituProvider", factory)
+
+
+def _fill_token(window: MainWindow, token: str = FAKE_TOKEN) -> None:
+    window.download_panel._token_edit.setText(token)
+
+
+def _wait_for_worker(window: MainWindow, qapp) -> None:
+    """等待后台测试线程结束并把结果送回主线程。"""
+    worker = window._connection_worker
+    assert worker is not None
+    assert worker.wait(10_000) is True
+    for _ in range(5):
+        qapp.processEvents()
 
 
 # --------------------------------------------------------------------------- #
@@ -127,12 +198,26 @@ def test_form_data_reflects_edits(window: MainWindow) -> None:
 # --------------------------------------------------------------------------- #
 def test_action_buttons_exist_and_enabled(window: MainWindow) -> None:
     buttons = window.download_panel.action_buttons
-    assert list(buttons) == [ACTION_CALCULATE, ACTION_START, ACTION_PAUSE, ACTION_RESUME]
-    assert [b.text() for b in buttons.values()] == ["计算", "开始下载", "暂停", "继续"]
+    assert list(buttons) == [
+        ACTION_CALCULATE,
+        ACTION_START,
+        ACTION_PAUSE,
+        ACTION_RESUME,
+        ACTION_TEST_CONNECTION,
+    ]
+    assert [b.text() for b in buttons.values()] == [
+        "计算",
+        "开始下载",
+        "暂停",
+        "继续",
+        "测试天地图连接",
+    ]
     assert all(b.isEnabled() for b in buttons.values())
 
 
-def test_clicking_action_buttons_does_not_crash(window: MainWindow) -> None:
+def test_clicking_action_buttons_does_not_crash(
+    window: MainWindow, error_dialogs: list[tuple[str, str]]
+) -> None:
     for action, button in window.download_panel.action_buttons.items():
         button.click()
         assert f"触发动作：{action}" in window.log_panel.to_text()
@@ -271,3 +356,225 @@ def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
     refresh_button, _ = window.device_panel.buttons
     refresh_button.click()  # Slice 0 的占位动作仍然可用
     assert "Slice 4" in window.log_panel.to_text()
+
+
+# --------------------------------------------------------------------------- #
+# "测试天地图连接" 接入 TiandituProvider（Slice 2）
+# --------------------------------------------------------------------------- #
+def test_connection_area_starts_empty(window: MainWindow) -> None:
+    assert window.download_panel.connection_label.text() == "尚未测试"
+    assert window.download_panel.test_connection_button.isEnabled()
+    assert window._connection_worker is None
+
+
+def test_connection_test_success_updates_ui(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    _stub_transport(monkeypatch, _png_handler())
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+
+    text = window.download_panel.connection_label.text()
+    assert text.startswith("连接成功")
+    assert "图层：vec_w" in text
+    assert f"Zoom：{settings.DEFAULT_MIN_ZOOM}" in text
+    assert "HTTP：200" in text
+    assert f"Size：{len(FAKE_PNG)} bytes" in text
+    assert "耗时：" in text
+
+    log = window.log_panel.to_text()
+    assert "天地图连接测试成功" in log
+    assert "请求 URL：" in log
+
+    assert error_dialogs == []
+    assert window.download_panel.test_connection_button.isEnabled()
+
+
+def test_connection_test_uses_center_tile_of_current_bounds(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    """请求的瓦片必须等于 Slice 1 算出的中心点瓦片（UI 不自己算坐标）。"""
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, content=FAKE_PNG, headers={"content-type": "image/png"})
+
+    _stub_transport(monkeypatch, handler)
+    panel = window.download_panel
+    _fill_token(window)
+    panel._west_spin.setValue(116.0)
+    panel._south_spin.setValue(39.0)
+    panel._east_spin.setValue(117.0)
+    panel._north_spin.setValue(40.0)
+    panel._min_zoom_spin.setValue(10)
+
+    panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+
+    data = panel.get_form_data()
+    bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
+    center_lat, center_lon = bounds.center
+    expected = TiandituProvider(FAKE_TOKEN).build_tile_url(
+        MapLayerType.VECTOR,
+        10,
+        lon_to_tile_x(center_lon, 10),
+        lat_to_tile_y(center_lat, 10),
+    )
+    assert len(seen) == 1
+    assert seen[0].query.decode() == httpx.URL(expected).query.decode()
+
+
+def test_connection_test_does_not_block_ui_thread(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    """网络请求必须发生在后台线程：点击后立即返回，界面不冻结。"""
+    _stub_transport(monkeypatch, _png_handler(delay=0.4))
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+
+    # 点击已返回但请求仍在进行中 —— 说明没有阻塞 UI 线程
+    worker = window._connection_worker
+    assert isinstance(worker, QThread)
+    assert worker.isRunning() is True
+    assert worker.isCurrentThread() is False
+    assert window.download_panel.connection_label.text() == "正在测试天地图连接…"
+    assert window.download_panel.test_connection_button.isEnabled() is False
+
+    _wait_for_worker(window, qapp)
+    assert window.download_panel.connection_label.text().startswith("连接成功")
+
+
+def test_connection_test_reports_http_error(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    _stub_transport(
+        monkeypatch,
+        _png_handler(status_code=403, content=b"<html>denied</html>", content_type="text/html"),
+    )
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+
+    text = window.download_panel.connection_label.text()
+    assert text.startswith("连接失败：HTTP 403")
+    assert "Token" in text
+    assert "HTTP：403" in text
+    assert "天地图连接测试失败" in window.log_panel.to_text()
+    assert error_dialogs and error_dialogs[0][0] == "天地图连接失败"
+
+
+def test_connection_test_detects_error_page(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    """HTTP 200 的错误页不能当成"连接成功"。"""
+    _stub_transport(
+        monkeypatch,
+        _png_handler(content=b"<html>Invalid Token</html>", content_type="text/html"),
+    )
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+
+    text = window.download_panel.connection_label.text()
+    assert text.startswith("连接失败：")
+    assert "不是有效的图片瓦片" in text
+
+
+def test_connection_test_without_token_never_starts_worker(
+    window: MainWindow, error_dialogs
+) -> None:
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+
+    assert window._connection_worker is None
+    text = window.download_panel.connection_label.text()
+    assert text.startswith("连接失败：")
+    assert "token 不能为空" in text
+    assert "无法发起" in window.log_panel.to_text()
+
+
+def test_connection_test_with_invalid_bounds(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    _stub_transport(monkeypatch, _png_handler())
+    _fill_token(window)
+    window.download_panel._east_spin.setValue(100.0)  # east < west
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+
+    assert window._connection_worker is None
+    assert "west 必须小于 east" in window.download_panel.connection_label.text()
+
+
+def test_connection_log_never_leaks_full_token(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    _stub_transport(monkeypatch, _png_handler())
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+
+    log = window.log_panel.to_text()
+    assert FAKE_TOKEN not in log
+    assert "abcd****lmn" in log
+
+
+def test_calculate_still_works_after_connection_test(
+    window: MainWindow, monkeypatch, qapp, error_dialogs
+) -> None:
+    """Slice 2 不能破坏 Slice 0/1 的功能。"""
+    _stub_transport(monkeypatch, _png_handler())
+    _fill_token(window)
+
+    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    _wait_for_worker(window, qapp)
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+
+    assert "预计瓦片：" in window.download_panel.result_label.text()
+    assert window.status_group.title() == "下载状态"
+    assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
+
+
+# --------------------------------------------------------------------------- #
+# ConnectionTestWorker：线程胶水自身的兜底行为
+# --------------------------------------------------------------------------- #
+def test_connection_worker_converts_unexpected_exception(qapp) -> None:
+    """非 httpx 的意外异常也必须变成结果，不能冒泡进 Qt 事件循环。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("boom")
+
+    provider = TiandituProvider(FAKE_TOKEN, transport=httpx.MockTransport(handler))
+    results: list[object] = []
+    worker = ConnectionTestWorker(provider, MapLayerType.VECTOR, 12, 3372, 1552)
+    worker.result_ready.connect(results.append)
+
+    worker.run()  # 同步执行，用例不依赖事件循环
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.success is False
+    assert "测试异常" in (result.error or "")
+
+
+def test_connection_worker_reports_success(qapp) -> None:
+    provider = TiandituProvider(
+        FAKE_TOKEN, transport=httpx.MockTransport(_png_handler())
+    )
+    results: list[object] = []
+    worker = ConnectionTestWorker(provider, MapLayerType.IMAGE, 8, 105, 48)
+    worker.result_ready.connect(results.append)
+
+    worker.run()
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.success is True
+    assert result.status_code == 200
+    assert result.content_length == len(FAKE_PNG)

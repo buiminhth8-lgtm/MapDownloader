@@ -58,6 +58,36 @@ MAX_LONGITUDE: float = 180.0
 DEFAULT_AVERAGE_TILE_SIZE: int = 30 * 1024
 
 # --------------------------------------------------------------------------- #
+# 天地图 WMTS 服务
+# --------------------------------------------------------------------------- #
+#: 天地图瓦片服务使用的协议（天地图同时支持 http/https，默认走 https）
+TIANDITU_URL_SCHEME: str = "https"
+
+#: 分片主机模板，``{index}`` 由 :func:`app.providers.tianditu.server_index` 填充
+TIANDITU_HOST_TEMPLATE: str = "t{index}.tianditu.gov.cn"
+
+#: 分片主机数量（天地图提供 t0 ~ t7）
+TIANDITU_SERVER_COUNT: int = 8
+
+#: WMTS 请求路径模板：``{layer}`` 为图层标识（``vec_w`` 等）
+TIANDITU_WMTS_PATH_TEMPLATE: str = "{layer}/wmts"
+
+#: 单瓦片连通性测试的默认超时（秒）
+DEFAULT_TILE_TIMEOUT_SECONDS: float = 10.0
+
+#: 瓦片请求携带的 Accept 头（部分服务会据此裁剪错误页）
+TIANDITU_ACCEPT_HEADER: str = "image/png,image/jpeg;q=0.9,*/*;q=0.8"
+
+#: 瓦片请求的 User-Agent，便于服务端识别调用方。
+#: 必须是纯 ASCII —— HTTP 头不允许非 ASCII 字符，因此这里用 ORG_NAME
+#: 而不是中文的 APP_NAME（否则 httpx 会在编码请求头时抛 UnicodeEncodeError）。
+HTTP_USER_AGENT: str = f"{ORG_NAME}/{APP_VERSION}"
+
+#: 单瓦片响应体积上限（字节）。超过即视为异常响应（例如错误页 / 大文件），
+#: 不再当作瓦片继续处理。
+MAX_TILE_RESPONSE_BYTES: int = 4 * 1024 * 1024
+
+# --------------------------------------------------------------------------- #
 # 默认输出
 # --------------------------------------------------------------------------- #
 DEFAULT_OUTPUT_DIR: Path = Path.home() / "MapDownloader" / "output"

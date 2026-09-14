@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from app.config.settings import (
     APP_NAME,
     APP_VERSION,
+    DEFAULT_TILE_TIMEOUT_SECONDS,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     WINDOW_MIN_HEIGHT,
@@ -35,13 +36,19 @@ from app.geo import (
     calculate_tile_ranges,
     estimate_size_bytes,
     format_size,
+    lat_to_tile_y,
+    lon_to_tile_x,
 )
+from app.models.map_layer import MapLayerType
+from app.providers import TiandituProvider, TileTestResult, mask_url
+from app.ui.connection_check import ConnectionTestWorker
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
     ACTION_CALCULATE,
     ACTION_PAUSE,
     ACTION_RESUME,
     ACTION_START,
+    ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
 from app.ui.log_panel import LogPanel
@@ -52,12 +59,16 @@ _LEFT_COLUMN_WIDTH = 460
 #: 右侧设备/日志列的最小宽度
 _RIGHT_COLUMN_WIDTH = 360
 
+#: 关闭窗口时等待后台连通性测试线程退出的上限（毫秒）
+_THREAD_SHUTDOWN_WAIT_MS = 3000
+
 #: 各占位动作对应的"未来实现位置"说明
 _ACTION_HINTS: dict[str, str] = {
     ACTION_CALCULATE: "按当前范围计算瓦片数量与预估容量（Slice 1 已实现）",
-    ACTION_START: "瓦片下载器将在 Slice 2 实现",
-    ACTION_PAUSE: "暂停 / 继续将在 Slice 2 随下载器一起实现",
-    ACTION_RESUME: "暂停 / 继续将在 Slice 2 随下载器一起实现",
+    ACTION_TEST_CONNECTION: "取范围中心点测试单瓦片连通性（Slice 2 已实现）",
+    ACTION_START: "瓦片下载器尚未实现（当前只做单瓦片连通性验证）",
+    ACTION_PAUSE: "暂停 / 继续会随下载器一起实现",
+    ACTION_RESUME: "暂停 / 继续会随下载器一起实现",
 }
 
 
@@ -87,6 +98,11 @@ class MainWindow(QMainWindow):
         self.status_group = self._build_status_group()
         self.device_panel = DevicePanel(self)
         self.log_panel = LogPanel(self)
+
+        #: 后台连通性测试线程（同一时刻最多一个；持有引用避免被 GC 提前回收）
+        self._connection_worker: ConnectionTestWorker | None = None
+        #: 最近一次测试的上下文，用于结果展示：(图层, zoom, x, y, 脱敏 URL)
+        self._connection_context: tuple[MapLayerType, int, int, int, str] | None = None
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -199,6 +215,9 @@ class MainWindow(QMainWindow):
         if action == ACTION_CALCULATE:
             self._run_tile_math()
             return
+        if action == ACTION_TEST_CONNECTION:
+            self._start_connection_test()
+            return
         self.statusBar().showMessage(hint, 5000)
 
     # ------------------------------------------------------------------ #
@@ -276,6 +295,113 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
+    # 槽：天地图连通性测试（Slice 2）
+    # ------------------------------------------------------------------ #
+    @Slot()
+    def _start_connection_test(self) -> None:
+        """取当前范围中心点，对单张瓦片做一次连通性测试。
+
+        链路：读表单 → ``app.geo`` 算中心点瓦片 → ``app.providers`` 造 URL 与
+        发请求（在后台线程）→ 回主线程展示。UI 层不拼接任何 URL 参数。
+        """
+        running = self._connection_worker
+        if running is not None and running.isRunning():
+            self.log_panel.append_log("上一次连通性测试尚未结束，已忽略本次请求", "WARNING")
+            return
+
+        data = self.download_panel.get_form_data()
+        try:
+            provider = TiandituProvider(data["token"])
+            # 中文注记由复选框控制，本 Slice 只测底图（注记图层可在后续版本单列入口）
+            layer = data["map_type"].base_layer
+            zoom = int(data["min_zoom"])
+            bounds = GeoBounds(
+                west=data["west"],
+                south=data["south"],
+                east=data["east"],
+                north=data["north"],
+            )
+            center_lat, center_lon = bounds.center
+            x = lon_to_tile_x(center_lon, zoom)
+            y = lat_to_tile_y(center_lat, zoom)
+            url = mask_url(provider.build_tile_url(layer, zoom, x, y))
+        except ValueError as exc:
+            self._report_connection_error(str(exc))
+            return
+
+        self._connection_context = (layer, zoom, x, y, url)
+        self.download_panel.set_connection_testing(True)
+        self.log_panel.append_log(
+            f"开始测试天地图连接：图层={layer.value}，Zoom={zoom}，"
+            f"中心点瓦片=({x}, {y})，超时={DEFAULT_TILE_TIMEOUT_SECONDS:.0f}s"
+        )
+        # URL 已在本层脱敏（不显示完整 Token）
+        self.log_panel.append_log(f"请求 URL：{url}")
+        self.statusBar().showMessage("正在测试天地图连接…")
+
+        worker = ConnectionTestWorker(
+            provider,
+            layer,
+            zoom,
+            x,
+            y,
+            timeout=DEFAULT_TILE_TIMEOUT_SECONDS,
+            parent=self,
+        )
+        worker.result_ready.connect(self._on_connection_result)
+        self._connection_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_connection_result(self, result: TileTestResult) -> None:
+        """后台线程测试结束，回到主线程更新界面。"""
+        self.download_panel.set_connection_testing(False)
+        layer, zoom, _x, _y, _url = self._connection_context or (None, None, 0, 0, "")
+        layer_text = layer.value if layer is not None else "—"
+        zoom_text = str(zoom) if zoom is not None else "—"
+
+        if result.success:
+            self.download_panel.set_connection_result(
+                [
+                    "连接成功",
+                    f"图层：{layer_text}",
+                    f"Zoom：{zoom_text}",
+                    f"HTTP：{result.status_code}",
+                    f"Size：{result.content_length} bytes",
+                    f"耗时：{result.elapsed_ms:.0f} ms",
+                ]
+            )
+            self.log_panel.append_log(
+                f"天地图连接测试成功：图层={layer_text}，Zoom={zoom_text}，"
+                f"HTTP={result.status_code}，体积={result.content_length} bytes"
+                f"（{result.content_type or '未知类型'}），耗时={result.elapsed_ms:.0f} ms"
+            )
+            self.statusBar().showMessage(
+                f"天地图连接正常 · HTTP {result.status_code} · {result.elapsed_ms:.0f} ms",
+                8000,
+            )
+            return
+
+        error = result.error or "未知错误"
+        lines = [f"连接失败：{error}", f"图层：{layer_text}", f"Zoom：{zoom_text}"]
+        if result.has_response:
+            lines.append(f"HTTP：{result.status_code}")
+        lines.append(f"耗时：{result.elapsed_ms:.0f} ms")
+        self.download_panel.set_connection_result(lines)
+
+        self.log_panel.append_log(f"天地图连接测试失败：{error}（{result.summary()}）", "ERROR")
+        self.statusBar().showMessage(f"天地图连接失败：{error}", 8000)
+        self._show_error_dialog("天地图连接失败", error)
+
+    def _report_connection_error(self, message: str) -> None:
+        """请求未能发起的错误出口（表单非法 / Token 为空）。"""
+        self.download_panel.set_connection_testing(False)
+        self.download_panel.set_connection_error(message)
+        self.log_panel.append_log(f"天地图连接测试无法发起：{message}", "ERROR")
+        self.statusBar().showMessage(f"天地图连接测试无法发起：{message}", 8000)
+        self._show_error_dialog("天地图连接测试失败", message)
+
+    # ------------------------------------------------------------------ #
     # 槽：设备动作
     # ------------------------------------------------------------------ #
     @Slot()
@@ -301,5 +427,19 @@ class MainWindow(QMainWindow):
             f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
             "Windows 端生成天地图离线地图包，后续导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 0（工程骨架）。",
+            "当前进度：Slice 2（天地图 Provider 与单瓦片连通性验证）。",
         )
+
+    # ------------------------------------------------------------------ #
+    # 生命周期
+    # ------------------------------------------------------------------ #
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名约定
+        """关闭前等待后台测试线程结束。
+
+        否则 ``QThread`` 可能仍在运行时被销毁，Qt 会直接中止进程。
+        """
+        worker = self._connection_worker
+        if worker is not None and worker.isRunning():
+            self.log_panel.append_log("等待连接测试线程结束…")
+            worker.wait(_THREAD_SHUTDOWN_WAIT_MS)
+        super().closeEvent(event)
