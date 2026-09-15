@@ -819,8 +819,156 @@ async def test_failure_logging_is_capped(caplog) -> None:
             summary = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
 
     assert summary.failed == expected
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == MAX_LOGGED_TILE_FAILURES
+    per_tile = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "瓦片下载失败" in r.getMessage()
+    ]
+    assert len(per_tile) == MAX_LOGGED_TILE_FAILURES
+
+
+# --------------------------------------------------------------------------- #
+# 失败原因聚合（DownloadSummary.failures_by_reason / top_failures / as_lines）
+# --------------------------------------------------------------------------- #
+async def test_summary_aggregates_failure_reasons() -> None:
+    """失败原因按"人话文本"聚合，而不是只丢一个 failed 数字。"""
+    server = TileServer(fail_predicate=lambda z, x, y: True)
+    downloader = _make_downloader(server)
+    manager = DownloadManager(downloader, concurrency=4)
+    expected = _tile_count(SMALL_BOUNDS, 12, 12)
+
+    async with downloader:
+        summary = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    assert summary.failed == expected
+    assert list(summary.failures_by_reason.values()) == [expected]
+    reason = next(iter(summary.failures_by_reason))
+    assert "HTTP 500" in reason
+    assert summary.top_failures() == [(reason, expected)]
+
+
+async def test_summary_aggregates_distinct_reasons_by_count() -> None:
+    """多种失败原因要分别计数，且按张数倒序展示。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _, x, _ = TileServer.tile_key(request)
+        code = 403 if x % 2 == 0 else 500
+        return httpx.Response(
+            code, content=b"<html>nope</html>", headers={"content-type": "text/html"}
+        )
+
+    downloader = TileDownloader(
+        TiandituProvider(FAKE_TOKEN),
+        transport=httpx.MockTransport(handler),
+        retry_policy=FAST_POLICY,
+        rate_limiter=NO_RATE_LIMIT,
+    )
+    manager = DownloadManager(downloader, concurrency=4)
+    expected = _tile_count(SMALL_BOUNDS, 12, 12)
+
+    async with downloader:
+        summary = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    assert summary.failed == expected
+    assert len(summary.failures_by_reason) == 2
+    assert sum(summary.failures_by_reason.values()) == expected
+
+    top = summary.top_failures()
+    assert [count for _, count in top] == sorted(
+        (count for _, count in top), reverse=True
+    )
+    # 张数相同时按原因文本排序 —— 聚合顺序必须是确定的
+    assert summary.top_failures(limit=1) == top[:1]
+
+
+async def test_summary_has_no_failure_reasons_when_all_succeed() -> None:
+    server = TileServer()
+    downloader = _make_downloader(server)
+    manager = DownloadManager(downloader, concurrency=4)
+
+    async with downloader:
+        summary = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    assert summary.failed == 0
+    assert summary.failures_by_reason == {}
+    assert summary.top_failures() == []
+
+
+async def test_failure_reasons_are_reset_between_runs() -> None:
+    """同一个 manager 连跑两次，第二次不能继承第一轮的失败原因。"""
+    server = TileServer(fail_predicate=lambda z, x, y: True)
+    downloader = _make_downloader(server)
+    manager = DownloadManager(downloader, concurrency=4)
+
+    async with downloader:
+        first = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    assert first.failures_by_reason
+
+    ok_server = TileServer()
+    ok_downloader = _make_downloader(ok_server)
+    ok_manager = DownloadManager(ok_downloader, concurrency=4)
+    async with ok_downloader:
+        second = await ok_manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    assert second.failures_by_reason == {}
+
+
+async def test_engine_logs_failure_reason_summary(caplog) -> None:
+    """收尾日志里要有一行聚合后的失败原因，供 stderr / 日志文件排查。"""
+    server = TileServer(fail_predicate=lambda z, x, y: True)
+    downloader = _make_downloader(server)
+    manager = DownloadManager(downloader, concurrency=4)
+
+    with caplog.at_level(logging.WARNING, logger="app.downloader.download_manager"):
+        async with downloader:
+            summary = await manager.download(SMALL_BOUNDS, 12, 12, LAYER)
+
+    aggregated = [
+        r.getMessage() for r in caplog.records if "Download failure reasons" in r.getMessage()
+    ]
+    assert len(aggregated) == 1
+    assert f"（{summary.failed} 张）" in aggregated[0]
+    assert FAKE_TOKEN not in caplog.text
+
+
+def test_as_lines_reports_top_failure_reasons() -> None:
+    """``as_lines``（GUI 日志逐行展示）必须带上失败原因。"""
+    summary = DownloadSummary(
+        total=10,
+        succeeded=4,
+        failed=6,
+        failures_by_reason={"HTTP 403 — Token 可能无效": 5, "请求超时": 1},
+    )
+
+    lines = summary.as_lines()
+
+    assert "总瓦片：10" in lines
+    assert "失败：6" in lines
+    assert "失败原因：HTTP 403 — Token 可能无效（5 张）" in lines
+    assert "失败原因：请求超时（1 张）" in lines
+    assert lines.index("失败原因：HTTP 403 — Token 可能无效（5 张）") < lines.index(
+        "失败原因：请求超时（1 张）"
+    )
+
+
+def test_as_lines_omits_failure_reasons_when_nothing_failed() -> None:
+    summary = DownloadSummary(total=6, succeeded=6)
+
+    lines = summary.as_lines()
+
+    assert not any(line.startswith("失败原因：") for line in lines)
+
+
+def test_top_failures_limit_is_bounded() -> None:
+    from app.config.settings import MAX_REPORTED_FAILURE_REASONS
+
+    summary = DownloadSummary(
+        failures_by_reason={f"原因{i}": 1 for i in range(10)}
+    )
+
+    assert len(summary.top_failures()) == MAX_REPORTED_FAILURE_REASONS
+    assert len(summary.failures_by_reason) == 10
 
 
 async def test_logs_never_leak_full_token(caplog) -> None:

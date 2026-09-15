@@ -23,9 +23,10 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
+from app.config.settings import MAX_REPORTED_FAILURE_REASONS
 from app.geo import format_size
 
 __all__ = [
@@ -220,7 +221,12 @@ class DownloadProgress:
 # --------------------------------------------------------------------------- #
 @dataclass
 class DownloadSummary:
-    """一次批量下载的最终汇总，由 ``DownloadManager.download`` 返回。"""
+    """一次批量下载的最终汇总，由 ``DownloadManager.download`` 返回。
+
+    ``failures_by_reason`` 把失败原因按"人话描述"聚合成 ``原因 -> 张数``。
+    只保留**可读的原因文本**（不含 Token、不含完整 URL），用于给用户交代
+    "为什么失败"，而不是只丢一个 ``failed=312`` 让人猜。
+    """
 
     total: int = 0
     succeeded: int = 0
@@ -230,6 +236,7 @@ class DownloadSummary:
     duration_seconds: float = 0.0
     average_tiles_per_second: float = 0.0
     cancelled: bool = False
+    failures_by_reason: dict[str, int] = field(default_factory=dict)
 
     @property
     def completed(self) -> int:
@@ -240,6 +247,17 @@ class DownloadSummary:
     def is_success(self) -> bool:
         """是否"跑完了且一张都没失败"。"""
         return not self.cancelled and self.failed == 0 and self.succeeded > 0
+
+    def top_failures(
+        self, limit: int = MAX_REPORTED_FAILURE_REASONS
+    ) -> list[tuple[str, int]]:
+        """按张数倒序取前 ``limit`` 条失败原因。
+
+        张数相同时按原因文本排序——聚合结果必须**确定**，否则同样的失败集合
+        会给出不同的展示顺序，测试与日志比对都会变成运气问题。
+        """
+        ordered = sorted(self.failures_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        return ordered[:limit]
 
     def as_lines(self) -> list[str]:
         """多行展示文案，供 GUI / 日志直接使用。"""
@@ -253,6 +271,8 @@ class DownloadSummary:
         lines.append(f"下载量：{format_size(self.bytes_downloaded)}")
         lines.append(f"耗时：{self.duration_seconds:.2f} s")
         lines.append(f"平均速度：{self.average_tiles_per_second:.1f} 瓦片/秒")
+        for reason, count in self.top_failures():
+            lines.append(f"失败原因：{reason}（{count:,} 张）")
         if self.cancelled:
             lines.append("状态：已取消（瓦片未落盘）")
         return lines

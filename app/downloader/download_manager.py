@@ -45,7 +45,7 @@ import asyncio
 import inspect
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Iterator
 from dataclasses import dataclass, field
 
@@ -139,6 +139,8 @@ class _Counters:
     bytes_downloaded: int = 0
     skipped: int = 0
     current_zoom: int | None = None
+    #: 失败原因 → 张数。只存人话原因（不含 Token / 完整 URL）。
+    failure_reasons: Counter[str] = field(default_factory=Counter)
 
     @property
     def completed(self) -> int:
@@ -515,8 +517,11 @@ class DownloadManager:
                 counters.bytes_downloaded += result.content_length
             else:
                 counters.failed += 1
+                counters.failure_reasons["瓦片回调处理失败"] += 1
         else:
             counters.failed += 1
+            # 按"人话原因"聚合，便于收尾时告诉用户到底为什么失败。
+            counters.failure_reasons[result.error or "未知错误"] += 1
             self._log_tile_failure(result)
 
         counters.current_zoom = result.tile.z
@@ -634,10 +639,11 @@ class DownloadManager:
             duration_seconds=duration,
             average_tiles_per_second=(completed / duration) if duration > 0 else 0.0,
             cancelled=cancelled,
+            failures_by_reason=dict(counters.failure_reasons),
         )
 
     def _log_summary(self, summary: DownloadSummary) -> None:
-        """按 Spec 要求的格式输出收尾日志。"""
+        """按 Spec 要求的格式输出收尾日志，并附上失败原因（若失败）。"""
         if summary.cancelled:
             self._logger.info(
                 "Download cancelled success=%d failed=%d skipped=%d duration=%.2fs",
@@ -646,14 +652,20 @@ class DownloadManager:
                 summary.skipped,
                 summary.duration_seconds,
             )
-            return
-        self._logger.info(
-            "Download completed success=%d failed=%d duration=%.2fs speed=%.1f/s",
-            summary.succeeded,
-            summary.failed,
-            summary.duration_seconds,
-            summary.average_tiles_per_second,
-        )
+        else:
+            self._logger.info(
+                "Download completed success=%d failed=%d duration=%.2fs speed=%.1f/s",
+                summary.succeeded,
+                summary.failed,
+                summary.duration_seconds,
+                summary.average_tiles_per_second,
+            )
+        if summary.failed:
+            # 只打去重后的 Top N：失败原因已聚合，不会随失败瓦片数膨胀。
+            detail = "；".join(
+                f"{reason}（{count} 张）" for reason, count in summary.top_failures()
+            )
+            self._logger.warning("Download failure reasons: %s", detail)
 
 
 # --------------------------------------------------------------------------- #
