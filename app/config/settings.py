@@ -170,9 +170,62 @@ GUI_LARGE_TASK_CONFIRM_TILES: int = 10_000
 DEFAULT_MAP_NAME: str = "offline_map"
 
 # --------------------------------------------------------------------------- #
+# 断点续传与任务持久化（Slice 5）
+# --------------------------------------------------------------------------- #
+#: 恢复已有 MBTiles 时，是否连内容一起校验（读 BLOB + 判 magic bytes）。
+#:
+#: **默认关闭**：开启后每张已有瓦片都要读一次 BLOB，恢复一个几十万张的库会从
+#: "秒级"变成"分钟级"。存在性判断只看坐标三列就足够了（Spec §22）。
+DEFAULT_RESUME_VERIFY_EXISTING_TILE: bool = False
+
+#: 校验发现已有瓦片内容为空/损坏时，是否重新下载覆盖。
+#: 仅在 ``DEFAULT_RESUME_VERIFY_EXISTING_TILE=True`` 时有意义。
+DEFAULT_RESUME_REDOWNLOAD_INVALID_TILE: bool = True
+
+#: 存在性判断的策略切换阈值。
+#:
+#: 目标瓦片数 ``<=`` 这个值时，一次性把已有坐标读成 ``set``（内存换速度）；
+#: 超过则改用主键索引逐张查询。5 万条 ``(z, x, y)`` 三元组约占 10MB，
+#: 属于"可以接受但要有个上限"的量级。
+DEFAULT_RESUME_CACHE_MAX_TILES: int = 50_000
+
+#: 任务状态持久化目录与文件名（JSON，不含 Token）。
+#: 与 ``DEFAULT_OUTPUT_DIR`` 同放 ``~/MapDownloader`` 下（见下方"默认输出"一节）：
+#: 桌面工具以"双击运行"为主，工作目录不可靠，不能把任务文件写在 cwd 里。
+TASKS_DIR_NAME: str = "data"
+TASKS_FILE_NAME: str = "tasks.json"
+
+#: JSON 结构版本号。将来字段有破坏性变化时用它做迁移判断。
+TASKS_FILE_VERSION: int = 1
+
+#: 损坏的任务文件被隔离时追加的后缀（不直接删除用户的文件）
+TASKS_CORRUPT_SUFFIX: str = ".corrupt"
+
+#: 任务进度落盘的节流参数：满足任一条件才写一次。
+#:
+#: 每下载一张瓦片就写一次 JSON，几十万张的任务会产生几十万次 fsync——
+#: 既是磁盘灾难，也和"下载"抢同一个线程的时间。状态变化（开始/暂停/取消/
+#: 失败/完成）**不受节流限制**，一律立即落盘。
+DEFAULT_TASK_SAVE_INTERVAL_SECONDS: float = 1.0
+DEFAULT_TASK_SAVE_TILE_INTERVAL: int = 100
+
+#: 恢复前一致性校验时，经纬度的允许偏差。
+#: metadata 里存的是 6 位小数字符串，回读成 float 会有量化误差；
+#: 1e-6 度 ≈ 0.1 米，远小于单张瓦片的精度，不会把正常文件判成"不兼容"。
+MBTILES_BOUNDS_TOLERANCE: float = 1e-6
+
+#: 任务列表区展示的最近任务条数上限（避免界面上无限增长）
+TASK_PANEL_MAX_ROWS: int = 200
+
+# --------------------------------------------------------------------------- #
 # 默认输出
 # --------------------------------------------------------------------------- #
 DEFAULT_OUTPUT_DIR: Path = Path.home() / "MapDownloader" / "output"
+
+#: 任务记录文件：``~/MapDownloader/data/tasks.json``。
+#: 刻意与输出目录同一父目录——"这个工具产生的东西"集中在一处，用户好清理。
+DEFAULT_TASKS_DIR: Path = DEFAULT_OUTPUT_DIR.parent / TASKS_DIR_NAME
+DEFAULT_TASKS_FILE: Path = DEFAULT_TASKS_DIR / TASKS_FILE_NAME
 
 # --------------------------------------------------------------------------- #
 # 日志
@@ -208,12 +261,66 @@ UI_TEXT_LARGE_TASK_CONFIRM: str = (
     "确认继续下载吗？（不会限制下载规模，仅作提醒）"
 )
 
-#: 取消任务后的提示：已写入的瓦片保留
+#: 取消任务后的提示：已写入的瓦片保留，且可以在任务列表里继续
 UI_TEXT_CANCELLED_KEEP_TILES: str = (
     "任务已取消，已完成瓦片已保留。\n"
-    "Slice 5 将支持从已有 MBTiles 断点续传。"
+    "可在「下载任务」列表里选中该任务后点「继续」，已有瓦片会自动跳过。"
 )
 
 #: 未指定地图名称时的提示
 UI_TEXT_MAP_NAME_REQUIRED: str = "请先填写地图名称（用于生成 <名称>.mbtiles）"
+
+# --------------------------------------------------------------------------- #
+# UI 文案：断点续传 / 任务（Slice 5）
+# --------------------------------------------------------------------------- #
+#: 目标 .mbtiles 已存在时的三选一提示（继续下载 / 重新下载 / 取消）
+UI_TEXT_MBTILES_EXISTS_TITLE: str = "检测到已有地图文件"
+UI_TEXT_MBTILES_EXISTS: str = (
+    "检测到已有地图文件：\n\n"
+    "{path}\n\n"
+    "已有瓦片：{existing:,} 张\n\n"
+    "继续下载：复用该文件，已有瓦片会自动跳过\n"
+    "重新下载：备份旧文件后从头开始（不会静默删除）"
+)
+UI_TEXT_MBTILES_EXISTS_CONTINUE: str = "继续下载"
+UI_TEXT_MBTILES_EXISTS_RESTART: str = "重新下载"
+UI_TEXT_MBTILES_EXISTS_CANCEL: str = "取消"
+
+#: 选"重新下载"后的二次确认
+UI_TEXT_MBTILES_RESTART_TITLE: str = "确认重新下载"
+UI_TEXT_MBTILES_RESTART_CONFIRM: str = (
+    "将把原文件重命名备份为：\n\n{backup}\n\n"
+    "然后从零重新下载全部 {total:,} 张瓦片。\n\n"
+    "确认继续吗？"
+)
+
+#: 恢复任务时没有 Token
+UI_TEXT_RESUME_TOKEN_REQUIRED: str = (
+    "恢复下载任务需要天地图 Token。\n"
+    "任务记录里**不会**保存 Token（密钥不落盘），请在界面上填写 Token 后再点继续。"
+)
+
+#: 已有 MBTiles 与任务参数不一致（Spec §12 的原文）
+UI_TEXT_RESUME_INCOMPATIBLE: str = (
+    "现有 MBTiles 与当前任务参数不一致，无法安全继续下载。"
+)
+
+#: 关窗时仍有任务在下载（Spec §17）
+UI_TEXT_EXIT_WITH_TASK_TITLE: str = "任务仍在下载"
+UI_TEXT_EXIT_WITH_TASK: str = (
+    "当前存在正在下载的地图任务。\n\n"
+    "退出后任务将暂停，下次可以继续下载。\n\n是否退出？"
+)
+UI_TEXT_EXIT_CONFIRM: str = "退出"
+UI_TEXT_EXIT_CANCEL: str = "取消"
+
+#: 任务列表区
+UI_TEXT_TASK_PANEL_EMPTY: str = "暂无任务记录"
+UI_TEXT_TASK_RESUME: str = "继续"
+UI_TEXT_TASK_DELETE: str = "删除记录"
+UI_TEXT_TASK_DELETE_HINT: str = "只删除任务记录，不会删除已生成的 .mbtiles 文件"
+UI_TEXT_TASK_RECOVERED: str = (
+    "检测到上次退出时仍有未完成任务，已标记为「已暂停」。"
+    "程序不会自动开始下载，需要你确认后手动继续。"
+)
 

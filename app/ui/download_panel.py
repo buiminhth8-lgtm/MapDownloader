@@ -431,6 +431,47 @@ class DownloadPanel(QGroupBox):
         return dict(self._action_buttons)
 
     # ------------------------------------------------------------------ #
+    # 反向填充（Slice 5：从任务记录恢复表单）
+    # ------------------------------------------------------------------ #
+    def set_form_data(self, task) -> None:
+        """把一条任务记录回填到表单（Spec §14/§16：双击任务 → 恢复配置）。
+
+        刻意**不回填 Token**：任务记录里根本没有 Token（Spec §9），
+        而把它清空会让人以为"程序把我的 Token 弄丢了"。保持用户当前输入不动。
+
+        图层按 ``MapLayerType.value`` 反查下拉框；认不出来就保持原选项并返回
+        ``False``（由调用方决定要不要提示），不抛异常——一个"图层不认识"的
+        任务不该让界面炸掉。
+
+        Args:
+            task: :class:`~app.models.download_task.DownloadTask` 或任何具备
+                同名属性的对象。
+
+        Returns:
+            ``True`` 表示图层也成功回填了；``False`` 表示图层没认出来。
+        """
+        self._west_spin.setValue(float(task.west))
+        self._south_spin.setValue(float(task.south))
+        self._east_spin.setValue(float(task.east))
+        self._north_spin.setValue(float(task.north))
+        # 任务里的 zoom 可能超出 UI 下拉范围（例如由命令行建的记录）：
+        # setValue 会自动 clamp 到控件范围，不会抛异常。
+        self._min_zoom_spin.setValue(int(task.min_zoom))
+        self._max_zoom_spin.setValue(int(task.max_zoom))
+        self._map_name_edit.setText(str(task.name))
+        output_path = Path(str(task.output_path))
+        # 任务存的是**文件**路径，表单要的是**目录**
+        self._output_edit.setText(str(output_path.parent))
+
+        layer_name = str(getattr(task, "map_layer", "") or "")
+        for index in range(self._map_type_combo.count()):
+            layer = self._map_type_combo.itemData(index)
+            if layer is not None and layer.value == layer_name:
+                self._map_type_combo.setCurrentIndex(index)
+                return True
+        return False
+
+    # ------------------------------------------------------------------ #
     # 结果展示
     # ------------------------------------------------------------------ #
     def set_calculation_result(

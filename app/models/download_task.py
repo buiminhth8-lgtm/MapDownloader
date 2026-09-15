@@ -1,7 +1,11 @@
 """下载任务模型。
 
-注意：本模块只描述"数据长什么样"，不包含任何下载调度逻辑
-（调度在 ``app.downloader``，Slice 2 实现）。
+注意：本模块只描述"数据长什么样"（含"怎么被持久化"所需的字段），
+不包含下载调度逻辑（调度在 ``app.downloader``）、也不做任何文件 IO
+（JSON 读写由 ``app.tasks.task_store`` 负责）。
+
+本模块是依赖图的叶子之一：只依赖 ``config``，不 import ``app.downloader``
+——所以 :meth:`DownloadTask.apply_progress` 用的是鸭子类型而不是引擎模型类型。
 """
 
 from __future__ import annotations
@@ -92,7 +96,28 @@ class DownloadProgress:
 
 @dataclass
 class DownloadTask:
-    """一次"区域 + 缩放级别"的下载任务描述。"""
+    """一次"区域 + 缩放级别"的下载任务描述。
+
+    Slice 5 起这个模型**会被持久化**（``~/MapDownloader/data/tasks.json``），
+    因此它是"程序重启后能恢复一次下载"的全部依据：
+
+    - 恢复所需的参数：范围、zoom、图层、输出路径；
+    - 恢复所需的进度：目标张数与四个计数器；
+    - 恢复时的失败交代：``error``。
+
+    刻意**不含**任何密钥字段：Token 只在内存与请求头里存在，绝不落盘
+    （Spec §9）。序列化由 ``app.tasks.task_store`` 负责，本层保持纯数据。
+
+    Attributes:
+        map_layer: 图层标识（``MapLayerType.value``，如 ``vec_w``）。
+            存字符串而不是枚举，是为了让 JSON 结构与人读的 JSON 都保持稳定；
+            从磁盘读回后由业务层转成枚举（转换失败会被当成"记录损坏"处理）。
+        total_tiles: 任务目标瓦片数（Tile Math 算出）。
+        completed_tiles: 已处理张数 = ``skipped + succeeded + failed``。
+        skipped_tiles: **已有瓦片、本次未重下**的张数。
+        succeeded_tiles / failed_tiles: 本次真正发起请求的结果。
+        error: 失败原因（成功/进行中为 ``None``）。
+    """
 
     id: str = field(default_factory=new_task_id)
     name: str = "未命名任务"
@@ -105,10 +130,25 @@ class DownloadTask:
     north: float = 0.0
     output_path: Path = field(default_factory=lambda: DEFAULT_OUTPUT_DIR)
 
+    #: 图层标识（``MapLayerType.value``）。空串表示"未记录"（旧记录/手工构造）。
+    map_layer: str = ""
+
+    #: 进度计数器（Slice 5 起是持久化的权威来源，Spec §7）
+    total_tiles: int = 0
+    completed_tiles: int = 0
+    succeeded_tiles: int = 0
+    failed_tiles: int = 0
+    skipped_tiles: int = 0
+
     #: 非核心字段：时间戳与进度快照
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    #: Slice 0 的占位快照。Slice 5 起由 :meth:`apply_progress` 与上面那组
+    #: 扁平计数器同步维护，保证两者不会各说各话。
     progress: DownloadProgress = field(default_factory=DownloadProgress)
+
+    #: 失败原因；正常结束/进行中为 ``None``
+    error: str | None = None
 
     # ------------------------------------------------------------------ #
     # 派生信息
@@ -133,6 +173,32 @@ class DownloadTask:
             and -90.0 <= self.south < self.north <= 90.0
         )
 
+    @property
+    def percent(self) -> float:
+        """完成百分比，``0.0 ~ 100.0``；未知总量时返回 ``0.0``。"""
+        if self.total_tiles <= 0:
+            return 0.0
+        return min(100.0, self.completed_tiles / self.total_tiles * 100.0)
+
+    @property
+    def remaining_tiles(self) -> int:
+        """还需要下载的张数（``total - completed``，已跳过的不算欠账）。"""
+        return max(0, self.total_tiles - self.completed_tiles)
+
+    @property
+    def can_resume(self) -> bool:
+        """是否值得显示"继续"。
+
+        已完成的任务不必再继续；其余状态（含首次创建、暂停、失败、取消）
+        都可以"接着下"，因为续传逻辑本来就是"按已有瓦片补齐差集"。
+        """
+        return self.status is not DownloadTaskStatus.COMPLETED
+
+    @property
+    def is_interrupted(self) -> bool:
+        """是否是"上次进程没来得及收尾"的状态（重启后要降级为 PAUSED）。"""
+        return self.status.is_running
+
     # ------------------------------------------------------------------ #
     # 状态流转
     # ------------------------------------------------------------------ #
@@ -140,3 +206,41 @@ class DownloadTask:
         """更新状态并刷新 ``updated_at``。"""
         self.status = status
         self.updated_at = datetime.now()
+
+    def apply_progress(self, progress) -> None:
+        """把下载引擎的进度快照同步进来（``DownloadProgress`` 引擎版）。
+
+        刻意用**鸭子类型**（只要有那几个字段就行）而不是 import 引擎模型：
+        ``app.models`` 是依赖图的叶子，不能反向依赖 ``app.downloader``
+        ——否则 models 就不再是"谁都能依赖、自己不依赖谁"的那一层了。
+
+        Args:
+            progress: 任何具备 ``total/completed/succeeded/failed/skipped``
+                属性的对象。
+        """
+        self.total_tiles = max(0, int(getattr(progress, "total", 0) or 0))
+        self.completed_tiles = max(0, int(getattr(progress, "completed", 0) or 0))
+        self.succeeded_tiles = max(0, int(getattr(progress, "succeeded", 0) or 0))
+        self.failed_tiles = max(0, int(getattr(progress, "failed", 0) or 0))
+        self.skipped_tiles = max(0, int(getattr(progress, "skipped", 0) or 0))
+
+        # 同步 Slice 0 的占位快照，避免两个进度视图各说各话
+        self.progress.tile_total = self.total_tiles
+        self.progress.tile_done = self.completed_tiles
+        self.progress.tile_failed = self.failed_tiles
+        current_zoom = getattr(progress, "current_zoom", None)
+        if current_zoom is not None:
+            self.progress.current_zoom = int(current_zoom)
+        self.progress.speed_tiles_per_second = float(
+            getattr(progress, "tiles_per_second", 0.0) or 0.0
+        )
+
+    def progress_text(self) -> str:
+        """进度文案（任务列表用），例如 ``64%（已有 32,418 / 50,000）``。"""
+        text = f"{self.percent:.0f}%"
+        if self.total_tiles:
+            text += f"（{self.completed_tiles:,} / {self.total_tiles:,}"
+            if self.skipped_tiles:
+                text += f"，已有 {self.skipped_tiles:,}"
+            text += "）"
+        return text

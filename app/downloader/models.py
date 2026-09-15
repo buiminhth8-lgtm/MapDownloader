@@ -37,6 +37,7 @@ __all__ = [
     "DownloadSummary",
     "TileCallback",
     "ProgressCallback",
+    "SkipPredicate",
 ]
 
 
@@ -183,8 +184,18 @@ class DownloadProgress:
     ``total`` 在任务开始前就由 Slice 1 的瓦片统计得出，因此进度条从一开始
     就有正确的分母，而不是"边发现边增长"。
 
-    ``skipped`` 只在被取消时有意义：表示因取消而**未下载**的瓦片数。
-    本 Slice 没有断点续传，这些瓦片不会在后续被补下。
+    四个计数的语义（Slice 5 起，Spec §4 明确定义）
+    ----------------------------------------------
+
+    - ``skipped``：**已经存在于 MBTiles 中，本次未重新下载**。
+      （Slice 3 时这个字段的含义是"因取消而未下载"，Slice 5 改成了续传语义，
+      取消的残留改由 ``unprocessed`` 表达。）
+    - ``succeeded``：本次真正下载成功。
+    - ``failed``：本次下载失败。
+    - ``completed = skipped + succeeded + failed``；``remaining = total - completed``。
+
+    这样恢复一个任务时进度条会**立刻**跳到"已有比例"，而不是从 0 开始爬：
+    用户看到的是"还有多少要下"，而不是"这次下了多少"。
     """
 
     total: int = 0
@@ -195,25 +206,47 @@ class DownloadProgress:
     bytes_downloaded: int = 0
     tiles_per_second: float = 0.0
     current_zoom: int | None = None
+    #: 因取消而**完全没有被处理**的瓦片数（既没跳过也没下载）。
+    #: 只在中途取消时有非零值。
+    unprocessed: int = 0
 
     @property
     def percent(self) -> float:
-        """完成百分比，``0.0 ~ 100.0``。"""
+        """完成百分比，``0.0 ~ 100.0``。
+
+        分母是任务目标瓦片数，分子含"已存在被跳过"的部分——所以续传任务的
+        百分比一开始就不是 0。这正是 Spec §16 要求的"ProgressBar 应快速反映
+        已有进度"。
+        """
         if self.total <= 0:
             return 100.0 if self.completed > 0 else 0.0
         return min(100.0, self.completed / self.total * 100.0)
 
     @property
     def remaining(self) -> int:
-        """尚未处理的瓦片数（不含被跳过的）。"""
-        return max(0, self.total - self.completed - self.skipped)
+        """尚未处理的瓦片数（``total - completed``，已跳过的不算未处理）。"""
+        return max(0, self.total - self.completed)
+
+    @property
+    def downloaded_total(self) -> int:
+        """本次任务一共拿下了多少张（新下载 + 直接沿用已有的）。
+
+        用于回答"这个库现在有多少张了"，与 ``succeeded``（本次真正发请求成功的）
+        区分开。
+        """
+        return self.skipped + self.succeeded
 
     @property
     def success_rate(self) -> float:
-        """已完成部分里的成功率，``0.0 ~ 1.0``。"""
-        if self.completed <= 0:
+        """真正发起过请求的那部分里的成功率，``0.0 ~ 1.0``。
+
+        分母刻意不含 ``skipped``：那些瓦片根本没发请求，算进成功率会把
+        "续传时成功率虚高"变成一个假指标。
+        """
+        attempted = self.succeeded + self.failed
+        if attempted <= 0:
             return 0.0
-        return self.succeeded / self.completed
+        return self.succeeded / attempted
 
 
 # --------------------------------------------------------------------------- #
@@ -237,16 +270,22 @@ class DownloadSummary:
     average_tiles_per_second: float = 0.0
     cancelled: bool = False
     failures_by_reason: dict[str, int] = field(default_factory=dict)
+    #: 因取消而完全没被处理的瓦片数（Slice 5 起从 ``skipped`` 里拆出来）
+    unprocessed: int = 0
 
     @property
     def completed(self) -> int:
-        """已处理（成功 + 失败）的瓦片数。"""
-        return self.succeeded + self.failed
+        """已处理的瓦片数（成功 + 失败 + 已有跳过）。"""
+        return self.succeeded + self.failed + self.skipped
 
     @property
     def is_success(self) -> bool:
-        """是否"跑完了且一张都没失败"。"""
-        return not self.cancelled and self.failed == 0 and self.succeeded > 0
+        """是否"跑完了且一张都没失败"。
+
+        ``skipped`` 也算"已处理"——一个全部命中已有瓦片的续传任务
+        （``skipped=N, succeeded=0``）是**成功**，不是"什么都没干"。
+        """
+        return not self.cancelled and self.failed == 0 and self.completed > 0
 
     def top_failures(
         self, limit: int = MAX_REPORTED_FAILURE_REASONS
@@ -267,14 +306,16 @@ class DownloadSummary:
             f"失败：{self.failed:,}",
         ]
         if self.skipped:
-            lines.append(f"跳过：{self.skipped:,}")
+            lines.append(f"已有跳过：{self.skipped:,}")
+        if self.unprocessed:
+            lines.append(f"未处理：{self.unprocessed:,}")
         lines.append(f"下载量：{format_size(self.bytes_downloaded)}")
         lines.append(f"耗时：{self.duration_seconds:.2f} s")
         lines.append(f"平均速度：{self.average_tiles_per_second:.1f} 瓦片/秒")
         for reason, count in self.top_failures():
             lines.append(f"失败原因：{reason}（{count:,} 张）")
         if self.cancelled:
-            lines.append("状态：已取消（瓦片未落盘）")
+            lines.append("状态：已取消（已完成瓦片已保留，可继续下载）")
         return lines
 
 
@@ -292,3 +333,10 @@ TileCallback = Callable[[TileDownloadResult], Awaitable[None] | None]
 
 #: 进度回调：引擎按 ``PROGRESS_EMIT_INTERVAL_SECONDS`` 节流后调用。
 ProgressCallback = Callable[[DownloadProgress], Awaitable[None] | None]
+
+#: 跳过判定回调（Slice 5）：返回 ``True`` 表示"这张不用下载"。
+#:
+#: 由生产者在**进入 HTTP Worker 之前**调用，因此命中的瓦片完全不消耗网络配额。
+#: 同步函数与协程函数都支持——判定通常是内存查表或一次索引查询，同步写更自然，
+#: 但把判定放到远端/异步存储的实现也应该能用。
+SkipPredicate = Callable[[TileCoordinate], Awaitable[bool] | bool]

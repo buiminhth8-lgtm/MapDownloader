@@ -1,6 +1,6 @@
-"""下载并落盘为一个 MBTiles 文件（Slice 4）。
+"""下载并落盘为一个 MBTiles 文件（Slice 4；Slice 5 增加断点续传）。
 
-这是本 Slice 的**编排层**：把 Slice 1/2/3/4 的能力串成"一个业务动作"。
+这是**编排层**：把 Slice 1/2/3/4/5 的能力串成"一个业务动作"。
 
 完整链路::
 
@@ -11,7 +11,7 @@
     TiandituProvider            (Slice 2：拼 WMTS URL、判响应合法性)
         ↓
     Async Downloader            (Slice 3：并发 / 限速 / 重试 / 暂停取消)
-        ↓  on_tile 回调
+        ↓  should_skip_tile      (Slice 5：已有瓦片在这里被拦下，不进 HTTP)
     MBTilesTileSink             (Slice 4：有界队列 + 单消费者)
         ↓
     MBTilesWriter               (Slice 4：批量事务写 SQLite)
@@ -19,6 +19,20 @@
     map.mbtiles
         ↓
     Validator                   (Slice 4：结构 + 抽样数据校验)
+
+续传（Slice 5）额外多出来的一圈::
+
+    DownloadTask                (Slice 5：任务记录，来自 tasks.json)
+        ↓
+    output_path 已存在？
+        ↓ 是
+    MBTilesReader 读 metadata
+        ↓
+    一致性校验（bounds / zoom / layer）  ← 不匹配就**拒绝续传**，绝不往错库里写
+        ↓ 通过
+    ExistingTileIndex           (Slice 5：已有瓦片 → 跳过)
+        ↓
+    只下缺失的那些，写回同一个 .mbtiles
 
 为什么要有这一层（而不是塞进 MainWindow）
 ------------------------------------------
@@ -44,18 +58,26 @@ from app.config.settings import (
     DEFAULT_MBTILES_BATCH_SIZE,
     DEFAULT_MBTILES_QUEUE_CAPACITY,
     DEFAULT_REQUEST_TIMEOUT,
+    MBTILES_BOUNDS_TOLERANCE,
     MBTILES_FILE_SUFFIX,
     PROGRESS_EMIT_INTERVAL_SECONDS,
+    UI_TEXT_RESUME_INCOMPATIBLE,
+    UI_TEXT_RESUME_TOKEN_REQUIRED,
 )
 from app.downloader import (
     DownloadManager,
     DownloadProgress,
     DownloadSummary,
+    ExistingTileIndex,
     RateLimiter,
+    ResumePolicy,
     RetryPolicy,
+    SkipMode,
     TileDownloader,
+    describe_existing_tiles,
+    make_skip_predicate,
 )
-from app.geo import GeoBounds, format_size
+from app.geo import GeoBounds, estimate_tile_count, format_size
 from app.mbtiles import (
     MBTilesMetadata,
     MBTilesReader,
@@ -65,12 +87,16 @@ from app.mbtiles import (
     MBTilesWriter,
     validate_mbtiles,
 )
+from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType
 from app.providers import TiandituProvider
 
 __all__ = [
     "MapDownloadOutcome",
     "MapDownloadService",
+    "MapResumeError",
+    "ResumeCompatibility",
+    "check_resume_compatibility",
     "build_output_path",
     "sanitize_map_name",
 ]
@@ -136,6 +162,202 @@ def build_output_path(output_dir: str | Path, map_name: str) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# 恢复前的一致性校验（Slice 5，Spec §12）
+# --------------------------------------------------------------------------- #
+class MapResumeError(RuntimeError):
+    """无法安全地继续一个下载任务。
+
+    与 :class:`~app.mbtiles.MBTilesWriteError` 的区别：那个是"写盘出问题了"，
+    这个是"**不该往这个文件里写**"——例如已有 MBTiles 属于另一个区域、
+    另一个缩放级别、或者根本不是本工具生成的合法文件。
+
+    刻意单独一个类型：GUI 需要给它完全不同的措辞（"参数不一致，无法安全继续"
+    而不是"磁盘写失败"），用户据此决定是换个文件名还是重新下载。
+    """
+
+
+@dataclass
+class ResumeCompatibility:
+    """已有 MBTiles 与任务参数的比对结果。"""
+
+    #: ``True`` 表示可以安全续传
+    compatible: bool = True
+    #: 阻断续传的问题（用户必须处理）
+    problems: list[str] = field(default_factory=list)
+    #: 不阻断但值得告知的差异
+    warnings: list[str] = field(default_factory=list)
+    #: 已有瓦片数（按任务 zoom 区间统计，不读 BLOB）
+    existing_tiles: int = 0
+    #: 任务目标瓦片数
+    target_tiles: int = 0
+
+    @property
+    def message(self) -> str:
+        """给用户看的一整段说明。"""
+        if self.compatible:
+            return ""
+        lines = [UI_TEXT_RESUME_INCOMPATIBLE]
+        lines.extend(f"· {problem}" for problem in self.problems)
+        return "\n".join(lines)
+
+
+def check_resume_compatibility(
+    task: DownloadTask,
+    metadata: MBTilesMetadata | None,
+    *,
+    tolerance: float = MBTILES_BOUNDS_TOLERANCE,
+) -> ResumeCompatibility:
+    """比对"已有 MBTiles 的元数据"与"任务参数"。
+
+    比对四项：范围、最小缩放、最大缩放、图层。前两项是硬性的——往一个
+    北京 z12 的库里写杭州 z15 的瓦片，得到的文件既不是北京也不是杭州，
+    只是坏掉的数据；图层同理（矢量底图和影像底图混在一起肉眼可见地花）。
+
+    ``metadata is None`` 表示"文件不存在或读不出元数据"：此时**视为兼容**
+    （当作全新下载），由调用方在日志里说明。
+
+    Args:
+        task: 任务记录。
+        metadata: 已有文件的元数据；``None`` 表示没有可比对的对象。
+        tolerance: 经纬度允许偏差（度）。
+
+    Returns:
+        :class:`ResumeCompatibility`
+    """
+    result = ResumeCompatibility(
+        target_tiles=max(0, int(task.total_tiles)),
+    )
+    if metadata is None:
+        return result
+
+    # --- 范围 ---
+    for name, task_value, meta_value in (
+        ("西边界", task.west, metadata.west),
+        ("南边界", task.south, metadata.south),
+        ("东边界", task.east, metadata.east),
+        ("北边界", task.north, metadata.north),
+    ):
+        if abs(float(task_value) - float(meta_value)) > tolerance:
+            result.problems.append(
+                f"{name}不一致：任务 {float(task_value):.6f}，文件 {float(meta_value):.6f}"
+            )
+
+    # --- 缩放 ---
+    if int(task.min_zoom) != int(metadata.min_zoom):
+        result.problems.append(
+            f"最小缩放不一致：任务 z{int(task.min_zoom)}，文件 z{int(metadata.min_zoom)}"
+        )
+    if int(task.max_zoom) != int(metadata.max_zoom):
+        result.problems.append(
+            f"最大缩放不一致：任务 z{int(task.max_zoom)}，文件 z{int(metadata.max_zoom)}"
+        )
+
+    # --- 图层 ---
+    # 图层不是 MBTiles 的标准字段，本工具把它写进 description。
+    # 提取得到才比对；提取不到就**不判不兼容**（否则会把别的工具生成的文件、
+    # 或用户自己改过 description 的文件一律拒之门外）。
+    if task.map_layer:
+        detected = _layer_tokens_in_description(metadata.description)
+        if detected and task.map_layer not in detected:
+            result.problems.append(
+                f"图层不一致：任务 {task.map_layer}，文件 {'/'.join(detected)}"
+            )
+        elif not detected and metadata.description and (
+            metadata.description != _default_description(task)
+        ):
+            result.warnings.append(
+                "文件的 description 与本次任务不同（无法从中识别图层，已放行）"
+            )
+
+    result.compatible = not result.problems
+    return result
+
+
+def _layer_tokens_in_description(description: str) -> list[str]:
+    """从 ``description`` 里尽力提取图层标识（形如 ``vec_w`` / ``cia_w``）。"""
+    found: list[str] = []
+    for match in re.finditer(r"([a-z]{2,4}_[a-z])\b", description or ""):
+        token = match.group(1)
+        if token not in found:
+            found.append(token)
+    return found
+
+
+def _default_description(task: DownloadTask) -> str:
+    """本工具写进 ``description`` 的标准内容（与 Slice 4 的写法保持一致）。"""
+    return (
+        f"天地图 {task.map_layer} "
+        f"z{task.min_zoom}~{task.max_zoom} "
+        f"{task.bounds}"
+    )
+
+
+def read_existing_metadata(path: str | Path) -> MBTilesMetadata | None:
+    """读取已有 ``.mbtiles`` 的元数据，**宽容地**还原成模型。
+
+    刻意不复用 :class:`MBTilesMetadata` 的严格构造器做"校验式读取"：
+    那个构造器对 ``format`` 有白名单，对数值有范围要求。别的工具生成的文件
+    完全可能带一个我们没见过的 format，而我们的目标是"读出信息用来比对"，
+    不是"拒绝这个文件"。因此不认识的字段退回默认值，完全读不出来才返回 ``None``。
+
+    Args:
+        path: MBTiles 路径。
+
+    Returns:
+        元数据；文件不存在 / 不是合法 SQLite / 缺关键键时返回 ``None``。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        with MBTilesReader(target) as reader:
+            raw = reader.get_metadata()
+    except (sqlite3.DatabaseError, OSError, RuntimeError):
+        return None
+
+    bounds = _parse_metadata_bounds(raw.get("bounds", ""))
+    if bounds is None:
+        return None
+    west, south, east, north = bounds
+    try:
+        min_zoom = int(float(raw.get("minzoom", "")))
+        max_zoom = int(float(raw.get("maxzoom", "")))
+    except (TypeError, ValueError):
+        return None
+
+    common = {
+        "name": raw.get("name") or target.stem,
+        "description": raw.get("description", ""),
+        "min_zoom": min_zoom,
+        "max_zoom": max_zoom,
+        "west": west,
+        "south": south,
+        "east": east,
+        "north": north,
+    }
+    try:
+        return MBTilesMetadata(format=(raw.get("format") or "png").strip().lower(), **common)
+    except ValueError:
+        # format 不认识：退回 png 再试一次；仍失败就认定"读不出元数据"。
+        try:
+            return MBTilesMetadata(format="png", **common)
+        except ValueError:
+            return None
+
+
+def _parse_metadata_bounds(value: str) -> tuple[float, float, float, float] | None:
+    """解析 metadata 里的 ``west,south,east,north``。"""
+    parts = [piece.strip() for piece in str(value).split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        west, south, east, north = (float(piece) for piece in parts)
+    except ValueError:
+        return None
+    return (west, south, east, north)
+
+
+# --------------------------------------------------------------------------- #
 # 结果
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -153,22 +375,77 @@ class MapDownloadOutcome:
     discarded: int = 0
     extra_lines: list[str] = field(default_factory=list)
 
+    # --- Slice 5：续传相关 ---
+    #: 本次是否是"继续已有任务"
+    resumed: bool = False
+    #: 开始前检测到的已有瓦片数
+    existing_tiles: int = 0
+    #: 任务目标瓦片数
+    target_tiles: int = 0
+    #: 存在性判断走的哪条路（批量缓存 / 索引查询）
+    skip_mode: SkipMode | None = None
+    #: 不能标成"已完成"的原因（``None`` 表示没有阻碍）
+    stop_reason: str | None = None
+
     @property
     def cancelled(self) -> bool:
         """是否是用户取消。"""
         return self.summary.cancelled
 
     @property
+    def pending_tiles(self) -> int:
+        """还需要下载的张数（目标 - 库里实际有的）。"""
+        return max(0, self.target_tiles - self.tile_count)
+
+    @property
     def is_success(self) -> bool:
-        """跑完、零失败、且文件通过校验。"""
-        return (
-            not self.cancelled and self.summary.failed == 0 and self.validation.valid
-        )
+        """是否"跑完 + 零失败 + 文件通过校验 + 库里张数达标"。
+
+        Spec §19 的完成判定：光"没报错"不算完成，必须
+        **数据库有效瓦片数 ≈ 任务目标瓦片数**。少了几张（服务端 404、
+        网络抖动重试耗尽）时不能标成已完成，否则用户以为拿到了完整地图。
+        """
+        if self.cancelled or not self.validation.valid:
+            return False
+        if self.summary.failed:
+            return False
+        if self.target_tiles and self.tile_count < self.target_tiles:
+            return False
+        return True
 
     @property
     def size_text(self) -> str:
         """格式化后的文件体积。"""
         return format_size(self.file_size)
+
+    @property
+    def failure_text(self) -> str:
+        """一句话说明"为什么没完成"，用于写进任务记录的 ``error``。"""
+        if self.cancelled:
+            return "任务已取消"
+        if not self.validation.valid:
+            errors = "；".join(self.validation.errors) or "校验未通过"
+            return f"MBTiles 校验未通过：{errors}"
+        if self.summary.failed:
+            detail = "；".join(
+                f"{reason}（{count} 张）" for reason, count in self.summary.top_failures()
+            )
+            return f"有 {self.summary.failed:,} 张瓦片下载失败：{detail}"
+        if self.target_tiles and self.tile_count < self.target_tiles:
+            return (
+                f"库中瓦片数不足：{self.tile_count:,} / {self.target_tiles:,}"
+                f"（缺 {self.pending_tiles:,} 张）"
+            )
+        return ""
+
+    @property
+    def verdict(self) -> DownloadTaskStatus:
+        """这次结果对应的任务状态（``COMPLETED`` / ``FAILED`` / ``CANCELLED``）。"""
+        if self.cancelled:
+            return DownloadTaskStatus.CANCELLED
+        if self.is_success:
+            return DownloadTaskStatus.COMPLETED
+        return DownloadTaskStatus.FAILED
 
     def as_lines(self) -> list[str]:
         """多行展示文案（GUI 结果区 / 日志逐行展示）。"""
@@ -179,15 +456,73 @@ class MapDownloadOutcome:
             f"Zoom：{self.validation.zoom_text}",
             f"验证：{self.validation.status_text}",
         ]
+        if self.resumed:
+            lines.append(
+                f"续传：已有 {self.existing_tiles:,} 张，本次跳过 "
+                f"{self.summary.skipped:,} 张，新下载 {self.summary.succeeded:,} 张"
+            )
+        elif self.summary.skipped:
+            lines.append(f"已有跳过：{self.summary.skipped:,} 张")
+        if self.target_tiles:
+            lines.append(
+                f"目标：{self.target_tiles:,} 张（偏差 "
+                f"{self.tile_count - self.target_tiles:+,}）"
+            )
         lines.extend(
             f"失败原因：{reason}（{count:,} 张）"
             for reason, count in self.summary.top_failures()
         )
         if self.discarded:
             lines.append(f"写库失败丢弃：{self.discarded:,} 张")
+        if self.summary.unprocessed:
+            lines.append(f"未处理（取消）：{self.summary.unprocessed:,} 张")
         lines.extend(self.validation.errors)
         lines.extend(self.extra_lines)
         return lines
+
+
+def _apply_task_verdict(task, task_service, outcome: MapDownloadOutcome) -> None:
+    """把 :meth:`MapDownloadOutcome.verdict` 的结果写进任务记录（Spec §18 / §19）。
+
+    放在服务层而不是 GUI 层的原因：任务的最终状态是**数据**，不是"界面效果"。
+    脚本、测试、将来的定时任务都可能直接调 ``MapDownloadService``；状态落盘
+    若只写在某一个 GUI 槽里，那些调用方就会留下一条永远 ``DOWNLOADING`` 的记录。
+
+    写盘失败**只记日志**：任务已经下完了，不能因为 tasks.json 不可写而让整个
+    下载被判定为失败。
+    """
+    if task is None or task_service is None:
+        return
+    try:
+        verdict = outcome.verdict
+        if verdict is DownloadTaskStatus.COMPLETED:
+            task_service.complete_task(task)
+        elif verdict is DownloadTaskStatus.CANCELLED:
+            task_service.cancel_task(task)
+        else:
+            task_service.fail_task(task, outcome.failure_text or "未达到完成条件")
+        # Spec §23 要求有一行能一眼看出"这个任务结束了、结果是什么"的日志
+        _logger.info(
+            "Task %s id=%s tiles=%d/%d failed=%d skipped=%d",
+            verdict.value,
+            task.id,
+            outcome.tile_count,
+            outcome.target_tiles,
+            outcome.summary.failed,
+            outcome.summary.skipped,
+        )
+    except Exception as exc:  # noqa: BLE001 - 见 docstring：落盘失败不该影响下载结论
+        _logger.warning("任务终态落盘失败 id=%s：%s", getattr(task, "id", "?"), exc)
+
+
+def _mark_task_failed(task, task_service, message: str) -> None:
+    """把任务标成 ``FAILED`` 并记下原因（写库阶段炸掉时用）。"""
+    if task is None or task_service is None:
+        return
+    try:
+        task_service.fail_task(task, message)
+    except Exception as exc:  # noqa: BLE001 - 同上：落盘失败不该盖住真正的错误
+        _logger.warning("任务失败态落盘失败 id=%s：%s", getattr(task, "id", "?"), exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +546,7 @@ class MapDownloadService:
 
     def __init__(
         self,
-        provider: TiandituProvider,
+        provider: TiandituProvider | None = None,
         *,
         concurrency: int = DEFAULT_DOWNLOAD_CONCURRENCY,
         timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -224,7 +559,9 @@ class MapDownloadService:
     ) -> None:
         """
         Args:
-            provider: 瓦片源（持有 Token）。
+            provider: 瓦片源（持有 Token）。可以传 ``None``，此时只能通过
+                :meth:`resume_task` 的 ``token`` 参数提供（恢复任务时 Token
+                来自界面输入，不在任务记录里）。
             concurrency: HTTP 并发数。
             timeout: 单请求超时（秒）。
             retry_policy: 重试策略，``None`` 用引擎默认。
@@ -237,6 +574,9 @@ class MapDownloadService:
         注意 ``transport`` 必须在这里暴露：``TileDownloader`` 用的是自己的
         transport，``TiandituProvider`` 上挂的那个不影响下载器。少了这个参数，
         集成测试就只能去打真实天地图——那既不允许也不稳定。
+        续传时由 ``token`` 现造的 provider 也会带上这个 transport（见
+        :meth:`_resolve_provider`），否则"恢复了任务却打了真网"这种事故
+        会在测试里悄悄发生。
         """
         self._provider = provider
         self._concurrency = concurrency
@@ -293,7 +633,7 @@ class MapDownloadService:
             manager.cancel()
 
     # ------------------------------------------------------------------ #
-    # 主流程
+    # 主流程：全新下载
     # ------------------------------------------------------------------ #
     async def download_to_mbtiles(
         self,
@@ -307,6 +647,9 @@ class MapDownloadService:
         description: str = "",
         image_format: str = "png",
         on_progress=None,
+        resume_policy: ResumePolicy | None = None,
+        task: DownloadTask | None = None,
+        task_service=None,
     ) -> MapDownloadOutcome:
         """下载给定范围并写成 MBTiles，返回最终结果。
 
@@ -319,6 +662,12 @@ class MapDownloadService:
             description: MBTiles 的 ``description``。
             image_format: 瓦片图片格式。
             on_progress: 进度回调（``DownloadProgress``），已节流。
+            resume_policy: 跳过策略。默认 ``None`` 即"不做跳过"——
+                全新下载的目标是"这个文件从无到有"，跳过已有瓦片是**续传**
+                才需要的行为（GUI 在用户选"继续下载"时会显式传入）。
+            task: 关联的任务记录（可选）。给了就会随进度落盘，
+                使"程序被强杀"最多只丢 1 秒的进度。
+            task_service: 任务服务（与 ``task`` 成对出现）。
 
         Returns:
             :class:`MapDownloadOutcome`
@@ -328,6 +677,186 @@ class MapDownloadService:
                 这种错误无法继续，必须让用户看见，因此不作降级处理。
             ValueError: 参数非法。
         """
+        return await self._execute(
+            provider=self._provider,
+            bounds=bounds,
+            min_zoom=min_zoom,
+            max_zoom=max_zoom,
+            layer=layer,
+            output_path=Path(output_path),
+            map_name=map_name,
+            description=description,
+            image_format=image_format,
+            on_progress=on_progress,
+            resume_policy=resume_policy,
+            task=task,
+            task_service=task_service,
+            resumed=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 主流程：断点续传（Slice 5）
+    # ------------------------------------------------------------------ #
+    async def resume_task(
+        self,
+        task: DownloadTask,
+        token: str = "",
+        *,
+        on_progress=None,
+        task_service=None,
+        resume_policy: ResumePolicy | None = None,
+    ) -> MapDownloadOutcome:
+        """继续一个已有任务：只下载缺失的瓦片，写回同一个 MBTiles。
+
+        流程严格按 Spec §11 / §12：
+
+        ::
+
+            读取 Task
+                ↓
+            检查 output_path（不存在 → 当全新下载，并有日志说明）
+                ↓
+            打开已有 MBTiles 读 metadata
+                ↓
+            一致性校验（bounds / 最小缩放 / 最大缩放 / 图层）
+                ↓ 不匹配 → 抛 MapResumeError，**一张都不写**
+            计算完整 Tile Range
+                ↓
+            检测已有瓦片（默认策略：只查坐标三列，不读 BLOB）
+                ↓
+            已有 → skip；缺失 → download
+                ↓
+            写入同一个 MBTiles（INSERT OR REPLACE，不会产生重复行）
+                ↓
+            任务进度持续落盘
+
+        Args:
+            task: 任务记录（来自 ``tasks.json``）。
+            token: 天地图 Token。**Token 不在任务记录里**（Spec §9），
+                恢复时要由界面重新提供；传空串则沿用构造本服务时的 provider。
+            on_progress: 进度回调。
+            task_service: 任务服务；给了就由本方法负责把进度与最终状态落盘。
+            resume_policy: 跳过策略，``None`` 用 :class:`ResumePolicy` 默认值
+                （跳过已有、不校验内容）。
+
+        Returns:
+            :class:`MapDownloadOutcome`。
+
+        Raises:
+            MapResumeError: 参数不兼容 / Token 缺失 / 图层无法识别。
+            MBTilesWriteError: 写库失败。
+        """
+        if not isinstance(task, DownloadTask):
+            raise ValueError(
+                f"task 必须是 DownloadTask，实际为 {type(task).__name__}"
+            )
+
+        # --- 1. 任务参数还原（bounds 的合法性由 GeoBounds 负责） ---
+        try:
+            bounds = GeoBounds(task.west, task.south, task.east, task.north)
+        except ValueError as exc:
+            raise MapResumeError(
+                f"任务 {task.id} 的范围非法，无法继续：{exc}"
+            ) from exc
+        try:
+            layer = MapLayerType(task.map_layer)
+        except ValueError as exc:
+            raise MapResumeError(
+                f"任务 {task.id} 的图层无法识别：{task.map_layer!r}；"
+                f"支持 {[item.value for item in MapLayerType]}"
+            ) from exc
+
+        path = Path(task.output_path)
+        _logger.info("Resume task: %s", task.id)
+
+        # --- 2. provider（Token 只在这一刻从内存里取，绝不落盘） ---
+        provider = self._resolve_provider(token)
+
+        # --- 3. 已有文件的一致性校验 ---
+        policy = resume_policy or ResumePolicy()
+        metadata: MBTilesMetadata | None = None
+        if path.is_file():
+            metadata = read_existing_metadata(path)
+            if metadata is None:
+                raise MapResumeError(
+                    f"已有文件无法读取元数据，不能安全续传：{path}"
+                )
+            compatibility = check_resume_compatibility(task, metadata)
+            if not compatibility.compatible:
+                # 关键：**一张都不写**。往不属于这个任务的地图包里写瓦片，
+                # 得到的既不是 A 也不是 B，只是一份坏数据。
+                raise MapResumeError(compatibility.message)
+            for message in compatibility.warnings:
+                _logger.warning("续传提示：%s", message)
+        else:
+            _logger.warning("目标文件不存在，按全新下载处理：%s", path)
+
+        # --- 4. 完整 Tile Range 与"已有 / 待下载" ---
+        total = estimate_tile_count(bounds, task.min_zoom, task.max_zoom)
+        zooms = list(range(int(task.min_zoom), int(task.max_zoom) + 1))
+        existing = count_existing_tiles(path, zooms) if path.is_file() else 0
+        task.total_tiles = total
+        task.skipped_tiles = 0
+        _logger.info("Existing tiles: %d", existing)
+        _logger.info("Remaining tiles: %d", max(0, total - existing))
+        for line in describe_existing_tiles(total, existing):
+            _logger.info("Resume %s", line)
+        _logger.info("Resume download started")
+
+        if task_service is not None:
+            task_service.resume_task(task)
+
+        # --- 5. 复用同一条落盘流水线（跳过判定由 resume_policy 驱动） ---
+        outcome = await self._execute(
+            provider=provider,
+            bounds=bounds,
+            min_zoom=int(task.min_zoom),
+            max_zoom=int(task.max_zoom),
+            layer=layer,
+            output_path=path,
+            map_name=task.name or None,
+            description=metadata.description if metadata else _default_description(task),
+            # 续传时**不重写**已有元数据（见 _execute 里 has_metadata 的判断）
+            image_format=metadata.format if metadata else "png",
+            on_progress=on_progress,
+            resume_policy=policy,
+            task=task,
+            task_service=task_service,
+            resumed=True,
+        )
+        _logger.info(
+            "Resume finished id=%s skipped=%d downloaded=%d failed=%d db_tiles=%d/%d",
+            task.id,
+            outcome.summary.skipped,
+            outcome.summary.succeeded,
+            outcome.summary.failed,
+            outcome.tile_count,
+            outcome.target_tiles,
+        )
+        return outcome
+
+    # ------------------------------------------------------------------ #
+    # 内部：落盘流水线（全新下载与续传共用）
+    # ------------------------------------------------------------------ #
+    async def _execute(
+        self,
+        *,
+        provider: TiandituProvider | None,
+        bounds: GeoBounds,
+        min_zoom: int,
+        max_zoom: int,
+        layer: MapLayerType,
+        output_path: Path,
+        map_name: str | None,
+        description: str,
+        image_format: str,
+        on_progress,
+        resume_policy: ResumePolicy | None,
+        task: DownloadTask | None,
+        task_service,
+        resumed: bool,
+    ) -> MapDownloadOutcome:
+        """建库 → 起 sink → 下载 → drain → close → 校验（两条入口共用）。"""
         if not isinstance(bounds, GeoBounds):
             raise ValueError(f"bounds 必须是 GeoBounds，实际为 {type(bounds).__name__}")
         if not isinstance(layer, MapLayerType):
@@ -336,7 +865,7 @@ class MapDownloadService:
                 f"支持 {[item.value for item in MapLayerType]}"
             )
 
-        path = Path(output_path)
+        path = output_path
         name = map_name or path.stem
         metadata = MBTilesMetadata.for_bounds(
             bounds,
@@ -351,20 +880,45 @@ class MapDownloadService:
         writer = MBTilesWriter(path, batch_size=self._batch_size)
         try:
             writer.open()
-            writer.write_metadata(metadata)
+            if not writer.has_metadata:
+                # 新库（或只有空表的文件）才写元数据；续传已有库时保留原有内容，
+                # 免得把用户改过的 name / description 覆盖掉。
+                writer.write_metadata(metadata)
         except Exception as exc:  # noqa: BLE001 - 建库失败统一归为写库失败
             # 建库阶段挂了（目录不可写、磁盘满、磁盘上的库已损坏……）：
             # 首先要保证不留下半个连接，其次要给出统一的异常类型，
             # 让 GUI 只需要认 MBTilesWriteError 一种"写盘失败"。
             writer.abort()
-            raise MBTilesWriteError(
-                f"无法创建 MBTiles（{path}）：{exc}"
-            ) from exc
+            message = f"无法创建 MBTiles（{path}）：{exc}"
+            _mark_task_failed(task, task_service, message)
+            raise MBTilesWriteError(message) from exc
+
+        # --- 跳过判定：用 writer 自己的写连接查"库里已有什么" ---
+        zooms = list(range(int(min_zoom), int(max_zoom) + 1))
+        policy = resume_policy or ResumePolicy.disabled()
+        total = estimate_tile_count(bounds, min_zoom, max_zoom)
+        # 只查一次（GROUP BY 一次拿回所有 zoom 的计数），别再放进生成器里循环调
+        counts_by_zoom = writer.count_tiles_by_zoom()
+        existing_tiles = sum(counts_by_zoom.get(zoom, 0) for zoom in zooms)
+        index = ExistingTileIndex(
+            writer, policy, expected_total=total, zooms=zooms
+        )
+        if index.mode is SkipMode.CACHED:
+            index.prime()
+        skip_predicate = make_skip_predicate(index) if policy.enabled else None
+        if policy.enabled:
+            _logger.info(
+                "已有瓦片索引：mode=%s existing=%d target=%d verify=%s",
+                index.mode.display_name,
+                existing_tiles,
+                total,
+                policy.verify_existing_tile,
+            )
 
         sink = MBTilesTileSink(writer, queue_capacity=self._queue_capacity)
         sink.start()
         downloader = TileDownloader(
-            self._provider,
+            provider,
             transport=self._transport,
             retry_policy=self._retry_policy,
             rate_limiter=self._rate_limiter,
@@ -388,7 +942,10 @@ class MapDownloadService:
                 max_zoom,
                 layer,
                 on_tile=sink.consume,
-                on_progress=self._make_progress_forwarder(manager, on_progress),
+                on_progress=self._make_progress_forwarder(
+                    manager, on_progress, task=task, task_service=task_service
+                ),
+                should_skip_tile=skip_predicate,
             )
         finally:
             self._manager = None
@@ -412,10 +969,12 @@ class MapDownloadService:
 
         if write_error is not None:
             # 写库失败属于"任务不可继续"，必须上抛（§14：不能被吞掉）
-            raise MBTilesWriteError(
+            message = (
                 f"MBTiles 写入失败（文件 {path}，已入库 {sink.written} 张，"
                 f"丢弃 {sink.discarded} 张）：{write_error}"
-            ) from write_error
+            )
+            _mark_task_failed(task, task_service, message)
+            raise MBTilesWriteError(message) from write_error
 
         tile_count, file_size = self._inspect(path)
         validation = validate_mbtiles(path)
@@ -427,12 +986,22 @@ class MapDownloadService:
             validation.zoom_text,
             validation.status_text,
         )
+        if policy.enabled:
+            for line in index.stats.as_lines():
+                _logger.info(line)
 
         extra_lines: list[str] = []
         if summary.cancelled:
-            extra_lines.append("状态：已取消，已完成瓦片已保留（Slice 5 支持断点续传）")
+            extra_lines.append(
+                "状态：已取消，已完成瓦片已保留；可在「下载任务」里点「继续」接着下"
+            )
+        if policy.verify_existing_tile and index.stats.invalid:
+            extra_lines.append(
+                f"已有瓦片中校验发现 {index.stats.invalid:,} 张损坏"
+                + ("，已重新下载覆盖" if policy.redownload_invalid_tile else "，已沿用")
+            )
 
-        return MapDownloadOutcome(
+        outcome = MapDownloadOutcome(
             summary=summary,
             output_path=path,
             metadata=metadata,
@@ -441,22 +1010,58 @@ class MapDownloadService:
             file_size=file_size,
             discarded=sink.discarded,
             extra_lines=extra_lines,
+            resumed=resumed,
+            existing_tiles=existing_tiles,
+            target_tiles=total,
+            skip_mode=index.mode if policy.enabled else None,
         )
+        # 终态在**数据流出这一层**落地：GUI / 脚本 / 测试任何调用方都自动获得
+        # 正确的任务状态，不必各自记得"跑完之后别忘了写状态"。
+        _apply_task_verdict(task, task_service, outcome)
+        return outcome
 
     # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
-    def _make_progress_forwarder(self, manager: DownloadManager, on_progress):
-        """包装进度回调：顺手把"写库失败"传导成"取消下载"。
+    def _resolve_provider(self, token: str | None) -> TiandituProvider:
+        """按"有没有传 Token"决定用哪个 provider。
+
+        刻意把 ``self._transport`` 带上：Token 是运行时拿到的，但**测试注入的
+        MockTransport 必须继续生效**——否则一个"恢复任务"的用例会突然去打真实
+        天地图，既是违规的（测试禁止触网）也是不稳定的。
+        """
+        cleaned = (token or "").strip()
+        if cleaned:
+            return TiandituProvider(cleaned, transport=self._transport)
+        if self._provider is not None:
+            return self._provider
+        raise MapResumeError(UI_TEXT_RESUME_TOKEN_REQUIRED)
+
+    def _make_progress_forwarder(
+        self,
+        manager: DownloadManager,
+        on_progress,
+        *,
+        task: DownloadTask | None = None,
+        task_service=None,
+    ):
+        """包装进度回调：顺手把"写库失败"传导成"取消下载"，并把进度落盘。
 
         写库挂了还继续下载纯属白耗配额，所以一旦 sink 报错就取消任务，
-        真正的异常仍由 :meth:`download_to_mbtiles` 统一抛出。
+        真正的异常仍由 :meth:`_execute` 统一抛出。
+
+        任务进度在这里落盘（而不是在 GUI 层）：GUI 的进度槽只在主线程收到
+        信号时才跑，而"程序被强杀"恰恰发生在没人处理信号的时候。放在数据流出
+        源头这一层，任何调用方（GUI、脚本、测试）都自动获得持久化。
         """
 
         def forward(progress: DownloadProgress) -> None:
             sink = self._sink
             if sink is not None and sink.failure is not None:
                 manager.cancel()
+            if task is not None and task_service is not None:
+                # update_progress 内部有节流（1 秒 / 100 张），这里不必再判
+                task_service.update_progress(task, progress)
             if on_progress is not None:
                 on_progress(progress)
 
@@ -472,3 +1077,29 @@ class MapDownloadService:
         file_size = path.stat().st_size if path.exists() else 0
         with MBTilesReader(path) as reader:
             return (reader.get_tile_count(), file_size)
+
+
+def count_existing_tiles(path: str | Path, zooms) -> int:
+    """统计一个已有 ``.mbtiles`` 在给定 zoom 区间里的瓦片数。
+
+    用 ``GROUP BY zoom_level`` 的计数查询，**不读任何 BLOB**（Spec §22）。
+    文件不存在 / 打不开时返回 ``0``——"数不出来"和"没有瓦片"在这个场景下
+    的后续动作是一样的（都要去下），没必要让调用方分辨。
+
+    Args:
+        path: MBTiles 路径。
+        zooms: 要统计的缩放级别（可迭代）。
+
+    Returns:
+        瓦片数。
+    """
+    target = Path(path)
+    if not target.is_file():
+        return 0
+    wanted = {int(zoom) for zoom in zooms}
+    try:
+        with MBTilesReader(target) as reader:
+            counts = reader.count_tiles_by_zoom()
+    except (sqlite3.DatabaseError, OSError, RuntimeError):
+        return 0
+    return sum(count for zoom, count in counts.items() if zoom in wanted)

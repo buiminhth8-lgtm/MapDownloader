@@ -345,7 +345,9 @@ async def test_cancel_keeps_already_downloaded_tiles(work_dir: Path) -> None:
         outcome = await task
 
     assert outcome.cancelled is True
-    assert outcome.summary.skipped > 0
+    # Slice 5 起：skipped 专指"已有瓦片未重下"，取消未轮到的记在 unprocessed
+    assert outcome.summary.unprocessed > 0
+    assert outcome.summary.skipped == 0
     assert outcome.summary.completed < expected        # 确实被打断了
     assert outcome.tile_count == outcome.summary.succeeded
     assert outcome.tile_count > 0                      # 但已下载的都留下来了

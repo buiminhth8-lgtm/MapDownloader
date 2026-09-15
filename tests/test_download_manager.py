@@ -630,9 +630,11 @@ async def test_cancel_returns_cancelled_summary() -> None:
     assert summary.cancelled is True
     assert summary.total == expected
     assert 0 <= summary.succeeded < expected  # 取消时通常还剩没下完的
-    # 三种归宿必须覆盖全部瓦片，不许凭空消失
-    assert summary.succeeded + summary.failed + summary.skipped == expected
-    assert summary.skipped > 0
+    # 三种归宿必须覆盖全部瓦片，不许凭空消失。
+    # Slice 5 起"没轮到"的瓦片记在 unprocessed（skipped 改成"已有瓦片未重下"）。
+    assert summary.succeeded + summary.failed + summary.unprocessed == expected
+    assert summary.unprocessed > 0
+    assert summary.skipped == 0  # 本次没有任何"已有瓦片"可跳
 
 
 async def test_cancel_while_paused_does_not_hang() -> None:

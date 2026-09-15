@@ -1,9 +1,11 @@
-"""批量瓦片下载调度（Slice 3）。
+"""批量瓦片下载调度（Slice 3；Slice 5 增加跳过已有瓦片）。
 
 结构（与 Spec 的推荐拓扑一致）::
 
     Tile Producer (协程，惰性生成)
           ↓
+      should_skip_tile(tile)         # Slice 5：已有瓦片在这里就被拦下
+          ↓ False
       asyncio.Queue  ← 有界，容量 = concurrency * 4
           ↓
     Worker 1 ─┐
@@ -14,6 +16,17 @@
     Worker 6 ─┘
           ↓
       on_progress(progress)          # 节流到 ~6.7 次/秒
+
+跳过判定（Slice 5）
+-------------------
+
+``should_skip_tile`` 在**生产者**里被调用，也就是在瓦片进入队列、进入任何
+HTTP 请求之前。命中的瓦片只增加 ``skipped`` 计数，完全不消耗天地图配额。
+判定失败（抛异常）时保守地按"需要下载"处理：宁可多下一张，也不能因为一次
+查询异常就把瓦片永久漏掉。
+
+``skipped``（库里有）与 ``unprocessed``（取消时没轮到）是两个不同的字段：
+前者计入 ``completed``，后者不计。
 
 关键约束（都是有意为之）
 ------------------------
@@ -63,6 +76,7 @@ from app.downloader.models import (
     DownloadProgress,
     DownloadSummary,
     ProgressCallback,
+    SkipPredicate,
     TileCallback,
     TileCoordinate,
     TileDownloadResult,
@@ -126,6 +140,17 @@ async def _maybe_await(value: object) -> None:
         await value  # type: ignore[misc]
 
 
+async def _maybe_await_bool(value: object) -> bool:
+    """求值一个"可能是协程"的布尔判定（Slice 5 的跳过谓词用）。
+
+    ``should_skip_tile`` 既可能是 ``lambda tile: True``（同步查表），
+    也可能是 ``async def``（异步存储/LRU）。这里统一求值，调用方只写一行。
+    """
+    if inspect.isawaitable(value):
+        return bool(await value)  # type: ignore[misc]
+    return bool(value)
+
+
 # --------------------------------------------------------------------------- #
 # 统计
 # --------------------------------------------------------------------------- #
@@ -137,14 +162,22 @@ class _Counters:
     succeeded: int = 0
     failed: int = 0
     bytes_downloaded: int = 0
+    #: 已有瓦片、本次跳过（Slice 5）
     skipped: int = 0
+    #: 因取消而完全没被处理的瓦片数
+    unprocessed: int = 0
     current_zoom: int | None = None
     #: 失败原因 → 张数。只存人话原因（不含 Token / 完整 URL）。
     failure_reasons: Counter[str] = field(default_factory=Counter)
 
     @property
     def completed(self) -> int:
-        return self.succeeded + self.failed
+        """已处理 = 成功 + 失败 + 已有跳过。
+
+        跳过的必须算进来：续传任务的分母是"任务目标张数"，如果跳过的 6 万张
+        不计入分子，进度条就会永远停在 40% 然后突然跳到 100%。
+        """
+        return self.succeeded + self.failed + self.skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +348,7 @@ class DownloadManager:
         layer: MapLayerType,
         on_tile: TileCallback | None = None,
         on_progress: ProgressCallback | None = None,
+        should_skip_tile: SkipPredicate | None = None,
     ) -> DownloadSummary:
         """下载覆盖范围内的全部瓦片。
 
@@ -326,6 +360,12 @@ class DownloadManager:
             on_tile: 单瓦片回调，**仅在下载成功时**调用，用于把瓦片字节交给
                 消费方（Slice 4 的 MBTilesWriter）。返回 ``None`` 或 awaitable 均可。
             on_progress: 进度回调，按 ``progress_interval_seconds`` 节流。
+            should_skip_tile: 跳过判定（Slice 5 的断点续传）。返回 ``True`` 的瓦片
+                **不会进入下载队列**，直接计入 ``skipped``。
+
+                **判定发生在生产者里，也就是任何 HTTP 请求之前**——
+                这是 Spec §5 的硬性要求："禁止先下载，再发现数据库里已经有"。
+                判定本身可以是同步函数，也可以是协程函数。
 
         Returns:
             :class:`DownloadSummary`。被取消时 ``cancelled=True``，已下载的
@@ -343,6 +383,10 @@ class DownloadManager:
                 f"layer 必须是 MapLayerType 成员，实际为 {layer!r}；"
                 f"支持 {[item.value for item in MapLayerType]}"
             )
+        if should_skip_tile is not None and not callable(should_skip_tile):
+            raise ValueError(
+                f"should_skip_tile 必须是可调用对象，实际为 {type(should_skip_tile).__name__}"
+            )
 
         # 交给 Slice 1 做 zoom 校验与瓦片统计（这里不复制任何公式）
         ranges = calculate_tile_ranges(bounds, min_zoom, max_zoom)
@@ -353,7 +397,15 @@ class DownloadManager:
         self._running = True
         try:
             return await self._run(
-                bounds, min_zoom, max_zoom, layer, ranges, total, on_tile, on_progress
+                bounds,
+                min_zoom,
+                max_zoom,
+                layer,
+                ranges,
+                total,
+                on_tile,
+                on_progress,
+                should_skip_tile,
             )
         finally:
             # 无论正常结束、取消还是异常，都必须把运行时状态清干净，
@@ -372,6 +424,7 @@ class DownloadManager:
         total: int,
         on_tile: TileCallback | None,
         on_progress: ProgressCallback | None,
+        should_skip_tile: SkipPredicate | None = None,
     ) -> DownloadSummary:
         """真正干活的部分（状态已就绪，异常由 :meth:`download` 统一收尾）。"""
         started = time.perf_counter()
@@ -402,7 +455,11 @@ class DownloadManager:
         assert gate is not None and self._cancel_event is not None
 
         producer = asyncio.create_task(
-            self._produce(queue, iter_tile_coordinates(bounds, min_zoom, max_zoom)),
+            self._produce(
+                queue,
+                iter_tile_coordinates(bounds, min_zoom, max_zoom),
+                should_skip_tile,
+            ),
             name="tile-producer",
         )
         workers = [
@@ -426,7 +483,7 @@ class DownloadManager:
                 if isinstance(item, BaseException):
                     self._logger.error("下载 worker 异常退出：%r", item)
 
-        self._finalize_skipped()
+        self._finalize_unprocessed()
         self._take_snapshot()
         await self._emit_progress(on_progress, force=True)
 
@@ -441,8 +498,16 @@ class DownloadManager:
         self,
         queue: asyncio.Queue[TileCoordinate | None],
         tiles: Iterator[TileCoordinate],
+        should_skip_tile: SkipPredicate | None = None,
     ) -> None:
-        """生产者：把瓦片喂进有界队列，受闸门与取消控制。"""
+        """生产者：把瓦片喂进有界队列，受闸门、取消与"跳过判定"控制。
+
+        跳过判定放在这里（而不是 worker 里）是**有意为之**：
+
+        - 命中的瓦片**根本不会进队列**，因此绝不会消耗 HTTP 配额，
+          也绝不会出现"下完了才发现库里已经有"的浪费；
+        - 判定与下载的先后顺序在代码结构上就是确定的，不依赖 worker 的自觉。
+        """
         assert self._gate is not None and self._cancel_event is not None
         gate = self._gate
         cancel_event = self._cancel_event
@@ -454,6 +519,24 @@ class DownloadManager:
             await gate.wait()
             if cancel_event.is_set():
                 return
+
+            if should_skip_tile is not None:
+                try:
+                    skip = await _maybe_await_bool(should_skip_tile(tile))
+                except Exception as exc:  # noqa: BLE001 - 判定失败不应该掀翻任务
+                    # 判定本身出错时**保守选择"下载"**：宁可多下一张，
+                    # 也不要因为一个查询异常就把瓦片永久漏掉。
+                    self._logger.warning(
+                        "跳过判定失败，按需要下载处理 %s：%r", tile, exc
+                    )
+                    skip = False
+                if skip:
+                    self._counters.skipped += 1
+                    self._counters.current_zoom = tile.z
+                    self._take_snapshot()
+                    await self._emit_progress(self._progress_callback, force=False)
+                    continue
+
             await queue.put(tile)
 
     async def _worker(
@@ -578,6 +661,7 @@ class DownloadManager:
             succeeded=self._counters.succeeded,
             failed=self._counters.failed,
             skipped=self._counters.skipped,
+            unprocessed=self._counters.unprocessed,
             bytes_downloaded=self._counters.bytes_downloaded,
             tiles_per_second=self._speed(now),
             current_zoom=self._counters.current_zoom,
@@ -614,16 +698,23 @@ class DownloadManager:
         self._cancelled = False
         self._progress_callback = None
 
-    def _finalize_skipped(self) -> None:
-        """被取消时把"没轮到的瓦片"记成 skipped。
+    def _finalize_unprocessed(self) -> None:
+        """被取消时把"根本没轮到的瓦片"记成 ``unprocessed``。
 
-        本 Slice 没有断点续传，跳过的瓦片不会被补下——``skipped`` 只是让用户
-        知道"这次少下了多少张"，不做任何后续动作。
+        Slice 5 起 ``skipped`` 的含义是"已有瓦片、本次未重下"，
+        与"因取消而没处理"是两件完全不同的事，因此拆成两个字段：
+
+        - ``skipped``：库里有 → 不需要下。**这是成果**，会计入 ``completed``。
+        - ``unprocessed``：还没来得及处理 → 下次续传再下。**这是欠账**。
+
+        混在一起会让"续传了 6 万张"和"取消了剩 6 万张"在界面上长得一模一样。
         """
         if not self._cancelled:
-            self._counters.skipped = 0
+            self._counters.unprocessed = 0
             return
-        self._counters.skipped = max(0, self._counters.total - self._counters.completed)
+        self._counters.unprocessed = max(
+            0, self._counters.total - self._counters.completed
+        )
 
     def _build_summary(self, started: float, *, cancelled: bool) -> DownloadSummary:
         """汇总本次任务。"""
@@ -635,6 +726,7 @@ class DownloadManager:
             succeeded=counters.succeeded,
             failed=counters.failed,
             skipped=counters.skipped,
+            unprocessed=counters.unprocessed,
             bytes_downloaded=counters.bytes_downloaded,
             duration_seconds=duration,
             average_tiles_per_second=(completed / duration) if duration > 0 else 0.0,
@@ -646,17 +738,21 @@ class DownloadManager:
         """按 Spec 要求的格式输出收尾日志，并附上失败原因（若失败）。"""
         if summary.cancelled:
             self._logger.info(
-                "Download cancelled success=%d failed=%d skipped=%d duration=%.2fs",
+                "Download cancelled success=%d failed=%d skipped=%d unprocessed=%d "
+                "duration=%.2fs",
                 summary.succeeded,
                 summary.failed,
                 summary.skipped,
+                summary.unprocessed,
                 summary.duration_seconds,
             )
         else:
             self._logger.info(
-                "Download completed success=%d failed=%d duration=%.2fs speed=%.1f/s",
+                "Download completed success=%d failed=%d skipped=%d duration=%.2fs "
+                "speed=%.1f/s",
                 summary.succeeded,
                 summary.failed,
+                summary.skipped,
                 summary.duration_seconds,
                 summary.average_tiles_per_second,
             )

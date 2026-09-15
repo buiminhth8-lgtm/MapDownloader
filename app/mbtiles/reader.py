@@ -1,6 +1,16 @@
-"""MBTiles 读取器（Slice 4）。
+"""MBTiles 读取器（Slice 4；Slice 5 补齐"已有瓦片"批量接口）。
 
-最小读取能力：元数据、瓦片总数、zoom 区间、单瓦片存在性 / 内容。
+最小读取能力：元数据、瓦片总数、zoom 区间、单瓦片存在性 / 内容，
+以及断点续传需要的"列出已有瓦片坐标"。
+
+Slice 5 新增的三个接口都是**只查坐标三列、绝不读 ``tile_data``** 的形态：
+
+- :meth:`MBTilesReader.iter_existing_tiles` —— 惰性产出 ``(z, x, y_xyz)``
+- :meth:`MBTilesReader.get_existing_tiles` —— 上面那个的 ``set`` 版本（小任务用）
+- :meth:`MBTilesReader.count_tiles_by_zoom` —— 只要计数，连坐标都不搬进内存
+
+原因见 Spec §22：一个 z14 级别的库有几十万张瓦片，每张几十 KB，
+"顺便 SELECT tile_data 判存在"就是几个 GB 的内存与磁盘 IO。
 
 坐标约定（与 Writer 一致）
 --------------------------
@@ -26,6 +36,7 @@ from __future__ import annotations
 import logging
 import operator
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 from app.geo import (
@@ -35,7 +46,16 @@ from app.geo import (
     xyz_y_to_tms_y,
 )
 
-__all__ = ["MBTilesReader"]
+__all__ = [
+    "MBTilesReader",
+    # 只读 SQL 常量：``writer.py`` 复用它做"已存在瓦片"查询，
+    # 避免两处各写一份 SQL（一处改错就会出现"写的和查的不是同一张表"）。
+    "TILE_EXISTS_SQL",
+    "TILE_DATA_SQL",
+    "EXISTING_TILES_SQL",
+    "EXISTING_TILES_BY_ZOOM_SQL",
+    "TILE_COUNT_BY_ZOOM_SQL",
+]
 
 
 _logger = logging.getLogger(__name__)
@@ -51,14 +71,31 @@ _SELECT_TILE_COUNT_SQL = "SELECT COUNT(*) FROM tiles"
 #: 靠主键索引最左前缀做 MIN/MAX 优化，不需要全表扫描
 _SELECT_ZOOM_RANGE_SQL = "SELECT MIN(zoom_level), MAX(zoom_level) FROM tiles"
 
-_SELECT_TILE_EXISTS_SQL = (
+#: 单张瓦片是否存在。用 ``SELECT 1`` 而不是 ``SELECT tile_data``：
+#: 存在性判断绝不能把 BLOB 读进内存（Slice 5 §22 的硬性要求）——
+#: 一个 z14 级别的库有几十万张瓦片，每张几十 KB，全读一遍就是几个 GB 的
+#: 内存与磁盘 IO。
+TILE_EXISTS_SQL = (
     "SELECT 1 FROM tiles "
     "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ? LIMIT 1"
 )
 
-_SELECT_TILE_DATA_SQL = (
+#: 读取单张瓦片字节。**只在显式校验已有瓦片时使用**（默认续传路径不会走到）。
+TILE_DATA_SQL = (
     "SELECT tile_data FROM tiles "
     "WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
+)
+
+#: 列出现有瓦片坐标。**只查三列，永不 SELECT tile_data**。
+EXISTING_TILES_SQL = "SELECT zoom_level, tile_column, tile_row FROM tiles"
+
+EXISTING_TILES_BY_ZOOM_SQL = (
+    "SELECT tile_column, tile_row FROM tiles WHERE zoom_level = ?"
+)
+
+#: 按 zoom 汇总瓦片数。走主键索引的最左前缀，不读任何一行数据。
+TILE_COUNT_BY_ZOOM_SQL = (
+    "SELECT zoom_level, COUNT(*) FROM tiles GROUP BY zoom_level"
 )
 
 _SELECT_TABLES_SQL = "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -195,13 +232,83 @@ class MBTilesReader:
     def has_tile(self, z: int, x: int, y_xyz: int) -> bool:
         """判断某张瓦片是否在库中（入参为 **XYZ**）。
 
+        走主键唯一索引，**不读 BLOB**：这是断点续传"这张已经下过了吗"的主查询。
+
         Raises:
             RuntimeError: 未 ``open()``。
             ValueError: z/x/y 非法。
         """
         conn = self._require_open()
         params = self._tms_params(z, x, y_xyz)
-        return conn.execute(_SELECT_TILE_EXISTS_SQL, params).fetchone() is not None
+        return conn.execute(TILE_EXISTS_SQL, params).fetchone() is not None
+
+    # ------------------------------------------------------------------ #
+    # 已有瓦片批量列举（Slice 5：断点续传用）
+    # ------------------------------------------------------------------ #
+    def iter_existing_tiles(
+        self, zoom: int | None = None
+    ) -> Iterator[tuple[int, int, int]]:
+        """惰性产出库里已有的瓦片坐标 ``(z, x, y_xyz)``（**XYZ** 语义）。
+
+        惰性生成器而不是 list：调用方可能只需要"边遍历边比对"，
+        没必要为了走一遍而把所有坐标先铺到内存里。
+
+        Args:
+            zoom: 只列举该缩放级别；``None`` 表示全部级别。
+
+        Yields:
+            ``(z, x, y_xyz)``。
+
+        Raises:
+            RuntimeError: 未 ``open()``。
+            ValueError: ``zoom`` 非 ``None`` 且非法。
+        """
+        conn = self._require_open()
+        if zoom is None:
+            rows = conn.execute(EXISTING_TILES_SQL)
+        else:
+            valid_zoom = validate_zoom(zoom)
+            rows = (
+                (valid_zoom, column, row)
+                for column, row in conn.execute(
+                    EXISTING_TILES_BY_ZOOM_SQL, (valid_zoom,)
+                )
+            )
+        for level, column, row in rows:
+            level_value = int(level)
+            yield (level_value, int(column), tms_y_to_xyz_y(level_value, int(row)))
+
+    def get_existing_tiles(
+        self, zoom: int | None = None
+    ) -> set[tuple[int, int, int]]:
+        """列出库里已有的瓦片坐标集合 ``{(z, x, y_xyz)}``（**XYZ** 语义）。
+
+        这是 Spec 要求的高效接口：**只查 ``zoom_level / tile_column /
+        tile_row`` 三列**，从不 ``SELECT tile_data``。
+
+        Args:
+            zoom: 只取该缩放级别；``None`` 表示全部级别。
+
+        Returns:
+            坐标集合；库为空时返回空集合。
+
+        Raises:
+            RuntimeError: 未 ``open()``。
+            ValueError: ``zoom`` 非 ``None`` 且非法。
+        """
+        return set(self.iter_existing_tiles(zoom))
+
+    def count_tiles_by_zoom(self) -> dict[int, int]:
+        """按缩放级别统计瓦片数，``{zoom: 张数}``（库为空时返回空 dict）。
+
+        比 ``get_existing_tiles()`` 更省内存：只回一行一个 zoom 的计数，
+        不需要把几十万个坐标搬进 Python。适合"只想看看已有多少"的场景。
+        """
+        conn = self._require_open()
+        return {
+            int(level): int(count)
+            for level, count in conn.execute(TILE_COUNT_BY_ZOOM_SQL)
+        }
 
     def read_tile(self, z: int, x: int, y_xyz: int) -> bytes | None:
         """读取一张瓦片的字节（入参为 **XYZ**）。
@@ -216,7 +323,7 @@ class MBTilesReader:
         """
         conn = self._require_open()
         params = self._tms_params(z, x, y_xyz)
-        row = conn.execute(_SELECT_TILE_DATA_SQL, params).fetchone()
+        row = conn.execute(TILE_DATA_SQL, params).fetchone()
         if row is None:
             return None
         return bytes(row[0])

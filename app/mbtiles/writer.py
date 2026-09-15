@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Iterator
 from contextlib import suppress
 from pathlib import Path
 
@@ -57,8 +58,23 @@ from app.config.settings import (
     MIN_MBTILES_QUEUE_CAPACITY,
 )
 from app.downloader import TileDownloadResult
-from app.geo import validate_tile_axis, validate_zoom, xyz_y_to_tms_y
+from app.geo import (
+    tms_y_to_xyz_y,
+    validate_tile_axis,
+    validate_zoom,
+    xyz_y_to_tms_y,
+)
 from app.mbtiles.models import MBTilesMetadata
+
+# 复用 reader 的只读 SQL：同一个包内，两个模块查的必须是同一张表、同一套列。
+# 各写一份 SQL 的风险是"writer 查 A 表、reader 查 B 表"这种极难发现的漂移。
+from app.mbtiles.reader import (
+    EXISTING_TILES_BY_ZOOM_SQL,
+    EXISTING_TILES_SQL,
+    TILE_COUNT_BY_ZOOM_SQL,
+    TILE_DATA_SQL,
+    TILE_EXISTS_SQL,
+)
 
 __all__ = ["MBTilesWriteError", "MBTilesWriter", "MBTilesTileSink"]
 
@@ -240,6 +256,16 @@ class MBTilesWriter:
         """批量事务大小。"""
         return self._batch_size
 
+    @property
+    def has_metadata(self) -> bool:
+        """库里是否已经有 ``metadata`` 行（断点续传时用来判断"要不要写元数据"）。
+
+        续传一个已有的库时**不应该**重写元数据：那会把用户可能改过的
+        ``description`` / ``name`` 覆盖成我们的默认值。只有新库（或只有空表
+        的文件）才需要写入。
+        """
+        return self._metadata_written
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
@@ -344,6 +370,99 @@ class MBTilesWriter:
         self._pending.append((zoom, column, tile_row, payload))
         if len(self._pending) >= self._batch_size:
             self.flush()
+
+    # ------------------------------------------------------------------ #
+    # 已有瓦片查询（Slice 5：断点续传）
+    #
+    # 断点续传要在**下载之前**知道"这张库里有吗"，而此刻 writer 已经拿着
+    # 写连接了。再开一个只读连接去查同一个文件，会撞上 WAL 的跨连接可见性
+    # 与 ``-shm`` 权限问题（Windows 上尤其容易出岔子）；直接用手里这条写连接
+    # 查则完全没有这些边界情况，而且看到的就是"这个文件里真实存在什么"。
+    #
+    # 语义提醒：``write_tile`` 是**批量缓冲**的，尚未提交的瓦片查不到。
+    # 这对续传没有影响（生产者对每个坐标只会问一次），但如果将来有人做
+    # "边下边查重"，必须先把这一点想清楚。
+    # ------------------------------------------------------------------ #
+    def tile_count(self) -> int:
+        """库里当前的瓦片数（走 ``COUNT(*)``，不读 BLOB）。"""
+        conn = self._require_open()
+        row = conn.execute("SELECT COUNT(*) FROM tiles").fetchone()
+        return int(row[0]) if row else 0
+
+    def has_tile(self, z: int, x: int, y_xyz: int) -> bool:
+        """判断某张瓦片是否已在库中（入参为 **XYZ**）。
+
+        用 ``SELECT 1 ... LIMIT 1`` 走主键唯一索引，**不读 tile_data**。
+
+        Raises:
+            RuntimeError: 未 ``open()``。
+            ValueError: z/x/y 非法。
+        """
+        conn = self._require_open()
+        zoom = validate_zoom(z)
+        column = validate_tile_axis("x", x, zoom)
+        row_xyz = validate_tile_axis("y", y_xyz, zoom)
+        params = (zoom, column, xyz_y_to_tms_y(zoom, row_xyz))
+        return conn.execute(TILE_EXISTS_SQL, params).fetchone() is not None
+
+    def read_tile(self, z: int, x: int, y_xyz: int) -> bytes | None:
+        """读取一张瓦片的字节（入参为 **XYZ**）；不存在返回 ``None``。
+
+        只应被 ``ResumePolicy.verify_existing_tile=True`` 这条显式路径调用
+        （那是一种"宁可慢也要确认库里那几张没坏"的选择）。
+        默认策略下续传**绝不**调用本方法，因此不会读任何 BLOB。
+
+        Raises:
+            RuntimeError: 未 ``open()``。
+            ValueError: z/x/y 非法。
+        """
+        conn = self._require_open()
+        zoom = validate_zoom(z)
+        column = validate_tile_axis("x", x, zoom)
+        row_xyz = validate_tile_axis("y", y_xyz, zoom)
+        params = (zoom, column, xyz_y_to_tms_y(zoom, row_xyz))
+        row = conn.execute(TILE_DATA_SQL, params).fetchone()
+        if row is None:
+            return None
+        return bytes(row[0]) if row[0] else b""
+
+    def iter_existing_tiles(
+        self, zoom: int | None = None
+    ) -> Iterator[tuple[int, int, int]]:
+        """惰性产出库里已有的瓦片坐标 ``(z, x, y_xyz)``（**XYZ**，不读 BLOB）。"""
+        conn = self._require_open()
+        if zoom is None:
+            rows = conn.execute(EXISTING_TILES_SQL)
+        else:
+            valid_zoom = validate_zoom(zoom)
+            rows = (
+                (valid_zoom, column, row)
+                for column, row in conn.execute(
+                    EXISTING_TILES_BY_ZOOM_SQL, (valid_zoom,)
+                )
+            )
+        for level, column, row in rows:
+            level_value = int(level)
+            yield (level_value, int(column), tms_y_to_xyz_y(level_value, int(row)))
+
+    def get_existing_tiles(
+        self, zoom: int | None = None
+    ) -> set[tuple[int, int, int]]:
+        """列出库里已有的瓦片坐标集合（**XYZ** 语义，只查三列）。
+
+        Raises:
+            RuntimeError: 未 ``open()``。
+            ValueError: ``zoom`` 非 ``None`` 且非法。
+        """
+        return set(self.iter_existing_tiles(zoom))
+
+    def count_tiles_by_zoom(self) -> dict[int, int]:
+        """按缩放级别统计瓦片数 ``{zoom: 张数}``（不读 BLOB）。"""
+        conn = self._require_open()
+        return {
+            int(level): int(count)
+            for level, count in conn.execute(TILE_COUNT_BY_ZOOM_SQL)
+        }
 
     def flush(self) -> None:
         """把缓冲里的瓦片一次性 ``executemany`` 并提交（无缓冲时是空操作）。

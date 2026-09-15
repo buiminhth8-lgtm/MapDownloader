@@ -40,6 +40,16 @@ from app.downloader.models import (
     TileFailureKind,
 )
 from app.downloader.rate_limiter import RateLimiter
+from app.downloader.resume import (
+    ExistingTileIndex,
+    ExistingTileStats,
+    ResumePolicy,
+    SkipMode,
+    SkipPredicate,
+    TileProbe,
+    describe_existing_tiles,
+    make_skip_predicate,
+)
 from app.downloader.retry_policy import (
     RETRYABLE_STATUS_CODES,
     RetryPolicy,
@@ -60,6 +70,15 @@ __all__ = [
     "is_retryable_status_code",
     "RETRYABLE_STATUS_CODES",
     "RateLimiter",
+    # 断点续传（Slice 5）
+    "ResumePolicy",
+    "SkipMode",
+    "SkipPredicate",
+    "TileProbe",
+    "ExistingTileIndex",
+    "ExistingTileStats",
+    "make_skip_predicate",
+    "describe_existing_tiles",
     # 模型
     "TileCoordinate",
     "TileDownloadResult",

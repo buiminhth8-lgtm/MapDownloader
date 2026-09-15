@@ -1,4 +1,4 @@
-"""下载并落盘的后台执行器（Slice 3 → Slice 4 演进）。
+"""下载并落盘的后台执行器（Slice 3 → Slice 4 → Slice 5 演进）。
 
 这是薄薄的**线程 + 事件循环胶水**：把 ``app.services`` 的协程跑到 UI 主线程
 之外，并把进度 / 结果通过 Qt 信号送回主线程。
@@ -16,17 +16,18 @@
 - 本类只负责"起线程 → 建 service → 转发信号 → 支持暂停/继续/取消"；
 - ``MainWindow`` 只负责"读表单 → 建 worker → 展示"。
 
-Slice 4 的改动只有一处：把上一版的 ``DownloadManager`` 换成了
-``MapDownloadService``（后者内部仍然是 ``DownloadManager`` + ``MBTilesTileSink``），
-因此暂停/继续/取消的语义、信号形状都保持不变。
+Slice 5 的改动：多了一种入口。给 ``resume_task`` 传一个任务记录时，走
+``MapDownloadService.resume_task``（跳过已有瓦片）；不传就是原来的全新下载。
+两种模式共用同一套信号与暂停/取消路径，因此 UI 侧不需要分支。
 
 暂停 / 取消的时序细节
 ---------------------
 
 ``pause()`` / ``cancel()`` 可能在任务真正启动**之前**就被调用（用户点得快，
 或测试点得快）。此时 ``service`` 已经建好但内部 ``manager`` 还不存在，
-指令会被记在 ``_pending_*`` 上，并在**第一次进度回调**里落地——那一帧恰好发生在
-``DownloadManager`` 的闸门与取消事件就绪之后，时机刚好。
+指令会被记在 ``_pause_requested`` / ``_cancel_requested`` 上，并在
+**第一次进度回调**里落地——那一帧恰好发生在 ``DownloadManager`` 的闸门与
+取消事件就绪之后，时机刚好。
 """
 
 from __future__ import annotations
@@ -44,18 +45,19 @@ from app.config.settings import (
     DEFAULT_REQUEST_TIMEOUT,
     PROGRESS_EMIT_INTERVAL_SECONDS,
 )
-from app.downloader import DownloadProgress, RateLimiter, RetryPolicy
+from app.downloader import DownloadProgress, RateLimiter, ResumePolicy, RetryPolicy
 from app.geo import GeoBounds
 from app.mbtiles import MBTilesWriteError
+from app.models.download_task import DownloadTask
 from app.models.map_layer import MapLayerType
 from app.providers import TiandituProvider
-from app.services import MapDownloadService
+from app.services import MapDownloadService, MapResumeError
 
 __all__ = ["DownloadWorker"]
 
 
 class DownloadWorker(QThread):
-    """在后台线程里跑一次"下载 → 写入 MBTiles"。
+    """在后台线程里跑一次"下载 → 写入 MBTiles"（全新下载或续传）。
 
     信号名刻意避开 ``QThread`` 自带的 ``finished``。
     """
@@ -86,12 +88,17 @@ class DownloadWorker(QThread):
         batch_size: int = DEFAULT_MBTILES_BATCH_SIZE,
         progress_interval_seconds: float = PROGRESS_EMIT_INTERVAL_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
+        resume_policy: ResumePolicy | None = None,
+        resume_task: DownloadTask | None = None,
+        token: str = "",
+        task: DownloadTask | None = None,
+        task_service=None,
         parent: QObject | None = None,
     ) -> None:
         """
         Args:
             provider: 瓦片源（持有 Token，不对外展示）。
-            bounds: 下载范围。
+            bounds: 下载范围（续传模式下取自任务记录）。
             min_zoom: 起始缩放级别。
             max_zoom: 结束缩放级别（含）。
             layer: 图层类型。
@@ -107,6 +114,13 @@ class DownloadWorker(QThread):
             batch_size: MBTiles 批量事务大小。
             progress_interval_seconds: 进度信号的最小间隔（秒）。
             transport: 传输层，**仅供测试注入 ``httpx.MockTransport``**。
+            resume_policy: 跳过策略；``None`` 表示不跳过已有瓦片。
+            resume_task: **续传模式**的任务记录。非 ``None`` 时走
+                ``service.resume_task``，此时 ``bounds/zoom/layer`` 只是
+                冗余信息（服务层会以任务记录为准重新校验）。
+            token: 续传时用的 Token（任务记录里不存 Token，Spec §9）。
+            task: 用于**持续落盘进度**的任务记录（全新下载时由 UI 先创建）。
+            task_service: 任务服务，与 ``task`` 成对出现。
             parent: Qt 父对象。
         """
         super().__init__(parent)
@@ -126,6 +140,11 @@ class DownloadWorker(QThread):
         self._batch_size = batch_size
         self._progress_interval = progress_interval_seconds
         self._transport = transport
+        self._resume_policy = resume_policy
+        self._resume_task = resume_task
+        self._token = token
+        self._task = task
+        self._task_service = task_service
 
         #: 编排器实例，仅在 worker 线程内被创建 / 使用
         self._service = None
@@ -155,6 +174,11 @@ class DownloadWorker(QThread):
     def output_path(self) -> Path:
         """本次任务的输出文件路径。"""
         return self._output_path
+
+    @property
+    def is_resume(self) -> bool:
+        """本次是否是"继续已有任务"。"""
+        return self._resume_task is not None
 
     @property
     def pause_requested(self) -> bool:
@@ -198,6 +222,9 @@ class DownloadWorker(QThread):
         except MBTilesWriteError as exc:
             # 写盘失败（磁盘满 / 库损坏 / 无写权限）——必须让用户看见原话
             self.failed.emit(f"写入 MBTiles 失败：{exc}")
+        except MapResumeError as exc:
+            # 无法安全续传（参数不匹配 / 缺 Token）：消息本身就是给用户看的
+            self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001 - 绝不让异常冒泡进 Qt 事件循环
             self.failed.emit(f"下载异常终止：{exc}")
 
@@ -216,16 +243,29 @@ class DownloadWorker(QThread):
         )
         self._service = service
         try:
-            outcome = await service.download_to_mbtiles(
-                self._bounds,
-                self._min_zoom,
-                self._max_zoom,
-                self._layer,
-                self._output_path,
-                map_name=self._map_name,
-                description=self._description,
-                on_progress=self._on_progress,
-            )
+            if self._resume_task is not None:
+                # 续传：参数以**任务记录**为准，Target 文件里的已有瓦片会被跳过
+                outcome = await service.resume_task(
+                    self._resume_task,
+                    self._token,
+                    on_progress=self._on_progress,
+                    task_service=self._task_service,
+                    resume_policy=self._resume_policy,
+                )
+            else:
+                outcome = await service.download_to_mbtiles(
+                    self._bounds,
+                    self._min_zoom,
+                    self._max_zoom,
+                    self._layer,
+                    self._output_path,
+                    map_name=self._map_name,
+                    description=self._description,
+                    on_progress=self._on_progress,
+                    resume_policy=self._resume_policy,
+                    task=self._task,
+                    task_service=self._task_service,
+                )
         finally:
             self._service = None
         self.completed.emit(outcome)
