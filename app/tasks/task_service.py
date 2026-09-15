@@ -114,6 +114,7 @@ class TaskService:
         map_layer: MapLayerType | str,
         output_path: str | Path,
         total_tiles: int = 0,
+        with_labels: bool = False,
         task_id: str | None = None,
     ) -> DownloadTask:
         """建一条新任务并**立即落盘**。
@@ -125,6 +126,9 @@ class TaskService:
             map_layer: 图层（枚举或 ``MapLayerType.value`` 字符串）。
             output_path: 目标 ``.mbtiles``。
             total_tiles: 目标瓦片数（可由 Tile Math 预算得到；未知时留 0）。
+            with_labels: 本次是否把中文注记合成进瓦片（Slice 6）。
+                必须落盘：续传时要靠它比对已有 MBTiles 的 ``composition``，
+                否则"合成任务续到一个纯底图文件上"会被静默放行。
             task_id: 指定 id（测试用；正常不传）。
 
         Returns:
@@ -153,14 +157,16 @@ class TaskService:
             max_zoom=int(max_zoom),
             output_path=Path(output_path),
             total_tiles=max(0, int(total_tiles)),
+            with_labels=bool(with_labels),
         )
         self._store.save(task)
         self._mark_saved(task)
         self._logger.info(
-            "Task created id=%s name=%s layer=%s tiles=%d",
+            "Task created id=%s name=%s layer=%s labels=%s tiles=%d",
             task.id,
             task.name,
             task.map_layer,
+            task.with_labels,
             task.total_tiles,
         )
         return task

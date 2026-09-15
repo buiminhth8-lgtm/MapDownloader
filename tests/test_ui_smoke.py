@@ -11,12 +11,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import io
 import time
 from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import QLabel, QMessageBox
 
@@ -35,7 +38,7 @@ from app.geo import (
 )
 from app.main import STARTUP_MESSAGES, _report_startup
 from app.mbtiles import MBTilesMetadata, MBTilesReader, MBTilesWriter
-from app.models import DownloadTaskStatus, MapLayerType
+from app.models import DownloadTaskStatus, MapLayerType, MapType, composition_for
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import build_output_path
 from app.tasks import TaskService, TaskStore
@@ -56,8 +59,24 @@ from app.ui.main_window import MainWindow
 #: 假 Token（禁止替换为真实密钥）
 FAKE_TOKEN = "abcdefghijklmn"
 
-#: 只需文件头正确，校验逻辑按 magic bytes 判定
-FAKE_PNG = PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + b"tile-payload" * 32
+
+def _real_png(size: int = settings.TILE_SIZE) -> bytes:
+    """生成一张**真的能被解码**的 PNG。
+
+    Slice ≤5 只要文件头正确就够了（校验按 magic bytes 判定）；Slice 6 的中文注记
+    合成是真的要 ``Image.open`` + ``alpha_composite``，所以桩数据必须是一张合法
+    图片——否则所有涉及下载的用例都会变成"合成失败 6 张"，
+    测的就不再是业务逻辑，而是桩数据本身。
+    """
+    buffer = io.BytesIO()
+    Image.new("RGBA", (size, size), (0, 0, 0, 0)).save(buffer, format="PNG")
+    data = buffer.getvalue()
+    assert data.startswith(PNG_SIGNATURE)  # 与生产判定用的是同一套 magic bytes
+    return data
+
+
+#: 假瓦片：一张 256×256 的透明 PNG（文件头与内容都是真的）
+FAKE_PNG = _real_png()
 
 #: 退避为 0 的重试策略：行为与生产一致，但测试不用真的等
 FAST_POLICY = RetryPolicy(max_attempts=3, base_delay_seconds=0.0, max_delay_seconds=0.0)
@@ -108,6 +127,23 @@ def _png_handler(
         )
 
     return handler
+
+
+class _RecordingLayerServer:
+    """假天地图服务：记录每一次请求打的是哪个图层，并返回一张真 PNG。
+
+    与 ``_png_handler`` 的区别在于"按请求作答"：合成模式下能不能分清
+    ``vec`` / ``cva``（以及它们的请求次数）是必须验证的事。
+    """
+
+    def __init__(self) -> None:
+        self.layers: list[str] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.layers.append(str(request.url.params.get("LAYER", "")))
+        return httpx.Response(
+            200, content=FAKE_PNG, headers={"content-type": "image/png"}
+        )
 
 
 def _stub_transport(monkeypatch, handler) -> None:
@@ -201,7 +237,8 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
         "map_name",
     }
     assert data["token"] == ""
-    assert data["map_type"] is MapLayerType.VECTOR
+    # Slice 6 起下拉框放的是"地图类型"（矢量 / 影像），底图图层由它派生
+    assert data["map_type"] is MapType.VECTOR
     assert data["with_labels"] is True
     assert data["min_zoom"] == settings.DEFAULT_MIN_ZOOM
     assert data["max_zoom"] == settings.DEFAULT_MAX_ZOOM
@@ -222,7 +259,7 @@ def test_form_data_reflects_edits(window: MainWindow) -> None:
 
     data = panel.get_form_data()
     assert data["token"] == "my-token"  # 首尾空白被裁掉
-    assert data["map_type"] is MapLayerType.IMAGE
+    assert data["map_type"] is MapType.IMAGE
     assert data["with_labels"] is False
     assert data["min_zoom"] == 10
     assert data["max_zoom"] == 12
@@ -284,8 +321,8 @@ def test_device_buttons_do_not_crash(window: MainWindow) -> None:
     refresh_button.click()
     import_button.click()
     text = window.log_panel.to_text()
-    # 设备管理属于 Slice 6；本 Slice 只要"点了不崩 + 如实说明"
-    assert "Slice 6" in text
+    # 设备管理属于 Slice 7（Slice 6 排给了图层合成）；本 Slice 只要"点了不崩 + 如实说明"
+    assert "Slice 7" in text
     assert "adb" in text
 
 
@@ -306,7 +343,10 @@ def test_log_panel_append_and_clear(window: MainWindow) -> None:
 
 
 def test_startup_messages_are_reported(window: MainWindow) -> None:
-    assert STARTUP_MESSAGES == ("Application started", "Slice 0 project initialized")
+    assert STARTUP_MESSAGES == (
+        "Application started",
+        "Slice 6 composition enabled (base map + Chinese labels → merged PNG)",
+    )
     _report_startup(window)
     text = window.log_panel.to_text()
     for message in STARTUP_MESSAGES:
@@ -337,10 +377,16 @@ def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
     expected_count = estimate_tile_count(bounds, 8, 17)
     expected_size = format_size(estimate_size_bytes(expected_count))
 
+    # Slice 6：多一行请求量。默认勾选了中文注记 → 每张瓦片请求底图 + 注记两次，
+    # 因此这里的请求数必须是瓦片数的两倍，且文案要说清这个倍数从哪来。
+    map_type = data["map_type"]
     assert panel.result_label.text() == (
         f"预计瓦片：{expected_count:,}\n预计容量：{expected_size}\n"
-        f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}"
+        f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}\n"
+        f"预计 WMTS 请求：{expected_count * 2:,}"
+        f"（{expected_count:,} 张 × 底图+注记 2 层）"
     )
+    assert map_type.request_count_per_tile(data["with_labels"]) == 2
     assert window._status_values["tile_total"].text() == f"{expected_count:,}"
     assert "瓦片计算完成" in window.log_panel.to_text()
 
@@ -406,8 +452,8 @@ def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
     assert window.device_panel.device_list.count() == 1
     assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
     refresh_button, _ = window.device_panel.buttons
-    refresh_button.click()  # Slice 0 的占位动作仍然可用
-    assert "Slice 6" in window.log_panel.to_text()
+    refresh_button.click()  # 设备区的占位动作仍然可用（真实实现排在 Slice 7）
+    assert "Slice 7" in window.log_panel.to_text()
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +681,30 @@ def test_connection_worker_reports_success(qapp) -> None:
 # --------------------------------------------------------------------------- #
 # [开始下载] / [暂停] / [继续]：下载并写入 MBTiles（Slice 3 引擎 + Slice 4 落盘）
 # --------------------------------------------------------------------------- #
+class _SlowTransport(httpx.AsyncBaseTransport):
+    """在假服务前面加一个**异步**延迟，用来制造"下载还在进行中"的窗口。
+
+    为什么不用 ``_png_handler(delay=...)`` 里那个 ``time.sleep``：它是同步阻塞，
+    会把事件循环一起按住。后果有两个，而且都很难查：
+
+    - 所有瓦片几乎在同一瞬间才被报告完成，"下了一部分、任务仍在跑"这个中间态
+      只剩几十毫秒宽 —— 取消类 / 退出类用例会随机地退化成"取消一个空任务"；
+    - ``cancel()`` 要在请求回来之后才有机会生效，于是取消一个慢下载要等它**跑完**。
+
+    ``asyncio.sleep`` 不阻塞循环：中间态稳定存在，取消也能立刻生效。
+    """
+
+    def __init__(self, handler, delay: float) -> None:
+        self._delay = delay
+        self._inner = httpx.MockTransport(handler)
+
+    async def handle_async_request(
+        self, request: httpx.Request
+    ) -> httpx.Response:  # pragma: no cover - 由 httpx 调用
+        await asyncio.sleep(self._delay)
+        return await self._inner.handle_async_request(request)
+
+
 def _stub_download_service(
     monkeypatch,
     handler,
@@ -642,6 +712,7 @@ def _stub_download_service(
     rate_limiter=None,
     policy: RetryPolicy = FAST_POLICY,
     batch_size: int = 7,
+    delay: float = 0.0,
 ) -> None:
     """让 DownloadWorker 内部的 MapDownloadService 走 MockTransport（不触网）。
 
@@ -649,11 +720,16 @@ def _stub_download_service(
     ``MapDownloadService`` 名字——顺带把限速/退避/批次调成"测试用"的档位。
     替换 service 而不是 ``TileDownloader``：Slice 4 起下载器由 service 自己创建，
     在 service 这一层注入才是唯一拦得住的入口。
+
+    ``delay`` 大于 0 时用 :class:`_SlowTransport` 给每个请求加异步延迟，
+    用来制造"下载进行中"的窗口（见该类的说明）。
     """
     original = download_worker_module.MapDownloadService
 
     def factory(provider: TiandituProvider, **kwargs: object):
-        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs["transport"] = (
+            _SlowTransport(handler, delay) if delay else httpx.MockTransport(handler)
+        )
         kwargs["retry_policy"] = policy
         kwargs["rate_limiter"] = (
             rate_limiter if rate_limiter is not None else RateLimiter.disabled()
@@ -697,6 +773,20 @@ def _expected_tile_count(window: MainWindow) -> int:
         data["min_zoom"],
         data["max_zoom"],
     )
+
+
+def _fill_multi_batch_region(window: MainWindow, work_dir: Path) -> int:
+    """填一个"要分几批才下完"的区域，返回瓦片数（z12 下 20 张）。
+
+    取消类 / 退出类用例需要"任务还在跑"的中间态。这个区域的规模（20 张瓦片、
+    并发 6）意味着至少 4 批，配合 :class:`_SlowTransport` 的延迟能留出
+    1 秒以上的窗口——不是靠"跑得快"侥幸赢下的时序，而是靠规模撑出来的。
+    """
+    panel = window.download_panel
+    _fill_small_region(window, work_dir)
+    panel._east_spin.setValue(116.3)
+    panel._north_spin.setValue(39.2)
+    return _expected_tile_count(window)
 
 
 def _wait_for_download(window: MainWindow, qapp, timeout: int = 20_000) -> None:
@@ -1443,12 +1533,18 @@ def _seed_existing_map(window: MainWindow, tiles: int = 3) -> Path:
 
     走真正的 Writer 而不是手拼 SQLite：预置文件必须与生产环境**同构**，
     否则"续传能不能跳过已有瓦片"这件事根本没被验证。
+
+    Slice 6 起"同构"还包含合成信息：元数据必须写上当前表单选的地图类型与
+    ``composition``，否则续传一致性校验（Spec §12）会正确地拒绝这个文件，
+    用例就变成在测"拒绝逻辑"而不是"跳过逻辑"了。
     """
     data = window.download_panel.get_form_data()
     bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
     path = build_output_path(data["output_dir"], data["map_name"])
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    map_type = data["map_type"]
+    with_labels = bool(data["with_labels"])
     writer = MBTilesWriter(path, batch_size=7)
     writer.open()
     writer.write_metadata(
@@ -1458,6 +1554,10 @@ def _seed_existing_map(window: MainWindow, tiles: int = 3) -> Path:
             data["max_zoom"],
             name=data["map_name"],
             description="",
+            provider=settings.MBTILES_PROVIDER_TIANDITU,
+            source_map_type=map_type.value,
+            with_labels=with_labels,
+            composition=composition_for(with_labels),
         )
     )
     coords: list[tuple[int, int, int]] = []
@@ -1772,6 +1872,10 @@ def test_task_resume_starts_resume_download(
         map_layer=MapLayerType.VECTOR,
         output_path=path,
         total_tiles=total,
+        # 必须与 ``_seed_existing_map`` 写进文件的合成配置一致（表单默认勾选了
+        # 中文注记）：否则 Spec §12 的一致性校验会正确地拒绝续传，
+        # 用例就变成在测"拒绝逻辑"了。
+        with_labels=True,
     )
     window.task_service.set_status(task, DownloadTaskStatus.PAUSED)
     window._refresh_task_list(select_id=task.id)
@@ -1870,7 +1974,8 @@ def test_task_double_click_backfills_form(
     assert panel._min_zoom_spin.value() == 10
     assert panel._max_zoom_spin.value() == 12
     assert panel._output_edit.text() == str(work_dir)
-    assert panel.get_form_data()["map_type"] is MapLayerType.IMAGE
+    # 老式任务记录（只有 map_layer，没有 source_map_type）也要能反查出地图类型
+    assert panel.get_form_data()["map_type"] is MapType.IMAGE
     assert panel._token_edit.text() == ""  # Token 不保存在任务里
     log = window.log_panel.to_text()
     assert "已把任务「shanghai」的参数回填到配置面板" in log
@@ -1933,11 +2038,9 @@ def test_exit_confirmation_does_not_block_event_loop(
     assert ".exec()" not in source
     assert ".show()" in source
 
-    _stub_download_service(
-        monkeypatch, _png_handler(delay=0.2), rate_limiter=RateLimiter.disabled()
-    )
-    _fill_small_region(window, work_dir)
-    assert _expected_tile_count(window) > 5
+    _stub_download_service(monkeypatch, _png_handler(), delay=0.4)
+    total = _fill_multi_batch_region(window, work_dir)
+    assert total > 15
     window.show()
     window.download_panel.action_buttons[ACTION_START].click()
     qapp.processEvents()
@@ -1974,10 +2077,8 @@ def test_exit_writes_paused_status_to_disk(
     window: MainWindow, tasks_file: Path, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
     """退出收尾必须把 PAUSED 落盘 —— 下次启动才看得到"可以继续"。"""
-    _stub_download_service(
-        monkeypatch, _png_handler(delay=0.2), rate_limiter=RateLimiter.disabled()
-    )
-    _fill_small_region(window, work_dir)
+    _stub_download_service(monkeypatch, _png_handler(), delay=0.4)
+    _fill_multi_batch_region(window, work_dir)
     window.show()
     window.download_panel.action_buttons[ACTION_START].click()
     qapp.processEvents()
@@ -1997,3 +2098,265 @@ def test_exit_writes_paused_status_to_disk(
     assert reloaded[0].completed_tiles > 0  # 已下完的部分记下来了
     # 已写入的瓦片保留在磁盘上
     assert (work_dir / "beijing.mbtiles").exists() is True
+
+
+# --------------------------------------------------------------------------- #
+# 底图 + 中文注记合成：图层说明 / 请求量预估 / 接线（Slice 6）
+# --------------------------------------------------------------------------- #
+def test_layer_plan_text_tracks_map_type_and_labels(window: MainWindow) -> None:
+    """三行说明必须随「地图类型」与「中文注记」实时变化（Spec §13）。"""
+    panel = window.download_panel
+    combo, labels = panel.map_type_combo, panel.labels_check
+
+    # 默认：矢量 + 中文注记
+    assert combo.currentData() is MapType.VECTOR
+    assert labels.isChecked() is True
+    text = panel.layer_plan_text()
+    assert "当前下载：vec_w + cva_w" in text
+    assert settings.UI_TEXT_LAYER_OUTPUT_MERGED in text
+    assert "每张瓦片 2 次 WMTS 请求" in text
+
+    # 切到影像：图层跟着换，请求次数不变
+    combo.setCurrentIndex(1)
+    assert combo.currentData() is MapType.IMAGE
+    text = panel.layer_plan_text()
+    assert "当前下载：img_w + cia_w" in text
+    assert "每张瓦片 2 次 WMTS 请求" in text
+
+    # 取消中文注记：只剩底图，请求次数减半
+    labels.setChecked(False)
+    text = panel.layer_plan_text()
+    assert "当前下载：img_w" in text
+    assert "cva_w" not in text and "cia_w" not in text
+    assert settings.UI_TEXT_LAYER_OUTPUT_SINGLE in text
+    assert "每张瓦片 1 次 WMTS 请求" in text
+
+
+def test_layer_plan_label_is_rendered(window: MainWindow) -> None:
+    """说明标签把模板渲染出来了（不是留着一堆 ``{}`` 占位符）。"""
+    panel = window.download_panel
+    rendered = panel.layer_plan_label.text()
+
+    assert "{layers}" not in rendered
+    assert "{output}" not in rendered
+    assert "{requests}" not in rendered
+    assert "vec_w" in rendered
+
+
+def test_layer_plan_change_signal_is_emitted(window: MainWindow) -> None:
+    """下拉框 / 复选框变化要发信号 —— 否则「预估结果」里的请求量不会重画。"""
+    panel = window.download_panel
+    seen: list[str] = []
+    panel.layer_plan_changed.connect(lambda: seen.append("changed"))
+
+    panel.labels_check.setChecked(False)
+    panel.map_type_combo.setCurrentIndex(1)
+
+    assert len(seen) == 2
+
+
+def test_estimated_requests_halve_without_labels(window: MainWindow) -> None:
+    """取消中文注记后，「预估结果」里的请求量必须等于瓦片数（而不是两倍）。"""
+    panel = window.download_panel
+    panel.set_calculation_result(1_000, "1.0 MB", "D:/maps/x.mbtiles")
+    assert "预计 WMTS 请求：2,000（1,000 张 × 底图+注记 2 层）" in panel.result_label.text()
+
+    panel.labels_check.setChecked(False)
+    panel.set_calculation_result(1_000, "1.0 MB", "D:/maps/x.mbtiles")
+    assert "预计 WMTS 请求：1,000" in panel.result_label.text()
+    assert "底图+注记 2 层" not in panel.result_label.text()
+
+
+def test_calculate_preview_follows_layer_plan(window: MainWindow) -> None:
+    """点过「计算」之后切换注记，请求量行要立刻跟着变（不必重新点计算）。"""
+    panel = window.download_panel
+    panel._min_zoom_spin.setValue(10)
+    panel._max_zoom_spin.setValue(12)
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    total = window._last_calculation[0]  # type: ignore[index]
+    assert f"预计 WMTS 请求：{total * 2:,}" in panel.result_label.text()
+
+    panel.labels_check.setChecked(False)
+
+    assert f"预计 WMTS 请求：{total:,}" in panel.result_label.text()
+    assert "底图+注记 2 层" not in panel.result_label.text()
+
+
+def test_large_task_confirm_shows_request_estimate(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """大任务确认框要给出请求次数（含"为什么是两倍"的解释）。
+
+    Slice 5 的模板加了 ``{requests}`` 占位符却没人传值，四个大任务用例当场
+    ``KeyError``——这条用例把"必须传进去"钉住。
+    """
+    total = _fill_large_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    plan = window._pending_plan
+    assert plan is not None
+    assert plan.requests == total * 2
+    text = window._confirm_dialog.text()
+    assert f"{total * 2:,}" in text
+    assert "每张瓦片要请求底图 + 注记两次" in text
+
+
+def test_large_task_request_estimate_without_labels(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """不勾中文注记时请求量不翻倍 —— 预估必须反映真实选择。"""
+    window.download_panel.labels_check.setChecked(False)
+    total = _fill_large_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    plan = window._pending_plan
+    assert plan is not None
+    assert plan.requests == total
+    assert plan.composition_text == settings.UI_TEXT_COMPOSITION_SINGLE
+
+
+def test_download_worker_receives_map_type_and_labels(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """接线检查：合成模式的下载线程拿到的是 ``MapType`` + ``with_labels=True``。
+
+    只传底图图层的话服务层就没法知道该用哪个注记图层，"合成"根本无从谈起。
+    """
+    _stub_download_service(monkeypatch, _png_handler())
+    _fill_small_region(window, work_dir)
+    window.download_panel.labels_check.setChecked(True)
+
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    worker = window._download_worker
+    assert isinstance(worker, DownloadWorker)
+    assert worker.layer is MapType.VECTOR
+    assert worker.with_labels is True
+
+    _wait_for_download(window, qapp)
+
+
+def test_start_download_writes_merged_metadata(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """端到端：勾着中文注记点「开始下载」，产物必须是写清了 composition 的合成包。"""
+    server = _RecordingLayerServer()
+    _stub_download_service(monkeypatch, server, rate_limiter=RateLimiter.disabled())
+    _fill_small_region(window, work_dir)
+    total = _expected_tile_count(window)
+    window.download_panel.labels_check.setChecked(True)
+
+    window.download_panel.action_buttons[ACTION_START].click()
+    _wait_for_download(window, qapp)
+
+    path = _expected_output_path(window)
+    with MBTilesReader(path) as reader:
+        raw = reader.get_metadata()
+        assert reader.get_tile_count() == total
+
+    assert raw["composition"] == "merged"
+    assert raw["labels"] == "true"
+    assert raw["map_type"] == "vector"
+    assert raw["format"] == "png"
+    # 一张最终瓦片两次请求，且只打该地图类型的两个图层
+    assert sorted(server.layers) == sorted(["vec", "cva"] * total)
+
+    log = window.log_panel.to_text()
+    assert settings.UI_TEXT_COMPOSITION_MERGED in log
+    assert "合成模式：每张瓦片请求 vec_w + cva_w 各一次" in log
+
+
+def test_start_download_without_labels_writes_single_metadata(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """不勾中文注记：产物是 ``single``，请求量减半。"""
+    server = _RecordingLayerServer()
+    _stub_download_service(monkeypatch, server, rate_limiter=RateLimiter.disabled())
+    _fill_small_region(window, work_dir)
+    total = _expected_tile_count(window)
+    window.download_panel.labels_check.setChecked(False)
+
+    window.download_panel.action_buttons[ACTION_START].click()
+    _wait_for_download(window, qapp)
+
+    with MBTilesReader(_expected_output_path(window)) as reader:
+        raw = reader.get_metadata()
+    assert raw["composition"] == "single"
+    assert server.layers == ["vec"] * total
+    assert settings.UI_TEXT_COMPOSITION_SINGLE in window.log_panel.to_text()
+
+
+def test_task_backfill_restores_labels_and_map_type(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """双击任务要把「地图类型」和「中文注记」都回填（Spec §14）。"""
+    task = window.task_service.create_task(
+        name="shanghai",
+        bounds=GeoBounds(121.0, 31.0, 121.5, 31.5),
+        min_zoom=10,
+        max_zoom=12,
+        map_layer=MapLayerType.IMAGE,
+        output_path=work_dir / "shanghai.mbtiles",
+        total_tiles=100,
+        with_labels=True,
+    )
+    window._refresh_task_list(select_id=task.id)
+    assert window.task_panel.select_task(task.id) is True
+    item = window.task_panel.table.item(0, 0)
+
+    # 先手动改掉，确认回填真的覆盖了当前界面状态
+    window.download_panel.map_type_combo.setCurrentIndex(0)
+    window.download_panel.labels_check.setChecked(False)
+
+    window.task_panel.table.itemDoubleClicked.emit(item)
+    qapp.processEvents()
+
+    panel = window.download_panel
+    assert panel.get_form_data()["map_type"] is MapType.IMAGE
+    assert panel.get_form_data()["with_labels"] is True
+    assert "img_w + cia_w" in panel.layer_plan_text()
+    # 回填也要把说明刷新到最新的任务形态
+    assert "vec_w" not in panel.layer_plan_text()
+
+
+def test_task_started_from_resume_keeps_merged_composition(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """从任务列表「继续」时，合成配置取自任务记录（而不是界面上的当前勾选）。"""
+    _stub_download_service(monkeypatch, _png_handler())
+    _fill_small_region(window, work_dir)
+    path = _seed_existing_map(window, tiles=3)  # 与表单一致：merged
+
+    task = window.task_service.create_task(
+        name="beijing",
+        bounds=GeoBounds(116.0, 39.0, 116.1, 39.1),
+        min_zoom=12,
+        max_zoom=12,
+        map_layer=MapLayerType.VECTOR,
+        output_path=path,
+        total_tiles=_expected_tile_count(window),
+        with_labels=True,
+    )
+    window.task_service.set_status(task, DownloadTaskStatus.PAUSED)
+    window._refresh_task_list(select_id=task.id)
+
+    # 用户把界面上的注记勾掉了——这不该影响"继续"一个合成任务
+    window.download_panel.labels_check.setChecked(False)
+
+    window.task_panel.resume_button.click()
+    qapp.processEvents()
+
+    plan = window._pending_plan or window._download_worker
+    assert plan is not None
+    worker = window._download_worker
+    assert isinstance(worker, DownloadWorker)
+    assert worker.with_labels is True
+    assert worker.layer is MapType.VECTOR
+    _wait_for_download(window, qapp)
+
+    with MBTilesReader(path) as reader:
+        assert reader.get_tile_count() == _expected_tile_count(window)

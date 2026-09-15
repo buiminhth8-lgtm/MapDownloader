@@ -39,14 +39,24 @@ from app.config.settings import (
     DEFAULT_OUTPUT_DIR,
     MAX_SUPPORTED_ZOOM,
     MIN_SUPPORTED_ZOOM,
+    UI_TEXT_ESTIMATED_REQUESTS_MERGED,
+    UI_TEXT_ESTIMATED_REQUESTS_SINGLE,
+    UI_TEXT_LAYER_OUTPUT_MERGED,
+    UI_TEXT_LAYER_OUTPUT_SINGLE,
+    UI_TEXT_LAYER_PLAN,
     UI_TEXT_MBTILES_OUTPUT_NOTICE,
 )
-from app.models.map_layer import LAYER_DISPLAY_NAMES, MapLayerType
+from app.models.map_layer import MAP_TYPE_DISPLAY_NAMES, MapType
 
-#: 地图类型下拉框只放"底图"，中文注记由独立复选框控制
-_BASE_LAYER_CHOICES: tuple[MapLayerType, ...] = (
-    MapLayerType.VECTOR,
-    MapLayerType.IMAGE,
+#: 地图类型下拉框的可选项（Slice 6，Spec §2）。
+#:
+#: 放的是 :class:`MapType` 而不是 :class:`MapLayerType`：用户选的是"矢量地图 /
+#: 影像地图"这个业务概念，注记由独立复选框控制。至于底图到底是 ``vec_w`` 还是
+#: ``img_w``，由 :data:`app.models.MAP_TYPE_LAYERS` 那张唯一的映射表回答 ——
+#: UI 不重复实现一遍"矢量用哪个图层"。
+_MAP_TYPE_CHOICES: tuple[MapType, ...] = (
+    MapType.VECTOR,
+    MapType.IMAGE,
 )
 
 #: 动作标识，与 MainWindow 的响应逻辑一一对应
@@ -167,6 +177,22 @@ class _CoordSpinBox(QDoubleSpinBox):
         return QSize(min(hint.width(), _COORD_SPIN_MIN_WIDTH), hint.height())
 
 
+def _task_map_type(task) -> MapType | None:
+    """从任务记录里取出地图类型；认不出来返回 ``None``。
+
+    走鸭子类型而不是 ``isinstance``：``DownloadTask.source_map_type`` 已经是
+    "优先取 map_type、缺失时由 map_layer 反推"的权威实现，这里只管调用它，
+    不把那条回退规则再抄一遍。测试里的轻量替身也走得通。
+    """
+    resolved = getattr(task, "source_map_type", None)
+    if isinstance(resolved, MapType):
+        return resolved
+    if isinstance(resolved, str) and resolved.strip():
+        return MapType.parse(resolved)
+    # 替身对象可能既没有 source_map_type 也不是 DownloadTask：退回 map_layer
+    return MapType.parse(str(getattr(task, "map_layer", "") or ""))
+
+
 class DownloadPanel(QGroupBox):
     """地图配置 / 下载区域。"""
 
@@ -177,6 +203,11 @@ class DownloadPanel(QGroupBox):
     #: 面板自己不去拼路径：路径规则（非法字符清理、扩展名）属于业务层，
     #: 统一由 ``app.services.build_output_path`` 提供，UI 只负责显示。
     output_config_changed = Signal()
+
+    #: 地图类型或「中文注记」被改动（Slice 6）—— MainWindow 据此刷新
+    #: 「预估结果」里的请求量行。请求量 = 瓦片数 × 每张瓦片请求次数，
+    #: 两个因子分别来自"范围计算"与"图层选择"，所以两边任何一边变了都要重画。
+    layer_plan_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
@@ -216,11 +247,15 @@ class DownloadPanel(QGroupBox):
         token_row.addWidget(self._show_token_check)
 
         self._map_type_combo = QComboBox(self)
-        for layer in _BASE_LAYER_CHOICES:
-            self._map_type_combo.addItem(LAYER_DISPLAY_NAMES[layer], layer)
+        for map_type in _MAP_TYPE_CHOICES:
+            self._map_type_combo.addItem(MAP_TYPE_DISPLAY_NAMES[map_type], map_type)
 
         self._labels_check = QCheckBox("下载中文注记图层", self)
         self._labels_check.setChecked(True)
+        self._labels_check.setToolTip(
+            "勾选后把中文注记合并进底图瓦片（一张瓦片请求底图 + 注记两次，"
+            "输出 PNG）；取消勾选只下载纯底图"
+        )
 
         # 「地图类型」与「中文注记」同占一行：左侧配置列内容已经比 760px 的窗口高，
         # 而这两个控件都很短，各占一行纯属浪费纵向空间（会挤掉下方"下载状态"区）。
@@ -228,11 +263,20 @@ class DownloadPanel(QGroupBox):
         type_row.addWidget(self._map_type_combo, 1)
         type_row.addWidget(self._labels_check)
 
+        # Slice 6 的动态说明（Spec §13）：这次请求哪些图层 / 产物是什么形态 /
+        # 每张瓦片几次请求。三行都随上面的下拉框与复选框实时变化 ——
+        # "勾上注记"这个动作会让请求量翻倍，必须在**开下载之前**就说清楚。
+        self._layer_plan_label = _WrappingLabel("", self)
+
         self._general_form = QFormLayout()
         self._general_form.addRow("Token", token_row)
         self._general_form.addRow("地图类型", type_row)
+        self._general_form.addRow("", self._layer_plan_label)
 
         self._show_token_check.toggled.connect(self._on_show_token_toggled)
+        self._map_type_combo.currentIndexChanged.connect(self._on_layer_plan_changed)
+        self._labels_check.toggled.connect(self._on_layer_plan_changed)
+        self._refresh_layer_plan()
 
     def _build_area_form(self) -> None:
         self._west_spin = self._make_lon_spin(-180.0, 180.0, 116.0)
@@ -370,6 +414,11 @@ class DownloadPanel(QGroupBox):
         self._connection_group = QGroupBox("天地图连接", self)
         group_layout = QVBoxLayout(self._connection_group)
         group_layout.addWidget(self._connection_label)
+        # 与「下载结果」同一个理由：还没测过时它只是一句"尚未测试"，
+        # 白占 53px 而左侧配置列本来就紧（760px 窗口下加一行图层说明就会
+        # 挤出纵向滚动条，进而连带拽出横向滚动条）。一旦有了结果——成功、
+        # 失败或"测试中"——立刻显形。
+        self._connection_group.setVisible(False)
 
     # ------------------------------------------------------------------ #
     # 控件工厂
@@ -391,6 +440,48 @@ class DownloadPanel(QGroupBox):
         return self._make_lon_spin(low, high, value)
 
     # ------------------------------------------------------------------ #
+    # 图层计划说明（Slice 6，Spec §13）
+    # ------------------------------------------------------------------ #
+    def current_map_type(self) -> MapType:
+        """当前选中的地图类型（下拉框为空时退回矢量地图）。"""
+        return self._map_type_combo.currentData() or MapType.VECTOR
+
+    def with_labels_selected(self) -> bool:
+        """「下载中文注记图层」是否被勾选。"""
+        return self._labels_check.isChecked()
+
+    def layer_plan_text(self) -> str:
+        """三行图层计划说明的**原始**文本（不含自动折行）。
+
+        公开成方法而不是让调用方各自 ``format`` 一遍模板：文案只有一处，
+        测试断言、界面显示、日志引用拿到的必然是同一份字符串。
+        """
+        map_type = self.current_map_type()
+        with_labels = self.with_labels_selected()
+        layers = " + ".join(item.value for item in map_type.layers(with_labels))
+        output = (
+            UI_TEXT_LAYER_OUTPUT_MERGED if with_labels else UI_TEXT_LAYER_OUTPUT_SINGLE
+        )
+        return UI_TEXT_LAYER_PLAN.format(
+            layers=layers,
+            output=output,
+            requests=map_type.request_count_per_tile(with_labels),
+        )
+
+    def _refresh_layer_plan(self) -> None:
+        """把当前选择算出的三行说明写进标签。"""
+        self._layer_plan_label.set_text(self.layer_plan_text())
+
+    def _on_layer_plan_changed(self, *_args) -> None:
+        """下拉框 / 复选框变化：先改自己的说明，再通知外部（请求量要重算）。
+
+        参数签名写成可变参数：两个信号一个带 ``int``（``currentIndexChanged``）
+        一个带 ``bool``（``toggled``），而这里两个值都不需要。
+        """
+        self._refresh_layer_plan()
+        self.layer_plan_changed.emit()
+
+    # ------------------------------------------------------------------ #
     # 对外接口
     # ------------------------------------------------------------------ #
     def get_form_data(self) -> dict:
@@ -400,8 +491,8 @@ class DownloadPanel(QGroupBox):
             dict，键与含义::
 
                 token           str            天地图密钥
-                map_type        MapLayerType   底图图层枚举成员
-                with_labels     bool           是否下载中文注记
+                map_type        MapType        地图类型（矢量 / 影像）
+                with_labels     bool           是否把中文注记合成进瓦片
                 west            float          西边界经度
                 south           float          南边界纬度
                 east            float          东边界经度
@@ -413,8 +504,8 @@ class DownloadPanel(QGroupBox):
         """
         return {
             "token": self._token_edit.text().strip(),
-            "map_type": self._map_type_combo.currentData() or MapLayerType.VECTOR,
-            "with_labels": self._labels_check.isChecked(),
+            "map_type": self.current_map_type(),
+            "with_labels": self.with_labels_selected(),
             "west": self._west_spin.value(),
             "south": self._south_spin.value(),
             "east": self._east_spin.value(),
@@ -439,16 +530,17 @@ class DownloadPanel(QGroupBox):
         刻意**不回填 Token**：任务记录里根本没有 Token（Spec §9），
         而把它清空会让人以为"程序把我的 Token 弄丢了"。保持用户当前输入不动。
 
-        图层按 ``MapLayerType.value`` 反查下拉框；认不出来就保持原选项并返回
-        ``False``（由调用方决定要不要提示），不抛异常——一个"图层不认识"的
-        任务不该让界面炸掉。
+        地图类型优先按 Slice 6 的 ``source_map_type`` 反查；老记录（Slice ≤5）
+        没有这个字段，退回用 ``map_layer`` 反查（``cva_w`` / ``cia_w`` 也能认出来）。
+        认不出来就保持原选项并返回 ``False``（由调用方决定要不要提示），
+        不抛异常——一个"图层不认识"的任务不该让界面炸掉。
 
         Args:
             task: :class:`~app.models.download_task.DownloadTask` 或任何具备
                 同名属性的对象。
 
         Returns:
-            ``True`` 表示图层也成功回填了；``False`` 表示图层没认出来。
+            ``True`` 表示地图类型也成功回填了；``False`` 表示没认出来。
         """
         self._west_spin.setValue(float(task.west))
         self._south_spin.setValue(float(task.south))
@@ -463,10 +555,14 @@ class DownloadPanel(QGroupBox):
         # 任务存的是**文件**路径，表单要的是**目录**
         self._output_edit.setText(str(output_path.parent))
 
-        layer_name = str(getattr(task, "map_layer", "") or "")
+        # 中文注记：任务记录里是权威值；老记录没有这个字段 → 视作"未合成"
+        self._labels_check.setChecked(bool(getattr(task, "with_labels", False)))
+
+        map_type = _task_map_type(task)
+        if map_type is None:
+            return False
         for index in range(self._map_type_combo.count()):
-            layer = self._map_type_combo.itemData(index)
-            if layer is not None and layer.value == layer_name:
+            if self._map_type_combo.itemData(index) is map_type:
                 self._map_type_combo.setCurrentIndex(index)
                 return True
         return False
@@ -485,11 +581,25 @@ class DownloadPanel(QGroupBox):
                 由调用方通过 ``app.geo.format_size`` 生成。
             output_path: 预计输出的 ``.mbtiles`` 完整路径；``None`` 时该行
                 显示占位符（例如地图名称为空）。
+
+        请求量行（Slice 6）由本面板按**当前**的地图类型 / 注记勾选算出来，
+        因此不需要调用方多传参数：勾上中文注记后请求量翻倍这件事，
+        与"面板上现在选的是什么"永远一致，不会出现两处算出不同数字。
         """
         lines = [f"预计瓦片：{tile_count:,}", f"预计容量：{size_text}"]
         lines.append(
             f"输出文件：{output_path}" if output_path else "输出文件：（请填写地图名称）"
         )
+        map_type = self.current_map_type()
+        with_labels = self.with_labels_selected()
+        requests = tile_count * map_type.request_count_per_tile(with_labels)
+        template = (
+            UI_TEXT_ESTIMATED_REQUESTS_MERGED
+            if with_labels
+            else UI_TEXT_ESTIMATED_REQUESTS_SINGLE
+        )
+        # 单层模板里没有 ``{tiles}``，多传一个键不会报错（str.format 忽略多余键）
+        lines.append(template.format(requests=requests, tiles=tile_count))
         self._result_label.set_text("\n".join(lines))
 
     def set_calculation_error(self, message: str) -> None:
@@ -504,6 +614,21 @@ class DownloadPanel(QGroupBox):
     def result_label(self) -> QLabel:
         """暴露结果标签，便于测试与后续扩展。"""
         return self._result_label
+
+    @property
+    def map_type_combo(self) -> QComboBox:
+        """暴露「地图类型」下拉框（测试与回填用）。"""
+        return self._map_type_combo
+
+    @property
+    def labels_check(self) -> QCheckBox:
+        """暴露「下载中文注记图层」复选框。"""
+        return self._labels_check
+
+    @property
+    def layer_plan_label(self) -> QLabel:
+        """暴露图层计划说明标签（三行：图层 / 产物 / 请求次数）。"""
+        return self._layer_plan_label
 
     # ------------------------------------------------------------------ #
     # 下载结果展示（Slice 4）
@@ -549,23 +674,32 @@ class DownloadPanel(QGroupBox):
         self._test_connection_button.setEnabled(not testing)
         if testing:
             self._connection_label.set_text("正在测试天地图连接…")
+            self._connection_group.setVisible(True)
 
     def set_connection_result(self, lines: Sequence[str]) -> None:
         """展示连通性测试结果（多行，每行一条信息）。"""
         self._connection_label.set_text("\n".join(lines))
+        self._connection_group.setVisible(True)
 
     def set_connection_error(self, message: str) -> None:
         """展示连通性测试失败原因。"""
         self._connection_label.set_text(f"连接失败：{message}")
+        self._connection_group.setVisible(True)
 
     def clear_connection_result(self) -> None:
-        """恢复成未测试状态。"""
+        """恢复成未测试状态（分组一并收起，不占纵向空间）。"""
         self._connection_label.set_text(_CONNECTION_PLACEHOLDER)
+        self._connection_group.setVisible(False)
 
     @property
     def connection_label(self) -> QLabel:
         """暴露连通性测试结果标签。"""
         return self._connection_label
+
+    @property
+    def connection_group(self) -> QGroupBox:
+        """暴露连通性测试分组（有结果时才可见）。"""
+        return self._connection_group
 
     @property
     def test_connection_button(self) -> QPushButton:

@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 #: 启动后必须出现在日志区的两条记录
 STARTUP_MESSAGES: tuple[str, ...] = (
     "Application started",
-    "Slice 0 project initialized",
+    "Slice 6 composition enabled (base map + Chinese labels → merged PNG)",
 )
 
 

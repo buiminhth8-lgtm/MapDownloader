@@ -29,13 +29,24 @@ from __future__ import annotations
 import operator
 from dataclasses import dataclass, field
 
-from app.config.settings import TILE_MATH_MAX_ZOOM, TILE_MATH_MIN_ZOOM
+from app.config.settings import (
+    MBTILES_PROVIDER_TIANDITU,
+    TILE_MATH_MAX_ZOOM,
+    TILE_MATH_MIN_ZOOM,
+)
 from app.geo import GeoBounds, format_size
+from app.models.map_layer import (
+    COMPOSITION_MERGED,
+    COMPOSITION_SINGLE,
+    COMPOSITION_VALUES,
+    MapType,
+)
 
 __all__ = [
     "MBTilesMetadata",
     "MBTilesValidationResult",
     "SUPPORTED_TILE_FORMATS",
+    "SUPPORTED_MAP_TYPES",
     "METADATA_KEY_ORDER",
 ]
 
@@ -46,10 +57,22 @@ SUPPORTED_TILE_FORMATS: frozenset[str] = frozenset(
     {"png", "jpg", "jpeg", "webp", "pbf"}
 )
 
+#: 允许出现在 ``metadata.map_type`` 里的取值。
+#:
+#: 刻意从 :class:`~app.models.MapType` 派生而不是自己写一遍字符串：
+#: 这个值会被**写进文件**，而 Slice 5 的续传一致性校验会拿它跟任务记录比对。
+#: 两处只要有一个字不同，用户就会遇到"明明参数一样却说不一致"。
+SUPPORTED_MAP_TYPES: frozenset[str] = frozenset(item.value for item in MapType)
+
 #: ``metadata`` 表中本工具会写入的键，顺序即写入顺序。
 #:
 #: 固定顺序不是为了好看：它让"同一份配置生成的 metadata"逐字节可比，
 #: 测试与人工 diff 才有意义。
+#:
+#: 前 8 个是 MBTiles 标准字段；后 4 个是 Slice 6 增加的本工具自有字段，
+#: 它们回答"这个包是怎么来的、能不能接着往里写"（Spec §10 / §12）。
+#: 不是每个文件都有后 4 个 —— Slice 4/5 生成的文件没有，
+#: 因此 :meth:`MBTilesMetadata.as_rows` 会跳过取值为空的那几个。
 METADATA_KEY_ORDER: tuple[str, ...] = (
     "name",
     "type",
@@ -59,6 +82,10 @@ METADATA_KEY_ORDER: tuple[str, ...] = (
     "bounds",
     "minzoom",
     "maxzoom",
+    "provider",
+    "map_type",
+    "labels",
+    "composition",
 )
 
 
@@ -74,6 +101,14 @@ class MBTilesMetadata:
         format: 瓦片图片格式，见 :data:`SUPPORTED_TILE_FORMATS`。
         map_type: MBTiles 的 ``type`` 字段，底图固定 ``"baselayer"``。
         version: MBTiles 规范版本，固定 ``"1.0"``。
+        provider: 瓦片来源标识（本工具固定 ``"tianditu"``）。
+        source_map_type: **本工具自有字段**，写进 ``metadata.map_type``
+            （``vector`` / ``image``）。注意它与上面的 ``map_type``（MBTiles
+            标准的 ``type`` 键）是两回事 —— 那个占用了 ``map_type`` 这个属性名，
+            所以这里的属性只能换个名字，而键名保持 Spec §10 要求的 ``map_type``。
+        with_labels: 是否包含中文注记层；``None`` 表示"不写这个键"
+            （老版本生成的文件读回来就是 ``None``）。
+        composition: ``single`` / ``merged``，见 :data:`COMPOSITION_VALUES`。
 
     Raises:
         ValueError: 名称为空、缩放区间非法、范围非法，或格式化参数不可识别。
@@ -90,6 +125,11 @@ class MBTilesMetadata:
     format: str = "png"
     map_type: str = "baselayer"
     version: str = "1.0"
+    # --- Slice 6：合成信息 ---
+    provider: str = ""
+    source_map_type: str = ""
+    with_labels: bool | None = None
+    composition: str = ""
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -111,6 +151,23 @@ class MBTilesMetadata:
         self.version = str(self.version).strip()
         if not self.version:
             raise ValueError("MBTiles 的 version 不能为空")
+
+        # --- Slice 6：合成信息（空值表示"本文件不记录这一项"）---
+        self.provider = str(self.provider).strip()
+        self.source_map_type = str(self.source_map_type).strip().lower()
+        if self.source_map_type and self.source_map_type not in SUPPORTED_MAP_TYPES:
+            raise ValueError(
+                f"map_type 必须是 {sorted(SUPPORTED_MAP_TYPES)} 之一，"
+                f"实际为 {self.source_map_type!r}"
+            )
+        self.composition = str(self.composition).strip().lower()
+        if self.composition and self.composition not in COMPOSITION_VALUES:
+            raise ValueError(
+                f"composition 必须是 {sorted(COMPOSITION_VALUES)} 之一，"
+                f"实际为 {self.composition!r}"
+            )
+        if self.with_labels is not None:
+            self.with_labels = bool(self.with_labels)
 
         try:
             min_zoom = operator.index(self.min_zoom)
@@ -163,9 +220,29 @@ class MBTilesMetadata:
         """``(min_zoom, max_zoom)``。"""
         return (self.min_zoom, self.max_zoom)
 
+    @property
+    def labels_text(self) -> str:
+        """``metadata.labels`` 的字符串值：``"true"`` / ``"false"``。
+
+        MBTiles 的 metadata 是 ``TEXT`` 键值表，因此布尔值必须转成小写字符串
+        —— 写 ``"True"`` 虽然同样能被我们读回来，但别的工具按
+        ``value == "true"`` 判断时会认不出来。
+        """
+        return "true" if self.with_labels else "false"
+
+    @property
+    def is_merged(self) -> bool:
+        """是否是"底图 + 中文注记已合成"的产物。"""
+        return self.composition == COMPOSITION_MERGED
+
     def as_dict(self) -> dict[str, str]:
-        """返回 ``metadata`` 表的键值对（全部为 TEXT）。"""
-        return {
+        """返回 ``metadata`` 表的键值对（全部为 TEXT）。
+
+        Slice 6 的四个自有字段**只在有值时写入**：一个 Slice 4 时代生成、
+        被本 Slice 重新读取的文件不该因为我们写了一遍元数据就多出
+        ``map_type=""`` 这种没有意义的内容。
+        """
+        values = {
             "name": self.name,
             "type": self.map_type,
             "version": self.version,
@@ -175,11 +252,20 @@ class MBTilesMetadata:
             "minzoom": str(self.min_zoom),
             "maxzoom": str(self.max_zoom),
         }
+        if self.provider:
+            values["provider"] = self.provider
+        if self.source_map_type:
+            values["map_type"] = self.source_map_type
+        if self.with_labels is not None:
+            values["labels"] = self.labels_text
+        if self.composition:
+            values["composition"] = self.composition
+        return values
 
     def as_rows(self) -> list[tuple[str, str]]:
         """返回 ``(key, value)`` 列表，顺序与 :data:`METADATA_KEY_ORDER` 一致。"""
         values = self.as_dict()
-        return [(key, values[key]) for key in METADATA_KEY_ORDER]
+        return [(key, values[key]) for key in METADATA_KEY_ORDER if key in values]
 
     @classmethod
     def for_bounds(
@@ -193,12 +279,19 @@ class MBTilesMetadata:
         image_format: str = "png",
         map_type: str = "baselayer",
         version: str = "1.0",
+        provider: str = MBTILES_PROVIDER_TIANDITU,
+        source_map_type: str = MapType.VECTOR.value,
+        with_labels: bool = False,
+        composition: str = COMPOSITION_SINGLE,
     ) -> "MBTilesMetadata":
         """便捷构造：直接用 :class:`~app.geo.GeoBounds` 建元数据。
 
         下载链路的入参本来就是 ``GeoBounds``，有这个工厂可以避免调用方
         到处写 ``bounds.west, bounds.south, bounds.east, bounds.north``
         ——那种写法一旦顺序写错（把 east/north 弄反）极难发现。
+
+        默认值即"本工具的默认配置"：天地图矢量底图、不含中文注记、未合成。
+        影像地图或合成模式必须显式传参（下载服务层会传）。
         """
         return cls(
             name=name,
@@ -212,6 +305,10 @@ class MBTilesMetadata:
             format=image_format,
             map_type=map_type,
             version=version,
+            provider=provider,
+            source_map_type=source_map_type,
+            with_labels=with_labels,
+            composition=composition,
         )
 
 
@@ -237,6 +334,11 @@ class MBTilesValidationResult:
     file_size: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # --- Slice 6：从 metadata 里读回的合成信息（读不出为 None）---
+    provider: str | None = None
+    map_type: str | None = None
+    labels: bool | None = None
+    composition: str | None = None
 
     @property
     def status_text(self) -> str:
@@ -250,6 +352,20 @@ class MBTilesValidationResult:
             return "—"
         return f"{self.min_zoom}~{self.max_zoom}"
 
+    @property
+    def is_merged(self) -> bool:
+        """是否是"底图 + 中文注记已合成"的产物。"""
+        return self.composition == COMPOSITION_MERGED
+
+    @property
+    def composition_text(self) -> str:
+        """一行合成说明；metadata 里没有这一项时返回空串。"""
+        if not self.composition:
+            return ""
+        if self.composition == COMPOSITION_MERGED:
+            return f"合成：{self.composition}（底图 + 中文注记）"
+        return f"合成：{self.composition}（仅底图）"
+
     def as_lines(self) -> list[str]:
         """多行展示文案（GUI 结果区 / 日志用）。"""
         lines = [
@@ -258,6 +374,11 @@ class MBTilesValidationResult:
             f"Zoom：{self.zoom_text}",
             f"文件大小：{format_size(self.file_size)}",
         ]
+        composition_line = self.composition_text
+        if composition_line:
+            lines.append(composition_line)
+        if self.map_type:
+            lines.append(f"地图类型：{self.map_type}")
         lines.extend(f"错误：{message}" for message in self.errors)
         lines.extend(f"提示：{message}" for message in self.warnings)
         return lines

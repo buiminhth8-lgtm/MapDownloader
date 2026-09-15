@@ -12,6 +12,9 @@
 4. ``metadata`` 必备字段齐全、``bounds`` / ``minzoom`` / ``maxzoom`` 可解析
 5. ``tiles`` 表非空，zoom 区间在合法范围内
 6. 抽样（默认最多 20 张）检查 ``tile_data``：非空、magic bytes 是 PNG/JPEG
+7. （Slice 6）metadata 里有合成信息时校验其自洽性：``labels=true`` 必须配
+   ``composition=merged``、合成地图必须是 ``format=png``，且抽样的瓦片
+   必须都是 PNG
 
 **本 Slice 不做全量扫描**：几十万张瓦片逐张 sniff 一次是分钟级操作，
 放在"下载完成"这个时机不合适，留给后续 Slice。
@@ -28,15 +31,24 @@ from app.config.settings import (
     TILE_MATH_MIN_ZOOM,
 )
 from app.geo import format_size
-from app.mbtiles.models import MBTilesValidationResult
+from app.mbtiles.models import (
+    SUPPORTED_MAP_TYPES,
+    MBTilesValidationResult,
+)
 from app.mbtiles.reader import MBTilesReader
+from app.models.map_layer import COMPOSITION_MERGED, COMPOSITION_VALUES
 
 # 复用 Slice 2 的 magic bytes 判定，不在这里再抄一份 PNG/JPEG 常量。
 # 这一条很重要：判断"这是不是一张合法瓦片"的规则必须全链路一致，
 # 否则会出现"下载时判合法、校验时判非法"的诡异现象。
 from app.providers import detect_image_format
 
-__all__ = ["validate_mbtiles", "REQUIRED_METADATA_KEYS", "OPTIONAL_METADATA_KEYS"]
+__all__ = [
+    "validate_mbtiles",
+    "REQUIRED_METADATA_KEYS",
+    "OPTIONAL_METADATA_KEYS",
+    "COMPOSITION_METADATA_KEYS",
+]
 
 
 #: 缺失即 `valid=False` 的元数据键。这几项是 osmdroid 能否正确加载的关键：
@@ -51,6 +63,19 @@ REQUIRED_METADATA_KEYS: tuple[str, ...] = (
 
 #: 缺失只记 warning 的元数据键：属于规范性字段，不影响加载。
 OPTIONAL_METADATA_KEYS: tuple[str, ...] = ("type", "version", "description")
+
+#: Slice 6 的本工具自有字段（Spec §10）。
+#:
+#: 刻意**不**放进 :data:`OPTIONAL_METADATA_KEYS`：``OPTIONAL`` 里的缺失会变成
+#: warning，而 Slice 4/5 生成的文件、别的工具生成的文件当然没有这几个键 ——
+#: 那样每个正常文件都会平白多出四条"缺少可选字段"的噪音。
+#: 它们**存在时**由 :func:`_check_composition` 严格校验（Spec §18）。
+COMPOSITION_METADATA_KEYS: tuple[str, ...] = (
+    "provider",
+    "map_type",
+    "labels",
+    "composition",
+)
 
 #: 抽样里最多列出几个"非法瓦片"的坐标（避免错误信息刷屏）
 _MAX_REPORTED_BAD_SAMPLES = 3
@@ -194,6 +219,85 @@ def _check_metadata(reader: MBTilesReader, result: MBTilesValidationResult) -> N
             f"metadata.minzoom > maxzoom：{declared[0]} > {declared[1]}"
         )
 
+    _check_composition(metadata, result)
+
+
+def _parse_bool(value: str) -> bool | None:
+    """解析 ``true`` / ``false``（大小写不敏感）；不认识返回 ``None``。"""
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
+
+
+def _check_composition(
+    metadata: dict[str, str], result: MBTilesValidationResult
+) -> None:
+    """Slice 6 第 7 项：合成信息（Spec §18）。
+
+    只在 metadata **存在**这几个键时校验。检查三件事：
+
+    1. 取值本身合法（``map_type`` ∈ vector/image，``labels`` ∈ true/false，
+       ``composition`` ∈ single/merged）。
+    2. ``labels`` 与 ``composition`` **互相自洽** —— ``labels=true`` 却写着
+       ``composition=single`` 说明有一个字段是错的，而用户无法分辨该信哪个。
+    3. 合成地图必须是 PNG。注记依赖透明通道，而 JPEG 存不下 alpha；
+       一个 ``format=jpg`` 的"合成地图"必然是坏的。
+
+    刻意**不做**图像识别判断"文字到底在不在"：那需要 OCR，既慢又不可靠，
+    而且"底色恰好是白色"的注记层无法与"没有注记"区分。
+    """
+    result.provider = (metadata.get("provider") or "").strip() or None
+
+    raw_map_type = (metadata.get("map_type") or "").strip().lower()
+    if raw_map_type:
+        if raw_map_type not in SUPPORTED_MAP_TYPES:
+            result.errors.append(
+                f"metadata.map_type 取值不认识：{raw_map_type!r}"
+                f"（应为 {sorted(SUPPORTED_MAP_TYPES)} 之一）"
+            )
+        else:
+            result.map_type = raw_map_type
+
+    raw_labels = metadata.get("labels")
+    if raw_labels is not None and str(raw_labels).strip():
+        parsed = _parse_bool(raw_labels)
+        if parsed is None:
+            result.errors.append(
+                f"metadata.labels 必须是 true / false：{raw_labels!r}"
+            )
+        else:
+            result.labels = parsed
+
+    raw_composition = (metadata.get("composition") or "").strip().lower()
+    if raw_composition:
+        if raw_composition not in COMPOSITION_VALUES:
+            result.errors.append(
+                f"metadata.composition 取值不认识：{raw_composition!r}"
+                f"（应为 {sorted(COMPOSITION_VALUES)} 之一）"
+            )
+        else:
+            result.composition = raw_composition
+
+    if result.labels is True and result.composition != COMPOSITION_MERGED:
+        result.errors.append(
+            "metadata.labels=true 但 composition 不是 merged"
+            f"（实际 {result.composition!r}）：注记层的存在与合成方式自相矛盾"
+        )
+    if result.is_merged and result.labels is not True:
+        result.errors.append(
+            "metadata.composition=merged 但 labels 不是 true"
+        )
+
+    if result.labels is True or result.is_merged:
+        declared_format = (metadata.get("format") or "").strip().lower()
+        if declared_format and declared_format != "png":
+            result.errors.append(
+                f"合成地图必须使用 PNG（注记依赖透明通道），实际 format={declared_format!r}"
+            )
+
 
 def _check_tiles(
     reader: MBTilesReader,
@@ -281,6 +385,15 @@ def _check_sample_tiles(
             f"抽样 {len(samples)} 张的图片格式为 {sorted(mismatched_formats)}"
             "，请确认与 metadata.format 一致"
         )
+    if result.is_merged:
+        # 合成产物统一 PNG（Spec §4）：即使底图来源是 JPEG，合成后也必须是 PNG。
+        # 出现别的格式说明有瓦片没走合成链路（例如被单层下载器直接写进来了）。
+        non_png = mismatched_formats - {"PNG"}
+        if non_png:
+            result.errors.append(
+                "合成地图（composition=merged）的瓦片必须是 PNG，"
+                "抽样中出现了：" + "、".join(sorted(non_png))
+            )
     result.warnings.append(
         f"已抽样检查 {len(samples)} 张瓦片（共 {result.tile_count:,} 张，"
         f"大小 {format_size(result.file_size)}）"

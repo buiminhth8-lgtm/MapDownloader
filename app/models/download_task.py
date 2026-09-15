@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 
 from app.config.settings import DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM, DEFAULT_OUTPUT_DIR
+from app.models.map_layer import MapType, composition_for
 
 
 class DownloadTaskStatus(Enum):
@@ -131,7 +132,20 @@ class DownloadTask:
     output_path: Path = field(default_factory=lambda: DEFAULT_OUTPUT_DIR)
 
     #: 图层标识（``MapLayerType.value``）。空串表示"未记录"（旧记录/手工构造）。
+    #:
+    #: 合成模式（Slice 6）下这里存的是**底图**图层（``vec_w`` / ``img_w``）：
+    #: 一个任务对应"一张最终瓦片"，它必然有一张底图；注记有没有合进去由
+    #: :attr:`with_labels` 单独表达。把两个图层塞进一个字符串会逼所有人去解析它。
     map_layer: str = ""
+
+    #: 地图类型（``MapType.value``：``vector`` / ``image``）。Slice 6 新增。
+    #: 空串表示"未记录"（Slice 5 及以前的记录），此时由 :attr:`map_layer` 反推。
+    map_type: str = ""
+
+    #: 本次是否把中文注记**合成**进瓦片。Slice 6 新增。
+    #: 缺省的 ``False`` 不是随手取的：Slice 5 及以前的版本只下载底图，
+    #: 老记录里没有这个键，读回来正好等于当时的事实。
+    with_labels: bool = False
 
     #: 进度计数器（Slice 5 起是持久化的权威来源，Spec §7）
     total_tiles: int = 0
@@ -164,6 +178,36 @@ class DownloadTask:
     def bounds(self) -> tuple[float, float, float, float]:
         """(west, south, east, north) 形式的包围盒。"""
         return (self.west, self.south, self.east, self.north)
+
+    @property
+    def source_map_type(self) -> MapType | None:
+        """任务的地图类型（矢量 / 影像）；认不出来时返回 ``None``。
+
+        Slice 6 起新建的任务都会显式记下 :attr:`map_type`；Slice 5 及以前的
+        记录没有这个字段，但它们的 :attr:`map_layer` 必然属于某个地图类型
+        （``vec_w`` → 矢量），所以**能反推的就反推**，不必让老记录作废。
+        两条路都认不出来（例如有人手工改了 JSON）才返回 ``None``，
+        由调用方决定是拒绝续传还是按默认值继续。
+        """
+        resolved = MapType.parse(self.map_type)
+        if resolved is not None:
+            return resolved
+        if not self.map_layer:
+            return None
+        try:
+            return MapType.from_layer(self.map_layer)
+        except ValueError:
+            return None
+
+    @property
+    def composition(self) -> str:
+        """本任务的合成方式（``single`` / ``merged``）。
+
+        由 :attr:`with_labels` 推出，**不单独存一份**：两个字段各存一次就
+        迟早会出现 ``labels=true`` 配 ``composition=single`` 这种自相矛盾的
+        记录，而续传校验正是靠它们比对文件。
+        """
+        return composition_for(self.with_labels)
 
     @property
     def is_valid_bounds(self) -> bool:

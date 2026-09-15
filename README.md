@@ -6,7 +6,7 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 5：断点续传、任务恢复与已有瓦片跳过（任务可持久化，中途关掉程序也能接着下）
+Slice 6：底图 × 中文注记图层合成（`vec_w + cva_w` 一次下两层，按 alpha 合成成一张 PNG）
 
 完整链路：
 
@@ -15,13 +15,17 @@ BoundingBox            (Slice 1：范围与合法性校验)
     ↓
 Tile Math              (Slice 1：算出瓦片编号区间)
     ↓
-DownloadTask           (Slice 5：任务记录，落盘到 data/tasks.json)
+DownloadTask           (Slice 5：任务记录，落盘到 data/tasks.json；Slice 6 增加 map_type / with_labels)
+    ↓
+MapType → 两个图层      (Slice 6：MAP_TYPE_LAYERS 是全项目唯一的那张映射表)
     ↓
 TiandituProvider       (Slice 2：拼 WMTS URL、判响应合法性)
     ↓
 ExistingTileIndex      (Slice 5：查库里已有瓦片；默认只读坐标三列)
     ↓  should_skip_tile（在发 HTTP 之前判定）
 Async Downloader       (Slice 3：并发 / 限速 / 重试 / 暂停取消)
+    ↓
+CompositeTileDownloader (Slice 6：底图 + 注记各请求一次 → TileComposer alpha 合成)
     ↓  on_tile 回调
 MBTilesTileSink        (Slice 4：有界写队列 + 单消费者)
     ↓
@@ -29,10 +33,26 @@ MBTilesWriter          (Slice 4：批量事务写 SQLite，INSERT OR REPLACE)
     ↓
 map.mbtiles
     ↓
-Validator              (Slice 4：结构 + 抽样数据校验)
+Validator              (Slice 4：结构 + 抽样数据校验；Slice 6 增加合成信息自洽性)
     ↓
 TaskService            (Slice 5：状态判定 + 落盘；启动时 DOWNLOADING → PAUSED)
 ```
+
+## Slice 6：底图 × 中文注记合成
+
+- **「地图类型」下拉 + 「下载中文注记图层」复选框** —— 用户选的是业务概念（矢量 / 影像地图），底图是 `vec_w` 还是 `img_w` 由 `app/models/map_layer.py` 里 `MAP_TYPE_LAYERS` **唯一那张映射表**回答；UI / Service / Downloader 三处都不再各写一遍 `if 矢量: 用 vec_w`
+- **一次下两层、合成一张** —— `CompositeTileDownloader` 对同一张瓦片并发请求底图与注记（**共用同一个 `TileDownloader`**：连接复用、限速、重试三件事与单层模式完全一致，因此"1 万张瓦片 ≈ 2 万次请求"里的每一次仍受 8 请求/秒约束），再用 Pillow 的 `alpha_composite` 合成
+- **注记只覆盖它不透明的像素** —— 合成只做 alpha 混合，注记的透明区域原样保留底图；半透明注记与底图混色（这三条都有像素级断言锁住）
+- **产物一律 PNG** —— 注记依赖透明通道，JPEG 存不下 alpha；`with_labels=True` 时传非 PNG 的 `image_format` 会**当场报错**，而不是落一个"metadata 说 jpg、内容其实是 png"的库
+- **三类失败分开计数**（Spec §7）—— `composite_base_failed` / `composite_label_failed` / `composite_failed`。前两类是网络与配额问题（可重试），第三类是图片本身合不到一起（同样字节重试多少次都一样，因此**不进重试**）。合成失败不会被折叠成"下载失败"，用户能分辨到底哪儿坏了
+- **写进 MBTiles metadata 的四个自有字段** —— `provider` / `map_type` / `labels` / `composition`。**只在有值时写入**：Slice 4/5 生成的文件不会被凭空补上这些键，校验器也不会为它们平白报"缺少可选字段"
+- **续传按合成方式把关** —— 任务是 `merged`、文件是 `single`（或地图类型不同）时 `resume_task()` **直接拒绝**，并且**一张瓦片都不写**；往不属于这个任务的库里写瓦片，得到的既不是 A 也不是 B，只是一份"有的地块有字、有的没有"的坏数据
+- **老文件按事实解读** —— 没有 `composition` 键的 Slice ≤5 文件视作 `single`（那个版本只可能下过单层底图）；反过来说，"要合成的任务续到老文件上"同样被拒绝
+- **校验器读懂合成信息** —— `labels=true` 必须配 `composition=merged`、合成地图必须是 `format=png`，且抽样瓦片必须都是 PNG
+- **请求量预估说清倍数** —— 面板上三行动态说明（请求哪些图层 / 产物形态 / 每张瓦片几次请求）、「预估结果」里的 `预计 WMTS 请求`、大任务确认框都用同一套数字；勾上注记后请求量与下载量翻倍，必须在**开工之前**就说清楚
+- **单层模式一行代码没退化** —— `layer` 传 `MapLayerType` 时行为与 Slice ≤5 完全一致；`with_labels=True` 配单个图层会被拒绝（一块注记瓦片没法回答"它属于矢量还是影像"）
+
+## Slice 5（仍有效）：断点续传、任务恢复与已有瓦片跳过
 
 已支持：
 
@@ -58,7 +78,7 @@ TaskService            (Slice 5：状态判定 + 落盘；启动时 DOWNLOADING 
 - **退出确认** —— 关闭程序时若还有任务在跑，弹**非模态**确认框；确认退出会把运行中的任务标成 `PAUSED`（语义是"暂停"而不是"失败/取消"，下次可以接着下）
 - **进度节流** —— 任务进度落盘按 **1 秒或 100 张** 节流（两者取先到），但**状态变化**（暂停 / 继续 / 完成 / 失败）一律立刻写盘
 
-> **本 Slice 不做**：图层合成、manifest、离线包级 SHA256、ADB、Android、失败瓦片清单与单点重试、速度曲线。
+> **本 Slice 不做**：manifest、离线包级 SHA256、ADB、Android、失败瓦片清单与单点重试、速度曲线。
 
 - **`MBTilesWriter`** —— 标准 MBTiles 结构（`metadata` + `tiles` 两张表），自动创建父目录，`with` 上下文管理，参数化 SQL；写入前强制先写 metadata（缺 metadata 的 MBTiles 在 osmdroid 侧会直接加载失败）
 - **批量事务** —— 默认 `batch_size = 200`（`executemany` + 显式 `BEGIN` / `COMMIT`），**不是每张瓦片 commit**；`flush()` / `close()` / 任务正常结束都保证剩余瓦片落盘
@@ -114,9 +134,8 @@ Slice 0 基础（仍有效）：
 
 暂未实现：
 
-- 底图与注记图层合成（本版本只单独下载单层）
-- 地图包 manifest、离线包级 Sha256 校验、离线包体积统计 —— Slice 6
-- ADB / Android 导入 —— Slice 6
+- 地图包 manifest、离线包级 Sha256 校验、离线包体积统计 —— Slice 7
+- ADB / Android 导入 —— Slice 7
 
 ## 环境
 
@@ -137,7 +156,7 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 621 passed
+python -m pytest                # 691 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 ```
 
@@ -148,7 +167,10 @@ python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 | `tests/test_task_store.py` | 任务记录读写、原子替换、损坏隔离、状态机、Token 不落盘、进度节流 |
 | `tests/test_resume.py` | `ResumePolicy` / `ExistingTileIndex` 的策略选择、`TileProbe` 依赖方向、坐标语义 |
 | `tests/test_resume_download.py` | 端到端续传：跳过已有、不读 BLOB、一致性拒绝、部分失败→失败→续传补缺口、取消→暂停、日志行 |
-| `tests/test_ui_smoke.py` | GUI：任务面板、启动恢复、已有文件三向确认、退出确认 |
+| `tests/test_ui_smoke.py` | GUI：任务面板、启动恢复、已有文件三向确认、退出确认；图层说明与请求量预估、合成接线 |
+| `tests/test_tile_composer.py` | 合成器：像素级 alpha 正确性、失败分类、尺寸阈值 |
+| `tests/test_composite_downloader.py` | 合成下载器：每张瓦片两次请求、三类失败归类、生命周期约定 |
+| `tests/test_composition_download.py` | 端到端合成：metadata 四字段、产物必须 PNG、参数组合拒绝、续传一致性把关 |
 
 测试在 Qt ``offscreen`` 平台下运行（见 `tests/conftest.py`），无需真实显示器；
 瓦片下载与落盘相关用例全部走 **MockTransport / 假数据**，**不访问真实网络**，
@@ -182,13 +204,14 @@ tianditu-offline-tool/
 │   ├── ui/                界面层：主窗口 + 各面板 + download_worker.py（QThread 桥接 asyncio）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
 │   ├── geo/               瓦片坐标计算：bounds.py + tile_math.py（Slice 1 ✅）
-│   ├── downloader/        下载引擎：models / retry_policy / rate_limiter / tile_downloader / download_manager / resume（Slice 3 ✅ + Slice 5 ✅）
-│   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅）
+│   ├── downloader/        下载引擎：models / retry_policy / rate_limiter / tile_downloader / download_manager / resume / composite_tile_downloader（Slice 3 ✅ + Slice 5 ✅ + Slice 6 ✅）
+│   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
-│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅）
-│   ├── package/           离线包打包与校验（Slice 6）
-│   └── android/           ADB 设备管理与导入（Slice 6）
-├── tests/                  pytest 用例（621 条）
+│   ├── composer/          瓦片合成：tile_composer.py（Pillow alpha 合成，无状态可复用）（Slice 6 ✅）
+│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅）
+│   ├── package/           离线包打包与校验（Slice 7）
+│   └── android/           ADB 设备管理与导入（Slice 7）
+├── tests/                  pytest 用例（691 条）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
 ├── docs/                   设计文档
 ├── scripts/capture_ui.py   界面截图留档脚本
@@ -283,7 +306,7 @@ python scripts/verify_resume.py
 
 ## 后续计划
 
-- **Slice 6：离线包打包与校验 + ADB 导入** —— 地图包 manifest、Sha256 校验、离线包体积统计；设备发现、push、设备侧校验
+- **Slice 7：离线包打包与校验 + ADB 导入** —— 地图包 manifest、Sha256 校验、离线包体积统计；设备发现、push、设备侧校验
 - GUI 下载管理完善（失败瓦片清单与单点重试、速度曲线）
 - 底图与注记图层合成
 - Android / osmdroid（端侧读取离线包）

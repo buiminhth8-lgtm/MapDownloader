@@ -40,12 +40,14 @@
 
 from app.mbtiles.models import (
     METADATA_KEY_ORDER,
+    SUPPORTED_MAP_TYPES,
     SUPPORTED_TILE_FORMATS,
     MBTilesMetadata,
     MBTilesValidationResult,
 )
 from app.mbtiles.reader import MBTilesReader
 from app.mbtiles.validator import (
+    COMPOSITION_METADATA_KEYS,
     OPTIONAL_METADATA_KEYS,
     REQUIRED_METADATA_KEYS,
     validate_mbtiles,
@@ -58,6 +60,7 @@ __all__ = [
     "MBTilesValidationResult",
     "METADATA_KEY_ORDER",
     "SUPPORTED_TILE_FORMATS",
+    "SUPPORTED_MAP_TYPES",
     # 写入
     "MBTilesWriter",
     "MBTilesTileSink",
@@ -68,4 +71,5 @@ __all__ = [
     "validate_mbtiles",
     "REQUIRED_METADATA_KEYS",
     "OPTIONAL_METADATA_KEYS",
+    "COMPOSITION_METADATA_KEYS",
 ]

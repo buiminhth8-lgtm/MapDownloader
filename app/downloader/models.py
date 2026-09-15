@@ -32,6 +32,7 @@ from app.geo import format_size
 __all__ = [
     "TileCoordinate",
     "TileFailureKind",
+    "COMPOSITE_FAILURE_KINDS",
     "TileDownloadResult",
     "DownloadProgress",
     "DownloadSummary",
@@ -95,6 +96,19 @@ class TileFailureKind(Enum):
     #: 兜底：未预期的异常（会被重试，但次数受 max_attempts 约束）
     UNEXPECTED = "unexpected"
 
+    # --- Slice 6：底图 + 中文注记合成模式（Spec §7）---
+    #
+    # 这三种失败**发生在两层都在这一层之上了**：单层下载器各自的重试已经跑完，
+    # 因此它们都是终态，不会再被重试（也不在 RETRYABLE_FAILURE_KINDS 里）。
+    # 分开计数是为了让用户看得懂"到底哪儿出了问题"——
+    # 是底图拿不到（网络/配额）、注记拿不到，还是两张图合不到一起（图片本身坏了）。
+    #: 合成模式：底图图层没拿到
+    COMPOSITE_BASE_FAILED = "composite_base_failed"
+    #: 合成模式：注记图层没拿到
+    COMPOSITE_LABEL_FAILED = "composite_label_failed"
+    #: 合成模式：两层都拿到了，但合成失败（图片损坏 / 尺寸不一致 / 编码失败）
+    COMPOSITE_FAILED = "composite_failed"
+
     @property
     def display_name(self) -> str:
         """中文展示名。"""
@@ -109,7 +123,19 @@ _FAILURE_DISPLAY_NAMES: dict[TileFailureKind, str] = {
     TileFailureKind.INVALID_CONTENT: "响应不是有效瓦片",
     TileFailureKind.RESPONSE_TOO_LARGE: "响应体积异常",
     TileFailureKind.UNEXPECTED: "未知错误",
+    TileFailureKind.COMPOSITE_BASE_FAILED: "底图下载失败",
+    TileFailureKind.COMPOSITE_LABEL_FAILED: "注记下载失败",
+    TileFailureKind.COMPOSITE_FAILED: "瓦片合成失败",
 }
+
+#: 合成模式的三种失败分类（供上层判断"这张瓦片是不是合成链路上的问题"）
+COMPOSITE_FAILURE_KINDS: frozenset[TileFailureKind] = frozenset(
+    {
+        TileFailureKind.COMPOSITE_BASE_FAILED,
+        TileFailureKind.COMPOSITE_LABEL_FAILED,
+        TileFailureKind.COMPOSITE_FAILED,
+    }
+)
 
 
 # --------------------------------------------------------------------------- #

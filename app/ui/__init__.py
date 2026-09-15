@@ -7,7 +7,7 @@
 - ``main_window``     只做装配与信号连接
 
 界面层允许依赖 ``models`` / ``config``；业务包（providers、geo、downloader、
-mbtiles、package、android）不得依赖本层。
+composer、mbtiles、package、android）不得依赖本层。
 """
 
 from app.ui.device_panel import DevicePanel

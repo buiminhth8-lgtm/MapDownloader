@@ -75,6 +75,8 @@ _TASK_FIELDS: tuple[str, ...] = (
     "name",
     "status",
     "map_layer",
+    "map_type",
+    "with_labels",
     "west",
     "south",
     "east",
@@ -116,6 +118,8 @@ def task_to_payload(task: DownloadTask) -> dict[str, Any]:
         "name": task.name,
         "status": task.status.value,
         "map_layer": task.map_layer,
+        "map_type": task.map_type,
+        "with_labels": bool(task.with_labels),
         "west": float(task.west),
         "south": float(task.south),
         "east": float(task.east),
@@ -163,6 +167,9 @@ def task_from_payload(payload: dict[str, Any]) -> DownloadTask:
     task = DownloadTask(id=task_id, status=status)
     task.name = str(payload.get("name") or task.name)
     task.map_layer = str(payload.get("map_layer") or "")
+    task.map_type = str(payload.get("map_type") or "")
+    # 缺这个键的老记录 = Slice 5 时代的单层任务，False 正是当时的真实情况
+    task.with_labels = _as_bool(payload.get("with_labels", False), "with_labels", task_id)
 
     task.west = _as_float(payload.get("west"), "west", task_id)
     task.south = _as_float(payload.get("south"), "south", task_id)
@@ -234,6 +241,26 @@ def _as_int(value: Any, field: str, task_id: str) -> int:
         raise TaskStoreError(
             f"任务 {task_id} 的 {field} 不是整数：{value!r}"
         ) from exc
+
+
+def _as_bool(value: Any, field: str, task_id: str) -> bool:
+    """转 bool，并**拒绝**字符串 ``"false"`` 被当成真。
+
+    ``bool("false")`` 是 ``True``——直接拿它读 JSON 会在有人手工把
+    ``"false"``（带引号）写进 tasks.json 时把单层任务当成合成任务，
+    进而让续传的一致性校验放行一份"一半有字一半没字"的地图。
+    因此这里只认真正的布尔与 ``true`` / ``false`` 文本。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false" or text == "":
+        return False
+    raise TaskStoreError(f"任务 {task_id} 的 {field} 不是布尔值：{value!r}")
 
 
 def _assert_no_secret_keys(payload: Any, *, where: str = "payload") -> None:

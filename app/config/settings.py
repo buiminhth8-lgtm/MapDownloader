@@ -218,6 +218,28 @@ MBTILES_BOUNDS_TOLERANCE: float = 1e-6
 TASK_PANEL_MAX_ROWS: int = 200
 
 # --------------------------------------------------------------------------- #
+# 底图 + 中文注记合成（Slice 6）
+# --------------------------------------------------------------------------- #
+#: 合成结果的图片格式。**固定 PNG**（Spec §4）：注记层必须保留透明通道，
+#: 而 JPEG 没有 alpha —— 合成后再存 JPEG 会把透明区域压成黑块。
+COMPOSER_OUTPUT_FORMAT: str = "PNG"
+
+#: 是否让 Pillow 做额外压缩优化。
+#:
+#: 刻意**关闭**：``optimize=True`` 会让单张瓦片的编码耗时增加数倍，
+#: 而本场景是"几万张瓦片边下边合成"，下载速度才是瓶颈，几 KB 的体积收益
+#: 换不来吞吐下降。
+COMPOSER_PNG_OPTIMIZE: bool = False
+
+#: 合成时底图与注记允许的尺寸差异（像素）。0 表示必须严格相等。
+#: 留成常量而不是写死 0，是为了将来遇到"服务端返回 257×257"这类脏数据时
+#: 有个集中的调整点；当前严格要求相等（尺寸不一致说明服务端给错了东西）。
+COMPOSER_SIZE_TOLERANCE_PIXELS: int = 0
+
+#: 合成模式写进 MBTiles ``metadata.provider`` 的值
+MBTILES_PROVIDER_TIANDITU: str = "tianditu"
+
+# --------------------------------------------------------------------------- #
 # 默认输出
 # --------------------------------------------------------------------------- #
 DEFAULT_OUTPUT_DIR: Path = Path.home() / "MapDownloader" / "output"
@@ -248,9 +270,10 @@ HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 
-#: 设备区占位说明。ADB 属于 Slice 6；在此之前界面必须**如实**说明"点了不会执行 adb"，
-#: 不能让人误以为按钮坏了。文案与 ``main_window`` 里的动作提示保持一致（都写 Slice 6）。
-UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理将在 Slice 6 实现"
+#: 设备区占位说明。ADB 属于 Slice 7（Slice 6 排给了"底图 + 中文注记合成"）；
+#: 在此之前界面必须**如实**说明"点了不会执行 adb"，
+#: 不能让人误以为按钮坏了。文案与 ``main_window`` 里的动作提示保持一致。
+UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理将在 Slice 7 实现"
 
 #: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）
 UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
@@ -261,7 +284,10 @@ UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
 UI_TEXT_LARGE_TASK_CONFIRM_TITLE: str = "大任务确认"
 UI_TEXT_LARGE_TASK_CONFIRM: str = (
     "当前范围预计需要下载 {total:,} 张瓦片，\n"
-    "预计容量约 {size}，可能需要较长时间并消耗天地图调用配额。\n\n"
+    "预计容量约 {size}，\n"
+    "预计 WMTS 请求约 {requests:,} 次"
+    "（开启中文注记时每张瓦片要请求底图 + 注记两次），\n"
+    "可能需要较长时间并消耗天地图调用配额。\n\n"
     "确认继续下载吗？（不会限制下载规模，仅作提醒）"
 )
 
@@ -327,4 +353,39 @@ UI_TEXT_TASK_RECOVERED: str = (
     "检测到上次退出时仍有未完成任务，已标记为「已暂停」。"
     "程序不会自动开始下载，需要你确认后手动继续。"
 )
+
+# --------------------------------------------------------------------------- #
+# UI 文案：底图 + 中文注记合成（Slice 6）
+# --------------------------------------------------------------------------- #
+#: 「地图类型 / 中文注记」下方的动态说明（Spec §13）。
+#: 三行分别是：这次请求哪些图层、产物是什么形态、每张瓦片要几次请求。
+UI_TEXT_LAYER_PLAN: str = (
+    "当前下载：{layers}\n"
+    "输出：{output}\n"
+    "每张瓦片 {requests} 次 WMTS 请求"
+)
+
+#: 合成模式的产物说明
+UI_TEXT_LAYER_OUTPUT_MERGED: str = (
+    "合并后的 PNG MBTiles（底图 + 中文注记 → RGBA alpha 合成）"
+)
+#: 单图层模式的产物说明
+UI_TEXT_LAYER_OUTPUT_SINGLE: str = "PNG MBTiles（仅底图，单图层，未合成）"
+
+#: 「预估结果」里的请求量行。合成模式要说清"为什么是两倍"——
+#: 否则用户看到"20,000 张瓦片 / 40,000 次请求"会以为程序算错了。
+UI_TEXT_ESTIMATED_REQUESTS_SINGLE: str = "预计 WMTS 请求：{requests:,}"
+UI_TEXT_ESTIMATED_REQUESTS_MERGED: str = (
+    "预计 WMTS 请求：{requests:,}（{tiles:,} 张 × 底图+注记 2 层）"
+)
+
+#: 已有 MBTiles 的"地图类型 / 注记配置"与当前任务不一致（Spec §12 原文）
+UI_TEXT_RESUME_COMPOSITION_INCOMPATIBLE: str = (
+    "现有 MBTiles 地图类型或注记配置与当前任务不一致，"
+    "无法安全继续下载。"
+)
+
+#: 合成模式的任务启动说明（Spec §23）——一次性把"这次到底在下什么"讲清楚
+UI_TEXT_COMPOSITION_SINGLE: str = "single（仅底图）"
+UI_TEXT_COMPOSITION_MERGED: str = "merged（底图 + 中文注记已合成）"
 

@@ -49,7 +49,7 @@ from app.downloader import DownloadProgress, RateLimiter, ResumePolicy, RetryPol
 from app.geo import GeoBounds
 from app.mbtiles import MBTilesWriteError
 from app.models.download_task import DownloadTask
-from app.models.map_layer import MapLayerType
+from app.models.map_layer import MapLayerType, MapType
 from app.providers import TiandituProvider
 from app.services import MapDownloadService, MapResumeError
 
@@ -75,9 +75,10 @@ class DownloadWorker(QThread):
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: MapLayerType,
+        layer: "MapLayerType | MapType",
         output_path: str | Path,
         *,
+        with_labels: bool = False,
         map_name: str | None = None,
         description: str = "",
         concurrency: int = DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -101,8 +102,11 @@ class DownloadWorker(QThread):
             bounds: 下载范围（续传模式下取自任务记录）。
             min_zoom: 起始缩放级别。
             max_zoom: 结束缩放级别（含）。
-            layer: 图层类型。
+            layer: 下载目标。``MapLayerType`` 表示只下这一层；
+                ``MapType`` 配合 ``with_labels`` 决定"只下底图"还是"底图 + 注记合成"。
             output_path: 输出的 ``.mbtiles`` 完整路径。
+            with_labels: 是否把中文注记合成进瓦片（Slice 6）。为 ``True`` 时
+                ``layer`` 必须是 ``MapType`` —— 服务层会据此改用合成下载器。
             map_name: MBTiles 的 ``name``；``None`` 时取输出文件名主体。
             description: MBTiles 的 ``description``。
             concurrency: 并发 worker 数。
@@ -130,6 +134,7 @@ class DownloadWorker(QThread):
         self._max_zoom = max_zoom
         self._layer = layer
         self._output_path = Path(output_path)
+        self._with_labels = bool(with_labels)
         self._map_name = map_name
         self._description = description
         self._concurrency = concurrency
@@ -156,9 +161,14 @@ class DownloadWorker(QThread):
     # 只读状态
     # ------------------------------------------------------------------ #
     @property
-    def layer(self) -> MapLayerType:
-        """本次下载的图层。"""
+    def layer(self) -> "MapLayerType | MapType":
+        """本次下载的图层 / 地图类型。"""
         return self._layer
+
+    @property
+    def with_labels(self) -> bool:
+        """本次是否把中文注记合成进瓦片（Slice 6）。"""
+        return self._with_labels
 
     @property
     def min_zoom(self) -> int:
@@ -259,6 +269,7 @@ class DownloadWorker(QThread):
                     self._max_zoom,
                     self._layer,
                     self._output_path,
+                    with_labels=self._with_labels,
                     map_name=self._map_name,
                     description=self._description,
                     on_progress=self._on_progress,

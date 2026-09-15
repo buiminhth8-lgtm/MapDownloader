@@ -14,9 +14,16 @@ from app.models.download_task import (
     new_task_id,
 )
 from app.models.map_layer import (
+    COMPOSITION_MERGED,
+    COMPOSITION_SINGLE,
+    COMPOSITION_VALUES,
     DEFAULT_LAYER_COMBO,
     LAYER_DISPLAY_NAMES,
+    MAP_TYPE_DISPLAY_NAMES,
+    MAP_TYPE_LAYERS,
     MapLayerType,
+    MapType,
+    composition_for,
     layers_for,
 )
 from app.models.map_package import MapPackage, new_package_id
@@ -24,7 +31,14 @@ from app.models.map_package import MapPackage, new_package_id
 __all__ = [
     # map_layer
     "MapLayerType",
+    "MapType",
+    "MAP_TYPE_LAYERS",
+    "MAP_TYPE_DISPLAY_NAMES",
     "LAYER_DISPLAY_NAMES",
+    "COMPOSITION_SINGLE",
+    "COMPOSITION_MERGED",
+    "COMPOSITION_VALUES",
+    "composition_for",
     "DEFAULT_LAYER_COMBO",
     "layers_for",
     # download_task

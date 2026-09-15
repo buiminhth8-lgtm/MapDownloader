@@ -84,9 +84,20 @@ from app.downloader.models import (
 )
 from app.downloader.tile_downloader import TileDownloader
 from app.geo import GeoBounds, TileRange, calculate_tile_ranges
-from app.models.map_layer import MapLayerType
+from app.models.map_layer import MapLayerType, MapType
 
 __all__ = ["DownloadManager", "iter_tile_coordinates"]
+
+#: ``layer`` 参数允许的取值。
+#:
+#: Slice 3~5 传的是单个图层（:class:`MapLayerType`）；Slice 6 的合成模式要传
+#: :class:`MapType`（"矢量 / 影像"这个业务语义），由
+#: :class:`~app.downloader.CompositeTileDownloader` 自己展开成两层。
+#:
+#: 本模块**不关心**它到底是哪一个：它只把 ``layer`` 原样交给下载器
+#: （``downloader.download_tile(tile, layer)``）。因此这里不需要一套
+#: "合成模式下换成别的参数"的分支——下载调度与"一层还是两层"无关。
+LayerArgument = MapLayerType | MapType
 
 
 _logger = logging.getLogger(__name__)
@@ -345,7 +356,7 @@ class DownloadManager:
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: MapLayerType,
+        layer: LayerArgument,
         on_tile: TileCallback | None = None,
         on_progress: ProgressCallback | None = None,
         should_skip_tile: SkipPredicate | None = None,
@@ -356,7 +367,9 @@ class DownloadManager:
             bounds: 地理范围，由 Slice 1 的 :class:`~app.geo.GeoBounds` 保证合法。
             min_zoom: 起始缩放级别。
             max_zoom: 结束缩放级别（含）。
-            layer: 图层类型。
+            layer: 图层（:class:`~app.models.MapLayerType`）**或**地图类型
+                （:class:`~app.models.MapType`，Slice 6 的合成模式）。
+                本模块只把它原样转交给下载器，不做任何解释。
             on_tile: 单瓦片回调，**仅在下载成功时**调用，用于把瓦片字节交给
                 消费方（Slice 4 的 MBTilesWriter）。返回 ``None`` 或 awaitable 均可。
             on_progress: 进度回调，按 ``progress_interval_seconds`` 节流。
@@ -378,10 +391,10 @@ class DownloadManager:
             raise ValueError("已有下载任务正在运行，请先取消或等待其结束")
         if not isinstance(bounds, GeoBounds):
             raise ValueError(f"bounds 必须是 GeoBounds，实际为 {type(bounds).__name__}")
-        if not isinstance(layer, MapLayerType):
+        if not isinstance(layer, (MapLayerType, MapType)):
             raise ValueError(
-                f"layer 必须是 MapLayerType 成员，实际为 {layer!r}；"
-                f"支持 {[item.value for item in MapLayerType]}"
+                f"layer 必须是 MapLayerType（或 Slice 6 的 MapType）成员，"
+                f"实际为 {layer!r}；支持 {[item.value for item in MapLayerType]}"
             )
         if should_skip_tile is not None and not callable(should_skip_tile):
             raise ValueError(
@@ -419,7 +432,7 @@ class DownloadManager:
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: MapLayerType,
+        layer: LayerArgument,
         ranges: list,
         total: int,
         on_tile: TileCallback | None,
@@ -542,7 +555,7 @@ class DownloadManager:
     async def _worker(
         self,
         queue: asyncio.Queue[TileCoordinate | None],
-        layer: MapLayerType,
+        layer: LayerArgument,
         on_tile: TileCallback | None,
     ) -> None:
         """消费者：单张瓦片下载 + 统计 + 交出去，然后处理下一张。"""

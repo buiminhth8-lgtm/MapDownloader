@@ -52,6 +52,7 @@ from pathlib import Path
 
 import httpx
 
+from app.composer import TileComposer
 from app.config.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
     DEFAULT_MAP_NAME,
@@ -60,11 +61,15 @@ from app.config.settings import (
     DEFAULT_REQUEST_TIMEOUT,
     MBTILES_BOUNDS_TOLERANCE,
     MBTILES_FILE_SUFFIX,
+    MBTILES_PROVIDER_TIANDITU,
     PROGRESS_EMIT_INTERVAL_SECONDS,
+    UI_TEXT_COMPOSITION_MERGED,
+    UI_TEXT_COMPOSITION_SINGLE,
     UI_TEXT_RESUME_INCOMPATIBLE,
     UI_TEXT_RESUME_TOKEN_REQUIRED,
 )
 from app.downloader import (
+    CompositeTileDownloader,
     DownloadManager,
     DownloadProgress,
     DownloadSummary,
@@ -88,10 +93,16 @@ from app.mbtiles import (
     validate_mbtiles,
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
-from app.models.map_layer import MapLayerType
+from app.models.map_layer import (
+    COMPOSITION_SINGLE,
+    MapLayerType,
+    MapType,
+    composition_for,
+)
 from app.providers import TiandituProvider
 
 __all__ = [
+    "LayerArgument",
     "MapDownloadOutcome",
     "MapDownloadService",
     "MapResumeError",
@@ -100,6 +111,11 @@ __all__ = [
     "build_output_path",
     "sanitize_map_name",
 ]
+
+
+#: 下载目标：单图层（:class:`~app.models.MapLayerType`）或地图类型
+#: （:class:`~app.models.MapType`）。服务层两种都收，由它决定走哪条链路。
+LayerArgument = MapLayerType | MapType
 
 
 _logger = logging.getLogger(__name__)
@@ -269,8 +285,63 @@ def check_resume_compatibility(
                 "文件的 description 与本次任务不同（无法从中识别图层，已放行）"
             )
 
+    # --- 地图类型（Slice 6，Spec §12）---
+    # 只有两边都说得清才比对：Slice ≤5 生成的文件根本没有 ``map_type`` 这一项，
+    # 拿空字符串去比会给每个老文件都判一次"不一致"，那是误报不是保护。
+    task_map_type = _task_map_type(task)
+    file_map_type = (metadata.source_map_type or "").strip().lower()
+    if task_map_type and file_map_type and task_map_type != file_map_type:
+        result.problems.append(
+            f"地图类型不一致：任务 {task_map_type}，文件 {file_map_type}"
+        )
+
+    # --- 合成方式（Slice 6，Spec §12）---
+    # 底图瓦片与"底图 + 注记"的合成瓦片**不可混写**：混出来的地图
+    # "有的地块有字、有的没有"，在手机上看着完全正常，只是内容不全 ——
+    # 属于最难被发现的那类缺陷。因此这里比 description 严格得多：**一律拦截**。
+    #
+    # 文件没有 ``composition`` 项 = Slice ≤5 的产物，那时只可能下过单层底图，
+    # 所以按 ``single`` 对待。于是"老文件 + 勾了中文注记"会被拒（正确：
+    # 老文件里没有注记）；"老文件 + 不勾注记"照常继续（正确：语义一致）。
+    task_composition = _task_composition(task)
+    file_composition = (metadata.composition or "").strip().lower() or COMPOSITION_SINGLE
+    if task_composition != file_composition:
+        result.problems.append(
+            f"合成方式不一致：任务 {task_composition}，文件 {file_composition}"
+            "（底图与合成瓦片不能混在同一个地图包里）"
+        )
+
     result.compatible = not result.problems
     return result
+
+
+def _task_map_type(task) -> str:
+    """从任务记录里取出地图类型字符串；认不出来返回空串（= 不比对）。
+
+    鸭子类型：只要求对象身上有 :attr:`DownloadTask.source_map_type` /
+    ``map_type`` / ``map_layer`` 里的任意一个。测试里的轻量替身也走得通。
+    """
+    resolved = getattr(task, "source_map_type", None)
+    if isinstance(resolved, MapType):
+        return resolved.value
+    raw = str(getattr(task, "map_type", "") or "").strip().lower()
+    if raw:
+        return raw
+    layer = str(getattr(task, "map_layer", "") or "")
+    if not layer:
+        return ""
+    try:
+        return MapType.from_layer(layer).value
+    except ValueError:
+        return ""
+
+
+def _task_composition(task) -> str:
+    """从任务记录里取出合成方式（``single`` / ``merged``）。"""
+    value = getattr(task, "composition", None)
+    if isinstance(value, str) and value:
+        return value
+    return composition_for(bool(getattr(task, "with_labels", False)))
 
 
 def _layer_tokens_in_description(description: str) -> list[str]:
@@ -284,11 +355,69 @@ def _layer_tokens_in_description(description: str) -> list[str]:
 
 
 def _default_description(task: DownloadTask) -> str:
-    """本工具写进 ``description`` 的标准内容（与 Slice 4 的写法保持一致）。"""
+    """本工具写进 ``description`` 的标准内容（与 Slice 4 的写法保持一致）。
+
+    Slice 6 起合成模式把**两个图层**都写进去：续传校验会从 ``description``
+    里提取图层标识，只写底图的话，"任务是合成、文件里只有底图"这类不一致
+    就少了一道本该有的线索。
+    """
+    layers = " + ".join(item.value for item in _task_layers(task))
     return (
-        f"天地图 {task.map_layer} "
+        f"天地图 {layers or task.map_layer} "
         f"z{task.min_zoom}~{task.max_zoom} "
         f"{task.bounds}"
+    )
+
+
+def _task_layers(task) -> tuple[MapLayerType, ...]:
+    """任务实际要下载的图层（合成模式是"底图 + 注记"两层，底图在前）。"""
+    with_labels = bool(getattr(task, "with_labels", False))
+    map_type = getattr(task, "source_map_type", None)
+    if with_labels and isinstance(map_type, MapType):
+        return map_type.layers(True)
+    raw_layer = str(getattr(task, "map_layer", "") or "")
+    try:
+        return (MapLayerType(raw_layer),)
+    except ValueError:
+        return map_type.layers(False) if isinstance(map_type, MapType) else ()
+
+
+def _resolve_task_target(task) -> tuple[LayerArgument, bool]:
+    """由任务记录还原"这次要下什么"。
+
+    返回 ``(layer, with_labels)``：
+
+    - 任务记录了中文注记合成 → ``(MapType, True)``，服务层据此走合成链路；
+    - 否则优先用记录里那个**具体图层** —— Slice ≤5 的记录就是这个语义，
+      行为一字不变（包括"只下注记层"这种少见但合法的记录）；
+    - 具体图层认不出来时，退回由地图类型展开出的底图。这时按"记录已经损坏"
+      处理，不猜。
+
+    Raises:
+        MapResumeError: 图层与地图类型都认不出来。
+    """
+    with_labels = bool(getattr(task, "with_labels", False))
+    map_type = getattr(task, "source_map_type", None)
+    if with_labels:
+        if not isinstance(map_type, MapType):
+            raise MapResumeError(
+                f"任务 {getattr(task, 'id', '?')} 记录了中文注记合成，"
+                f"但地图类型无法识别：{getattr(task, 'map_type', '')!r}；"
+                f"支持 {[item.value for item in MapType]}"
+            )
+        return (map_type, True)
+
+    raw_layer = str(getattr(task, "map_layer", "") or "")
+    if raw_layer:
+        try:
+            return (MapLayerType(raw_layer), False)
+        except ValueError:
+            pass
+    if isinstance(map_type, MapType):
+        return (map_type.base_layer, False)
+    raise MapResumeError(
+        f"任务 {getattr(task, 'id', '?')} 的图层无法识别：{raw_layer!r}；"
+        f"支持 {[item.value for item in MapLayerType]}"
     )
 
 
@@ -334,15 +463,41 @@ def read_existing_metadata(path: str | Path) -> MBTilesMetadata | None:
         "south": south,
         "east": east,
         "north": north,
+        # Slice 6 的本工具自有字段。**必须读回来**：续传一致性校验正是靠
+        # ``composition`` / ``map_type`` 判断"这个包还能不能接着往里写"。
+        # 漏掉它们会让每个合成文件的续传都被误判成"合成方式不一致"，
+        # 而且报错信息会说文件是 single——因为空串会被当成 Slice ≤5 的老文件。
+        "provider": raw.get("provider", ""),
+        "source_map_type": raw.get("map_type", ""),
+        "composition": raw.get("composition", ""),
     }
-    try:
-        return MBTilesMetadata(format=(raw.get("format") or "png").strip().lower(), **common)
-    except ValueError:
-        # format 不认识：退回 png 再试一次；仍失败就认定"读不出元数据"。
+    labels = _parse_metadata_bool(raw.get("labels"))
+    for candidate in (
+        {"format": (raw.get("format") or "png").strip().lower()},
+        {"format": "png"},
+    ):
         try:
-            return MBTilesMetadata(format="png", **common)
+            return MBTilesMetadata(with_labels=labels, **candidate, **common)
         except ValueError:
-            return None
+            # format 不认识：退回 png 再试一次；仍失败就认定"读不出元数据"。
+            continue
+    return None
+
+
+def _parse_metadata_bool(value: str | None) -> bool | None:
+    """解析 metadata 里的 ``true`` / ``false``。
+
+    ``None`` 表示"这个键不存在"——不能粗暴地当成 ``False``，
+    否则一个 Slice ≤5 的老文件会被误报成"明确声明没有注记"。
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
 
 
 def _parse_metadata_bounds(value: str) -> tuple[float, float, float, float] | None:
@@ -375,6 +530,12 @@ class MapDownloadOutcome:
     discarded: int = 0
     extra_lines: list[str] = field(default_factory=list)
 
+    # --- Slice 6：本次下的是什么 ---
+    #: 地图类型（``MapType.value``）
+    map_type: str = ""
+    #: 瓦片里是否已经合成了中文注记
+    with_labels: bool = False
+
     # --- Slice 5：续传相关 ---
     #: 本次是否是"继续已有任务"
     resumed: bool = False
@@ -386,6 +547,17 @@ class MapDownloadOutcome:
     skip_mode: SkipMode | None = None
     #: 不能标成"已完成"的原因（``None`` 表示没有阻碍）
     stop_reason: str | None = None
+
+    @property
+    def composition_text(self) -> str:
+        """一行合成说明（"这次产物到底是什么形态"）。
+
+        直接复用 metadata 的判定，不在这里重写一遍 ``with_labels`` 的分支：
+        结果区、日志、任务记录三处说的必须是同一件事。
+        """
+        if self.with_labels:
+            return UI_TEXT_COMPOSITION_MERGED
+        return UI_TEXT_COMPOSITION_SINGLE
 
     @property
     def cancelled(self) -> bool:
@@ -556,6 +728,7 @@ class MapDownloadService:
         batch_size: int = DEFAULT_MBTILES_BATCH_SIZE,
         progress_interval_seconds: float = PROGRESS_EMIT_INTERVAL_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
+        composer: TileComposer | None = None,
     ) -> None:
         """
         Args:
@@ -570,6 +743,10 @@ class MapDownloadService:
             batch_size: MBTiles 批量事务大小。
             progress_interval_seconds: 进度回调节流间隔。
             transport: httpx 传输层，**仅供测试注入 ``httpx.MockTransport``**。
+            composer: 图像合成器（Slice 6）。``None`` 表示用
+                :class:`~app.composer.TileComposer` 的默认配置；
+                单独留一个注入口是为了将来能换图像后端（例如带金字塔抽稀的
+                实现）而不必改服务层。
 
         注意 ``transport`` 必须在这里暴露：``TileDownloader`` 用的是自己的
         transport，``TiandituProvider`` 上挂的那个不影响下载器。少了这个参数，
@@ -587,6 +764,7 @@ class MapDownloadService:
         self._batch_size = batch_size
         self._progress_interval = progress_interval_seconds
         self._transport = transport
+        self._composer = composer
 
         self._manager: DownloadManager | None = None
         self._sink: MBTilesTileSink | None = None
@@ -640,9 +818,10 @@ class MapDownloadService:
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: MapLayerType,
+        layer: LayerArgument,
         output_path: str | Path,
         *,
+        with_labels: bool = False,
         map_name: str | None = None,
         description: str = "",
         image_format: str = "png",
@@ -656,11 +835,15 @@ class MapDownloadService:
         Args:
             bounds: 下载范围。
             min_zoom / max_zoom: 缩放区间（含两端）。
-            layer: 图层。
+            layer: 下载目标。传 :class:`~app.models.MapLayerType` 时**只下这一层**；
+                传 :class:`~app.models.MapType` 时按 :attr:`with_labels` 决定
+                是"只下底图"还是"底图 + 中文注记合成成一张"。
+            with_labels: 是否把中文注记合成进瓦片。**只能与 ``MapType`` 一起用**
+                ——一块注记瓦片没法自己回答"它属于矢量还是影像"。
             output_path: 输出的 ``.mbtiles`` 路径（父目录自动创建）。
             map_name: MBTiles 的 ``name``；``None`` 时取输出文件名主体。
             description: MBTiles 的 ``description``。
-            image_format: 瓦片图片格式。
+            image_format: 瓦片图片格式。合成模式强制 PNG（注记依赖透明通道）。
             on_progress: 进度回调（``DownloadProgress``），已节流。
             resume_policy: 跳过策略。默认 ``None`` 即"不做跳过"——
                 全新下载的目标是"这个文件从无到有"，跳过已有瓦片是**续传**
@@ -675,7 +858,7 @@ class MapDownloadService:
         Raises:
             MBTilesWriteError: **写库阶段**失败（磁盘满、库损坏等）。
                 这种错误无法继续，必须让用户看见，因此不作降级处理。
-            ValueError: 参数非法。
+            ValueError: 参数非法（含"注记层没有对应的地图类型"）。
         """
         return await self._execute(
             provider=self._provider,
@@ -683,6 +866,7 @@ class MapDownloadService:
             min_zoom=min_zoom,
             max_zoom=max_zoom,
             layer=layer,
+            with_labels=with_labels,
             output_path=Path(output_path),
             map_name=map_name,
             description=description,
@@ -758,13 +942,8 @@ class MapDownloadService:
             raise MapResumeError(
                 f"任务 {task.id} 的范围非法，无法继续：{exc}"
             ) from exc
-        try:
-            layer = MapLayerType(task.map_layer)
-        except ValueError as exc:
-            raise MapResumeError(
-                f"任务 {task.id} 的图层无法识别：{task.map_layer!r}；"
-                f"支持 {[item.value for item in MapLayerType]}"
-            ) from exc
+        # --- 1b. 下载目标：具体图层 / 地图类型 + 是否合成（Slice 6） ---
+        target, with_labels = _resolve_task_target(task)
 
         path = Path(task.output_path)
         _logger.info("Resume task: %s", task.id)
@@ -812,7 +991,8 @@ class MapDownloadService:
             bounds=bounds,
             min_zoom=int(task.min_zoom),
             max_zoom=int(task.max_zoom),
-            layer=layer,
+            layer=target,
+            with_labels=with_labels,
             output_path=path,
             map_name=task.name or None,
             description=metadata.description if metadata else _default_description(task),
@@ -845,7 +1025,8 @@ class MapDownloadService:
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: MapLayerType,
+        layer: LayerArgument,
+        with_labels: bool,
         output_path: Path,
         map_name: str | None,
         description: str,
@@ -859,14 +1040,35 @@ class MapDownloadService:
         """建库 → 起 sink → 下载 → drain → close → 校验（两条入口共用）。"""
         if not isinstance(bounds, GeoBounds):
             raise ValueError(f"bounds 必须是 GeoBounds，实际为 {type(bounds).__name__}")
-        if not isinstance(layer, MapLayerType):
+        if not isinstance(layer, (MapLayerType, MapType)):
             raise ValueError(
-                f"layer 必须是 MapLayerType，实际为 {layer!r}；"
-                f"支持 {[item.value for item in MapLayerType]}"
+                f"layer 必须是 MapLayerType 或 MapType，实际为 {layer!r}；"
+                f"支持图层 {[item.value for item in MapLayerType]} "
+                f"或地图类型 {[item.value for item in MapType]}"
+            )
+        if with_labels and not isinstance(layer, MapType):
+            # 一块注记瓦片没法自己回答"它属于矢量还是影像"，所以合成模式
+            # 只能从"地图类型"出发。这里直接拒绝而不是猜一个类型：
+            # 猜错会把影像的注记贴到矢量底图上，成品看着"有字"但整体是错的。
+            raise ValueError(
+                "with_labels=True 需要传 MapType（矢量 / 影像地图）；"
+                f"实际传的是 {layer!r}（单图层）。"
+                "请改传 MapType.VECTOR / MapType.IMAGE，或把 with_labels 设为 False。"
             )
 
+        # --- 下载目标解析（Spec §2：从唯一那张映射表里取图层） ---
+        map_type = layer if isinstance(layer, MapType) else MapType.from_layer(layer)
+        merged = bool(with_labels)
         path = output_path
         name = map_name or path.stem
+
+        if merged and str(image_format).strip().lower() != "png":
+            # 合成产物一律 PNG（Spec §4）：注记依赖透明通道，JPEG 存不下 alpha。
+            # 与其落一个"metadata 说 jpg、内容其实是 png"的库，不如当场拒绝。
+            raise ValueError(
+                f"合成模式（中文注记）只能输出 PNG，实际要求 {image_format!r}"
+            )
+
         metadata = MBTilesMetadata.for_bounds(
             bounds,
             min_zoom,
@@ -874,6 +1076,10 @@ class MapDownloadService:
             name=name,
             description=description,
             image_format=image_format,
+            provider=MBTILES_PROVIDER_TIANDITU,
+            source_map_type=map_type.value,
+            with_labels=merged,
+            composition=composition_for(merged),
         )
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -924,6 +1130,29 @@ class MapDownloadService:
             rate_limiter=self._rate_limiter,
             timeout=self._timeout,
         )
+        # 合成模式：**同一个** TileDownloader 被用两次（底图 + 注记）。
+        # 于是连接复用、限速、重试三件事与单层模式完全一致 ——
+        # "1 万张瓦片 ≈ 2 万次请求"里的每一次都仍然受 8 请求/秒约束。
+        # 生命周期上 CompositeTileDownloader **不拥有**它（谁创建谁关闭），
+        # 所以下面 finally 里关的仍然是 downloader 本身。
+        worker = (
+            CompositeTileDownloader(downloader, self._composer)
+            if merged
+            else downloader
+        )
+        # 单层模式下 MapType 要展开成**底图**图层：不勾中文注记时产物就是
+        # "没有字的底图"。这一步由服务层写死，不让下载器去猜。
+        target: LayerArgument = (
+            map_type
+            if merged
+            else (layer if isinstance(layer, MapLayerType) else map_type.base_layer)
+        )
+        if merged:
+            _logger.info(
+                "Composite mode: %s + %s → PNG",
+                map_type.base_layer.value,
+                map_type.label_layer.value,
+            )
 
         self._sink = sink
         self._tiles_written = 0
@@ -931,7 +1160,7 @@ class MapDownloadService:
 
         try:
             manager = DownloadManager(
-                downloader,
+                worker,
                 concurrency=self._concurrency,
                 progress_interval_seconds=self._progress_interval,
             )
@@ -940,7 +1169,7 @@ class MapDownloadService:
                 bounds,
                 min_zoom,
                 max_zoom,
-                layer,
+                target,
                 on_tile=sink.consume,
                 on_progress=self._make_progress_forwarder(
                     manager, on_progress, task=task, task_service=task_service
@@ -1010,6 +1239,8 @@ class MapDownloadService:
             file_size=file_size,
             discarded=sink.discarded,
             extra_lines=extra_lines,
+            map_type=map_type.value,
+            with_labels=merged,
             resumed=resumed,
             existing_tiles=existing_tiles,
             target_tiles=total,

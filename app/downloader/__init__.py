@@ -29,8 +29,10 @@
 - 本层**不 import `app.mbtiles` / `app.package`**：没有 SQLite，没有 ADB。
 """
 
+from app.downloader.composite_tile_downloader import CompositeTileDownloader
 from app.downloader.download_manager import DownloadManager, iter_tile_coordinates
 from app.downloader.models import (
+    COMPOSITE_FAILURE_KINDS,
     DownloadProgress,
     DownloadSummary,
     ProgressCallback,
@@ -64,6 +66,7 @@ __all__ = [
     "iter_tile_coordinates",
     # 单瓦片
     "TileDownloader",
+    "CompositeTileDownloader",
     # 策略
     "RetryPolicy",
     "should_retry",
@@ -83,6 +86,7 @@ __all__ = [
     "TileCoordinate",
     "TileDownloadResult",
     "TileFailureKind",
+    "COMPOSITE_FAILURE_KINDS",
     "DownloadProgress",
     "DownloadSummary",
     "TileCallback",

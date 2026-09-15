@@ -39,6 +39,8 @@ from app.config.settings import (
     DEFAULT_WINDOW_WIDTH,
     GUI_LARGE_TASK_CONFIRM_TILES,
     UI_TEXT_CANCELLED_KEEP_TILES,
+    UI_TEXT_COMPOSITION_MERGED,
+    UI_TEXT_COMPOSITION_SINGLE,
     UI_TEXT_EXIT_CANCEL,
     UI_TEXT_EXIT_CONFIRM,
     UI_TEXT_EXIT_WITH_TASK,
@@ -70,7 +72,7 @@ from app.geo import (
     lon_to_tile_x,
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
-from app.models.map_layer import MapLayerType
+from app.models.map_layer import MapLayerType, MapType
 from app.providers import TiandituProvider, TileTestResult, mask_url
 from app.services import (
     MapDownloadOutcome,
@@ -119,6 +121,26 @@ def _backup_path(path: Path) -> Path:
         candidate = path.with_name(f"{path.name}.bak-{stamp}-{counter}")
         counter += 1
     return candidate
+
+
+def _describe_plan(
+    map_type: MapType,
+    with_labels: bool,
+    min_zoom: int,
+    max_zoom: int,
+    bounds: GeoBounds,
+) -> str:
+    """拼出写进 MBTiles ``description`` 的一句话。
+
+    合成模式把**两个图层标识**都写进去（``vec_w + cva_w``）：续传一致性校验会
+    从 ``description`` 里提取图层标识作为兜底线索，只写底图的话，
+    "任务是合成、文件里其实只有底图"这类不一致就少了一道本该有的证据。
+
+    只在这里拼一次：服务层 ``_default_description`` 用的是同样的格式，
+    两边必须一致，否则人工比对描述时会误判成"参数不匹配"。
+    """
+    layers = " + ".join(item.value for item in map_type.layers(with_labels))
+    return f"天地图 {layers} z{min_zoom}~{max_zoom} {bounds.as_tuple()}"
 
 #: 各动作对应的说明（下载相关动作在 Slice 3 已实现，Slice 4 起落盘为 MBTiles，
 #: Slice 5 起支持断点续传与任务恢复）
@@ -178,6 +200,12 @@ class _DownloadPlan:
             但任务记录本身是这一轮新建的（不是从任务列表里恢复的）。
         effective_tiles: 预计**真正要下载**的张数（用于大任务确认的阈值判断）。
             续传时它是"目标 - 库里已有"，否则等于 ``total``。
+        map_type: 地图类型（矢量 / 影像，Slice 6）。续传时取自任务记录。
+        with_labels: 是否把中文注记合成进瓦片（Slice 6）。
+        requests: 预计 WMTS 请求次数 = ``effective_tiles × 每张瓦片请求次数``。
+            开启中文注记后每张瓦片要请求底图 + 注记两次，因此这个数字是
+            ``effective_tiles`` 的两倍 —— 大任务提示必须给出它，
+            否则用户看到"配额消耗"时无法预估真实开销。
     """
 
     provider: TiandituProvider
@@ -196,6 +224,9 @@ class _DownloadPlan:
     existing_tiles: int = 0
     resume_existing: bool = False
     effective_tiles: int = 0
+    map_type: MapType | None = None
+    with_labels: bool = False
+    requests: int = 0
 
     @property
     def is_resume(self) -> bool:
@@ -206,6 +237,23 @@ class _DownloadPlan:
     def skips_existing(self) -> bool:
         """本次启动是否会跳过已有瓦片。"""
         return self.is_resume or self.resume_existing
+
+    @property
+    def download_target(self) -> "MapLayerType | MapType":
+        """交给下载引擎的目标（``MapType`` 或单个 ``MapLayerType``）。
+
+        合成模式下必须把 ``MapType`` 本身传下去——服务层要靠它才知道
+        该用哪个注记图层；只传底图的话"合成"就无从谈起。
+        认不出地图类型时退回单个底图图层，保证老任务仍能跑。
+        """
+        if self.with_labels and self.map_type is not None:
+            return self.map_type
+        return self.layer
+
+    @property
+    def composition_text(self) -> str:
+        """一行合成说明（界面日志与结果区共用同一句话）。"""
+        return UI_TEXT_COMPOSITION_MERGED if self.with_labels else UI_TEXT_COMPOSITION_SINGLE
 
 
 class MainWindow(QMainWindow):
@@ -368,6 +416,9 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.download_panel.action_requested.connect(self._on_download_action)
         self.download_panel.output_config_changed.connect(self._refresh_output_preview)
+        # Slice 6：切换地图类型 / 勾选中文注记会改变每张瓦片的请求次数，
+        # 已算出的「预估结果」要跟着重画那一行请求量。
+        self.download_panel.layer_plan_changed.connect(self._refresh_output_preview)
         self.device_panel.refresh_requested.connect(self._on_refresh_devices)
         self.device_panel.import_requested.connect(self._on_import_to_android)
         # Slice 5：任务列表
@@ -678,7 +729,11 @@ class MainWindow(QMainWindow):
                 east=data["east"],
                 north=data["north"],
             )
-            layer = data["map_type"].base_layer
+            map_type = data["map_type"]
+            with_labels = bool(data["with_labels"])
+            # 任务记录里存的是**底图图层**（历史字段，续传校验与老版本兼容都靠它）；
+            # "是否合成注记"由 with_labels 单独承载（Slice 6）。
+            layer = map_type.base_layer
             min_zoom = int(data["min_zoom"])
             max_zoom = int(data["max_zoom"])
             # 先算总量——不能"跑起来才发现是几十万张"
@@ -694,6 +749,7 @@ class MainWindow(QMainWindow):
             if output_path.exists()
             else 0
         )
+        effective = max(0, total - existing)
 
         try:
             task = self.task_service.create_task(
@@ -704,6 +760,7 @@ class MainWindow(QMainWindow):
                 map_layer=layer,
                 output_path=output_path,
                 total_tiles=total,
+                with_labels=with_labels,
             )
         except (TaskStoreError, OSError) as exc:
             self._report_download_error(
@@ -720,8 +777,8 @@ class MainWindow(QMainWindow):
             layer=layer,
             output_path=output_path,
             map_name=data["map_name"],
-            description=(
-                f"天地图 {layer.value} z{min_zoom}~{max_zoom} {bounds.as_tuple()}"
+            description=_describe_plan(
+                map_type, with_labels, min_zoom, max_zoom, bounds
             ),
             total=total,
             size_text=format_size(estimate_size_bytes(total)),
@@ -729,7 +786,10 @@ class MainWindow(QMainWindow):
             existing_tiles=existing,
             # 全新下载默认"不跳过"：目标文件本来就不该有内容，跳过只会掩盖问题
             resume_policy=ResumePolicy.disabled(),
-            effective_tiles=max(0, total - existing),
+            effective_tiles=effective,
+            map_type=map_type,
+            with_labels=with_labels,
+            requests=effective * map_type.request_count_per_tile(with_labels),
         )
 
     def _discard_plan(self, plan: _DownloadPlan) -> None:
@@ -772,7 +832,9 @@ class MainWindow(QMainWindow):
             QMessageBox.Icon.Question,
             UI_TEXT_LARGE_TASK_CONFIRM_TITLE,
             UI_TEXT_LARGE_TASK_CONFIRM.format(
-                total=plan.effective_tiles, size=plan.size_text
+                total=plan.effective_tiles,
+                size=plan.size_text,
+                requests=plan.requests,
             ),
             parent=self,
         )
@@ -784,7 +846,8 @@ class MainWindow(QMainWindow):
         dialog.finished.connect(self._on_large_task_answered)
         self._confirm_dialog = dialog
         self.log_panel.append_log(
-            f"预计需要下载 {plan.effective_tiles:,} 张瓦片（约 {plan.size_text}），"
+            f"预计需要下载 {plan.effective_tiles:,} 张瓦片（约 {plan.size_text}，"
+            f"约 {plan.requests:,} 次 WMTS 请求），"
             "已弹出大任务确认框，等待用户确认",
             "WARNING",
         )
@@ -981,14 +1044,28 @@ class MainWindow(QMainWindow):
         self._refresh_task_list(select_id=task.id)
 
         token = self.download_panel.get_form_data()["token"]
+        type_text = (
+            plan.map_type.display_name if plan.map_type is not None else plan.layer.value
+        )
         self.log_panel.append_log(
-            f"开始下载：图层={plan.layer.value}，范围={plan.bounds.as_tuple()}，"
+            f"开始下载：地图类型={type_text}，图层={plan.layer.value}，"
+            f"范围={plan.bounds.as_tuple()}，"
             f"缩放={plan.min_zoom}~{plan.max_zoom}，瓦片总数={plan.total:,}，"
             f"并发={DEFAULT_DOWNLOAD_CONCURRENCY}，"
             f"限速={DEFAULT_REQUESTS_PER_SECOND:g} 请求/秒，"
             f"超时={DEFAULT_REQUEST_TIMEOUT:g}s，"
             f"最大尝试={DEFAULT_MAX_RETRIES} 次"
         )
+        # Spec §23：开工前一次性说清"这次到底在下什么"。合成模式与纯底图模式的
+        # 产物、请求量、体积都不一样，只报一个"瓦片总数"是交代不清楚的。
+        self.log_panel.append_log(f"合成方式：{plan.composition_text}")
+        if plan.with_labels and plan.map_type is not None:
+            self.log_panel.append_log(
+                f"合成模式：每张瓦片请求 {plan.map_type.base_layer.value} + "
+                f"{plan.map_type.label_layer.value} 各一次，"
+                f"按 RGBA alpha 合成后存为 PNG；"
+                f"本次预计 {plan.requests:,} 次 WMTS 请求"
+            )
         if resume_task is not None:
             self.log_panel.append_log(
                 f"续传模式：已有 {plan.existing_tiles:,} 张瓦片会自动跳过，"
@@ -1005,8 +1082,9 @@ class MainWindow(QMainWindow):
             plan.bounds,
             plan.min_zoom,
             plan.max_zoom,
-            plan.layer,
+            plan.download_target,
             plan.output_path,
+            with_labels=plan.with_labels,
             map_name=plan.map_name,
             description=plan.description,
             concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -1338,6 +1416,14 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Slice 6：地图类型与"要不要合成"都从任务记录还原。
+        # 老记录（Slice ≤5）没有这两项 —— 那时的产物一定是单层底图，
+        # 因此 source_map_type 空串、with_labels 为 False 都是**正确**的还原结果。
+        map_type = MapType.parse(getattr(task, "source_map_type", "")) 
+        if map_type is None:
+            map_type = MapType.from_layer(layer)
+        with_labels = bool(getattr(task, "with_labels", False))
+
         path = Path(task.output_path)
         total = task.total_tiles or estimate_tile_count(
             bounds, task.min_zoom, task.max_zoom
@@ -1359,8 +1445,13 @@ class MainWindow(QMainWindow):
             layer=layer,
             output_path=path,
             map_name=task.name,
-            description=f"天地图 {layer.value} z{task.min_zoom}~{task.max_zoom} "
-            f"{bounds.as_tuple()}",
+            description=_describe_plan(
+                map_type,
+                with_labels,
+                int(task.min_zoom),
+                int(task.max_zoom),
+                bounds,
+            ),
             total=total,
             size_text=format_size(estimate_size_bytes(total)),
             resume_policy=ResumePolicy(),
@@ -1368,6 +1459,9 @@ class MainWindow(QMainWindow):
             task=task,
             existing_tiles=existing,
             effective_tiles=remaining,
+            map_type=map_type,
+            with_labels=with_labels,
+            requests=remaining * map_type.request_count_per_tile(with_labels),
         )
         self._continue_plan(plan)
 
@@ -1426,14 +1520,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     @Slot()
     def _on_refresh_devices(self) -> None:
-        message = "刷新设备：本版本不执行 adb，设备发现将在 Slice 6 实现"
+        message = "刷新设备：本版本不执行 adb，设备发现将在 Slice 7 实现"
         self.log_panel.append_log(message)
         self.device_panel.clear_devices()
         self.statusBar().showMessage(message, 5000)
 
     @Slot()
     def _on_import_to_android(self) -> None:
-        message = "导入到 Android：需要 adb 设备管理，将在 Slice 6 实现"
+        message = "导入到 Android：需要 adb 设备管理，将在 Slice 7 实现"
         self.log_panel.append_log(message, "WARNING")
         self.statusBar().showMessage(message, 5000)
 
@@ -1447,7 +1541,7 @@ class MainWindow(QMainWindow):
             f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
             "Windows 端生成天地图离线地图包，后续导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 5（断点续传、任务恢复与已有瓦片跳过）。",
+            "当前进度：Slice 6（底图与中文注记图层合成）。",
         )
 
     # ------------------------------------------------------------------ #

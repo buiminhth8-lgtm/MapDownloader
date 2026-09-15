@@ -1,4 +1,4 @@
-"""Android 设备层（Slice 6）。
+"""Android 设备层（Slice 7）。
 
 计划内容：
 - ``AdbClient``：封装 ``adb devices`` / ``adb push`` / ``adb shell``，统一超时与错误处理。
