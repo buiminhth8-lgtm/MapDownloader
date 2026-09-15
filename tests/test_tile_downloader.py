@@ -309,6 +309,28 @@ async def test_connect_error_is_retried() -> None:
     assert result.attempts == FAST_POLICY.max_attempts
 
 
+async def test_network_error_message_survives_via_cause_chain() -> None:
+    """连接层异常常常 ``str()`` 为空，真正的消息在 ``__cause__`` 链更深处。
+
+    真实形态（本机实测）：``httpx.ConnectError`` → ``httpcore.ConnectError``
+    → ``anyio.EndOfStream`` → ``ssl.SSLEOFError``，只有最后一层带文本。
+    没有这个回退，用户看到的就只有一句"网络错误："。
+    """
+    root = httpx.ConnectError("")
+    root.__cause__ = RuntimeError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF")
+
+    scripted = Scripted([_raise(root)])
+    async with _make_downloader(scripted) as downloader:
+        result = await downloader.download_tile(TILE, LAYER)
+
+    assert result.failure_kind is TileFailureKind.NETWORK
+    error = result.error or ""
+    assert error.strip() != "网络错误："                 # 不能只剩一个冒号
+    assert "ConnectError" in error                       # 类型名保留
+    assert "UNEXPECTED_EOF_WHILE_READING" in error        # 真实原因也带出来
+    assert "12/3367/1563" not in error                   # 但不含 URL / Token
+
+
 async def test_network_error_then_success() -> None:
     scripted = Scripted(
         [_raise(httpx.ConnectError("dns failure")), _image(FAKE_PNG)]

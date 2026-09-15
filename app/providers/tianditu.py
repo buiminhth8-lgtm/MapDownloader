@@ -61,6 +61,7 @@ __all__ = [
     "detect_image_format",
     "is_valid_tile_response",
     "describe_response",
+    "describe_exception",
     "http_error_message",
     "test_tile",
 ]
@@ -439,6 +440,53 @@ class TiandituProvider:
 # --------------------------------------------------------------------------- #
 # HTTP 状态码 -> 人话
 # --------------------------------------------------------------------------- #
+def describe_exception(exc: BaseException) -> str:
+    """把异常转成**一定非空**的一行说明。
+
+    为什么需要这个：``str(exc)`` 为空是真实存在且很常见的情况。以 TLS 被中断
+    为例，异常链是这样的（实测）::
+
+        httpx.ConnectError        str=''        args=('',)
+        └─ httpcore.ConnectError  str=''        args=(EndOfStream(),)
+           └─ anyio.EndOfStream   str=''
+              └─ ssl.SSLEOFError  str='[SSL: UNEXPECTED_EOF_WHILE_READING] ...'
+
+    最外层那句 ``f"网络错误：{exc}"`` 于是退化成一句"网络错误："——用户既分不清
+    是 DNS、TLS 还是被墙，也没法拿这句话去搜索。
+
+    本函数沿 ``__cause__`` / ``__context__`` 往下找**第一段非空文本**（顶层有文本
+    就直接用它，没有就一路往下），并保留链上的异常类型名作为前缀。
+
+    >>> describe_exception(ValueError("boom"))
+    'boom'
+    >>> describe_exception(OSError())
+    'OSError'
+    """
+    names: list[str] = []
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    detail = ""
+
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        name = type(node).__name__
+        if name not in names:
+            names.append(name)
+        text = str(node).strip()
+        if text:
+            detail = text
+            break
+        node = node.__cause__ or node.__context__
+
+    top = names[0] if names else type(exc).__name__
+    if not detail:
+        # 整条链都没有文本：至少把类型名给出来（"←" 表示原因链）
+        return " ← ".join(names) if names else top
+    if len(names) == 1:
+        return detail
+    return f"{top}：{detail}"
+
+
 def http_error_message(status_code: int) -> str:
     """把 HTTP 状态码翻译成带排查提示的错误文案。
 
@@ -523,7 +571,7 @@ def test_tile(
             content_type=None,
             content_length=0,
             elapsed_ms=(time.perf_counter() - started) * 1000.0,
-            error=f"{_ERROR_IMPLICIT_NETWORK}：{exc}",
+            error=f"{_ERROR_IMPLICIT_NETWORK}：{describe_exception(exc)}",
         )
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0

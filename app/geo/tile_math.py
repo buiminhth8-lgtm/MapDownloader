@@ -52,6 +52,8 @@ __all__ = [
     "calculate_tile_range",
     "calculate_tile_ranges",
     "estimate_tile_count",
+    "validate_zoom",
+    "validate_tile_axis",
     "xyz_y_to_tms_y",
     "tms_y_to_xyz_y",
     "estimate_size_bytes",
@@ -91,8 +93,16 @@ class TileRange:
 # --------------------------------------------------------------------------- #
 # 参数校验
 # --------------------------------------------------------------------------- #
-def _validate_zoom(zoom: int) -> int:
-    """校验缩放级别，返回规范化后的 int。"""
+def validate_zoom(zoom: int) -> int:
+    """校验缩放级别在 ``[0, 22]`` 且为真整数，返回规范化后的 int。
+
+    公开它是为了让"合法缩放级别"这条规则只有一处定义：Slice 4 写 MBTiles 时
+    需要先把 ``z`` 规范化成 ``int`` 再入列（``zoom_level``），若各层自己写一遍
+    边界判断，早晚会出现"能下载但写不进库"的错位。
+
+    Raises:
+        ValueError: 非整数，或超出 ``[TILE_MATH_MIN_ZOOM, TILE_MATH_MAX_ZOOM]``。
+    """
     try:
         value = operator.index(zoom)
     except TypeError as exc:
@@ -107,7 +117,7 @@ def _validate_zoom(zoom: int) -> int:
 
 def _tiles_per_axis(zoom: int) -> int:
     """该缩放级别下每轴的瓦片数 ``2**zoom``。"""
-    return 1 << _validate_zoom(zoom)
+    return 1 << validate_zoom(zoom)
 
 
 def _check_finite(name: str, value: float) -> float:
@@ -124,6 +134,44 @@ def _check_finite(name: str, value: float) -> float:
 def _clamp(value: int, low: int, high: int) -> int:
     """把整数限制在 ``[low, high]``。"""
     return min(max(value, low), high)
+
+
+def validate_tile_axis(name: str, value: int, zoom: int) -> int:
+    """校验瓦片的某个轴编号落在 ``[0, 2**zoom - 1]``，返回规范化后的 int。
+
+    公开出来是因为"合法瓦片编号"这条规则需要被多处共用：
+
+    - :func:`xyz_y_to_tms_y` / :func:`tms_y_to_xyz_y` 只校验 ``y``；
+    - Slice 4 写 MBTiles 前需要**单独**校验 ``x``（``tile_column``），
+      而拒绝非法编号这件事必须与 Tile Math 用同一套边界，不能各写一份。
+
+    Args:
+        name: 轴名称（``"x"`` / ``"y"``），只用于错误信息。
+        value: 待校验的编号，必须支持 ``__index__``（即真整数）。
+        zoom: 缩放级别，``0 ~ 22``。
+
+    Returns:
+        规范化后的 ``int``。
+
+    Raises:
+        ValueError: zoom 非法，或编号超出该缩放级别的合法区间。
+
+    >>> validate_tile_axis("x", 4, 3)
+    4
+    >>> validate_tile_axis("x", 8, 3)
+    Traceback (most recent call last):
+    ValueError: x 必须在 [0, 7] 之间（zoom=3），实际为 8
+    """
+    limit = _tiles_per_axis(zoom)
+    try:
+        number = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} 必须是整数，实际为 {value!r}") from exc
+    if not 0 <= number < limit:
+        raise ValueError(
+            f"{name} 必须在 [0, {limit - 1}] 之间（zoom={zoom}），实际为 {number}"
+        )
+    return number
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +253,7 @@ def calculate_tile_range(bounds: GeoBounds, zoom: int) -> TileRange:
     Raises:
         ValueError: zoom 非法。
     """
-    _validate_zoom(zoom)
+    validate_zoom(zoom)
     return TileRange(
         zoom=zoom,
         min_x=lon_to_tile_x(bounds.west, zoom),
@@ -223,8 +271,8 @@ def calculate_tile_ranges(
     Raises:
         ValueError: zoom 非法，或 ``min_zoom > max_zoom``。
     """
-    _validate_zoom(min_zoom)
-    _validate_zoom(max_zoom)
+    validate_zoom(min_zoom)
+    validate_zoom(max_zoom)
     if min_zoom > max_zoom:
         raise ValueError(
             f"min_zoom 不能大于 max_zoom，实际 min_zoom={min_zoom}, max_zoom={max_zoom}"

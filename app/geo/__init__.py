@@ -24,6 +24,8 @@ from app.geo.tile_math import (
     lat_to_tile_y,
     lon_to_tile_x,
     tms_y_to_xyz_y,
+    validate_tile_axis,
+    validate_zoom,
     xyz_y_to_tms_y,
 )
 
@@ -37,6 +39,8 @@ __all__ = [
     "calculate_tile_range",
     "calculate_tile_ranges",
     "estimate_tile_count",
+    "validate_zoom",
+    "validate_tile_axis",
     "xyz_y_to_tms_y",
     "tms_y_to_xyz_y",
     "estimate_size_bytes",

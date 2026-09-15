@@ -48,6 +48,7 @@ from app.models.map_layer import MapLayerType
 from app.providers import (
     TiandituProvider,
     describe_response,
+    describe_exception,
     http_error_message,
     is_valid_tile_response,
     mask_url,
@@ -296,7 +297,10 @@ class TileDownloader:
                 content=None,
                 status_code=None,
                 elapsed_ms=(time.perf_counter() - request_started) * 1000.0,
-                error=f"{_ERROR_NETWORK}：{exc}",
+                # 走 describe_exception 而不是直接 f"{exc}"：连接层异常的
+                # str() 可能为空，那样用户只会看到一句"网络错误："，
+                # 连是 DNS、TLS 还是超时都分不出来。
+                error=f"{_ERROR_NETWORK}：{describe_exception(exc)}",
                 failure_kind=TileFailureKind.NETWORK,
             )
         except Exception as exc:  # noqa: BLE001 - 兜底：绝不让异常打断整个任务
@@ -305,7 +309,7 @@ class TileDownloader:
                 content=None,
                 status_code=None,
                 elapsed_ms=(time.perf_counter() - request_started) * 1000.0,
-                error=f"未知错误：{exc}",
+                error=f"未知错误：{describe_exception(exc)}",
                 failure_kind=TileFailureKind.UNEXPECTED,
             )
 

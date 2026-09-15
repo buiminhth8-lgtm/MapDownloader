@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal, Slot
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,18 +26,20 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from app.config.settings import (
+    DEFAULT_MAP_NAME,
     DEFAULT_MAX_ZOOM,
     DEFAULT_MIN_ZOOM,
     DEFAULT_OUTPUT_DIR,
     MAX_SUPPORTED_ZOOM,
     MIN_SUPPORTED_ZOOM,
-    UI_TEXT_DOWNLOAD_TEST_MODE,
+    UI_TEXT_MBTILES_OUTPUT_NOTICE,
 )
 from app.models.map_layer import LAYER_DISPLAY_NAMES, MapLayerType
 
@@ -65,6 +68,92 @@ _RESULT_PLACEHOLDER = "尚未计算"
 #: 未做连通性测试时展示的占位文案
 _CONNECTION_PLACEHOLDER = "尚未测试"
 
+#: 尚未下载时"下载结果"区的占位文案
+_DOWNLOAD_RESULT_PLACEHOLDER = "尚未下载"
+
+#: 标签尚未完成首次布局时使用的折行宽度（配置列的典型内宽）。
+#: 首次 ``set_text`` 时控件宽度还是 0，只能用这个估值；随后的 ``resizeEvent``
+#: 会按真实宽度重排，因此它只影响一帧，不会留下错误换行。
+_LABEL_FALLBACK_WIDTH = 420
+
+
+def _wrap_anywhere(text: str, width: int, metrics: QFontMetrics) -> str:
+    """按**字符**宽度折行，返回插入显式换行符后的文本。
+
+    与 ``QLabel`` 的自动折行相对：那个只在"单词边界"断行，遇到 Windows 绝对
+    路径 / SSL 错误文本这类超长无空格 token 时找不到断点，于是**不折行、直接
+    横向裁掉**。这里逐字符累加宽度，超过就断，任何文本都不会溢出。
+
+    Args:
+        text: 原始文本（可含换行）。
+        width: 可用宽度（像素）。``<= 0`` 时原样返回。
+        metrics: 用于测量宽度的字体度量。
+
+    Returns:
+        折行后的文本。
+    """
+    if width <= 0:
+        return text
+
+    lines: list[str] = []
+    for raw_line in text.splitlines() or [""]:
+        current = ""
+        for char in raw_line:
+            if current and metrics.horizontalAdvance(current + char) > width:
+                lines.append(current)
+                current = char
+            else:
+                current += char
+        lines.append(current)
+    return "\n".join(lines)
+
+
+class _WrappingLabel(QLabel):
+    """多行说明标签：**自己按字符折行**，不依赖 ``QLabel.setWordWrap``。
+
+    为什么不用 ``setWordWrap(True)``：它按单词边界断行，长路径这类无空格
+    token 会被整段横向裁掉（实测在 460px 宽的配置列里，"文件：C:\\...\\x.mbtiles"
+    只显示到一半，且强制重排也修不好）。本类把"折行"这一步拿回自己手里，
+    文本里全是显式换行符，布局结果完全确定。
+
+    用法上仍兼容 ``QLabel``：``set_text()`` 传原始文本，``text()`` 取回原始
+    文本（不是折行后的），因此调用方与断言不必关心折行细节。
+    """
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # 水平方向 Ignored：本标签**不得**反过来决定配置列的宽度
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._source_text = ""
+        self._wrapped_width = -1
+        self.set_text(text)
+
+    def set_text(self, text: str) -> None:
+        """设置原始文本（显示时会按当前宽度折行）。"""
+        self._source_text = text
+        self._rewrap(force=True)
+
+    def text(self) -> str:  # noqa: A003 - 与 QLabel 同名，便于替换
+        """返回**原始**文本（不含自动插入的换行符）。"""
+        return self._source_text
+
+    def _rewrap(self, *, force: bool = False) -> None:
+        width = self.width()
+        if width <= 0:
+            width = _LABEL_FALLBACK_WIDTH
+        if not force and width == self._wrapped_width:
+            return
+        self._wrapped_width = width
+
+        wrapped = _wrap_anywhere(self._source_text, width, self.fontMetrics())
+        if wrapped != super().text():
+            super().setText(wrapped)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名约定
+        super().resizeEvent(event)
+        self._rewrap()
+
 
 class _CoordSpinBox(QDoubleSpinBox):
     """收窄最小宽度的经纬度输入框（见 ``_COORD_SPIN_MIN_WIDTH`` 说明）。
@@ -84,6 +173,11 @@ class DownloadPanel(QGroupBox):
     #: 用户点击了某个动作按钮，参数为 ``ACTION_*`` 之一
     action_requested = Signal(str)
 
+    #: 输出目录或地图名称被改动 —— 由 MainWindow 据此刷新"输出文件"预览。
+    #: 面板自己不去拼路径：路径规则（非法字符清理、扩展名）属于业务层，
+    #: 统一由 ``app.services.build_output_path`` 提供，UI 只负责显示。
+    output_config_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
 
@@ -92,6 +186,7 @@ class DownloadPanel(QGroupBox):
         self._build_output_form()
         self._build_buttons()
         self._build_result_area()
+        self._build_download_result_area()
         self._build_connection_area()
 
         layout = QVBoxLayout(self)
@@ -101,6 +196,7 @@ class DownloadPanel(QGroupBox):
         layout.addLayout(self._button_row)
         layout.addWidget(self._mode_notice)
         layout.addWidget(self._result_group)
+        layout.addWidget(self._download_result_group)
         layout.addWidget(self._connection_group)
         layout.addStretch(1)
 
@@ -126,10 +222,15 @@ class DownloadPanel(QGroupBox):
         self._labels_check = QCheckBox("下载中文注记图层", self)
         self._labels_check.setChecked(True)
 
+        # 「地图类型」与「中文注记」同占一行：左侧配置列内容已经比 760px 的窗口高，
+        # 而这两个控件都很短，各占一行纯属浪费纵向空间（会挤掉下方"下载状态"区）。
+        type_row = QHBoxLayout()
+        type_row.addWidget(self._map_type_combo, 1)
+        type_row.addWidget(self._labels_check)
+
         self._general_form = QFormLayout()
         self._general_form.addRow("Token", token_row)
-        self._general_form.addRow("地图类型", self._map_type_combo)
-        self._general_form.addRow("中文注记", self._labels_check)
+        self._general_form.addRow("地图类型", type_row)
 
         self._show_token_check.toggled.connect(self._on_show_token_toggled)
 
@@ -176,10 +277,22 @@ class DownloadPanel(QGroupBox):
         output_row.addWidget(self._output_edit, 1)
         output_row.addWidget(self._browse_button)
 
+        #: 地图名称 —— 决定 ``<名称>.mbtiles`` 的文件名主体
+        self._map_name_edit = QLineEdit(DEFAULT_MAP_NAME, self)
+        self._map_name_edit.setPlaceholderText("地图名称，例如 beijing")
+
         self._output_form = QFormLayout()
         self._output_form.addRow("输出目录", output_row)
+        self._output_form.addRow("地图名称", self._map_name_edit)
 
         self._browse_button.clicked.connect(self._on_browse_clicked)
+        self._output_edit.textChanged.connect(self._on_output_config_changed)
+        self._map_name_edit.textChanged.connect(self._on_output_config_changed)
+
+    @Slot()
+    def _on_output_config_changed(self) -> None:
+        """输出目录 / 地图名称变了，通知外部刷新预览。"""
+        self.output_config_changed.emit()
 
     def _build_buttons(self) -> None:
         self._calculate_button = QPushButton("计算", self)
@@ -207,9 +320,8 @@ class DownloadPanel(QGroupBox):
             )
             self._button_row.addWidget(button)
 
-        # Slice 3 只是下载引擎验证：瓦片不落盘，UI 必须把这件事说清楚，
-        # 免得用户以为"开始下载"之后磁盘上会出现离线包。
-        self._mode_notice = QLabel(UI_TEXT_DOWNLOAD_TEST_MODE, self)
+        # Slice 4 起瓦片真的会落盘：这里说明输出产物形态（不再是"测试模式"）。
+        self._mode_notice = QLabel(UI_TEXT_MBTILES_OUTPUT_NOTICE, self)
         self._mode_notice.setWordWrap(True)
         self._mode_notice.setStyleSheet("color: palette(mid);")
 
@@ -221,16 +333,31 @@ class DownloadPanel(QGroupBox):
 
         Slice 1 起由 MainWindow 调用 :meth:`set_calculation_result` 写入，
         面板自身不计算任何瓦片数据（公式统一在 ``app.geo``）。
+
+        Slice 4 起多一行「输出文件」——开始下载前用户就该看到文件会落在哪。
         """
-        self._result_label = QLabel(_RESULT_PLACEHOLDER, self)
-        self._result_label.setWordWrap(True)
-        self._result_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
+        self._result_label = _WrappingLabel(_RESULT_PLACEHOLDER, self)
 
         self._result_group = QGroupBox("预估结果", self)
         group_layout = QVBoxLayout(self._result_group)
         group_layout.addWidget(self._result_label)
+
+    def _build_download_result_area(self) -> None:
+        """下载结果区（Slice 4）。
+
+        与「预估结果」分开：那个是开工前的**预测**，这个是收工后的**实测**
+        （文件、真实瓦片数、真实体积、验证结论）。混在一个标签里会让人误读。
+        """
+        self._download_result_label = _WrappingLabel(
+            _DOWNLOAD_RESULT_PLACEHOLDER, self
+        )
+
+        self._download_result_group = QGroupBox("下载结果", self)
+        group_layout = QVBoxLayout(self._download_result_group)
+        group_layout.addWidget(self._download_result_label)
+        # 还没有结果就先不占地方：一个空的"尚未下载"分组只是噪音，
+        # 而且会把下方的「下载状态」区（进度条所在）挤出可视范围。
+        self._download_result_group.setVisible(False)
 
     def _build_connection_area(self) -> None:
         """天地图服务连通性测试结果区。
@@ -238,11 +365,7 @@ class DownloadPanel(QGroupBox):
         与"预估结果"分开，因为二者的触发入口与生命周期不同：
         计算结果是配置的派生值，连接结果是服务端的一次性反馈。
         """
-        self._connection_label = QLabel(_CONNECTION_PLACEHOLDER, self)
-        self._connection_label.setWordWrap(True)
-        self._connection_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
+        self._connection_label = _WrappingLabel(_CONNECTION_PLACEHOLDER, self)
 
         self._connection_group = QGroupBox("天地图连接", self)
         group_layout = QVBoxLayout(self._connection_group)
@@ -286,6 +409,7 @@ class DownloadPanel(QGroupBox):
                 min_zoom        int            最小缩放级别
                 max_zoom        int            最大缩放级别
                 output_dir      pathlib.Path   输出目录
+                map_name        str            地图名称（``<名称>.mbtiles``）
         """
         return {
             "token": self._token_edit.text().strip(),
@@ -298,6 +422,7 @@ class DownloadPanel(QGroupBox):
             "min_zoom": self._min_zoom_spin.value(),
             "max_zoom": self._max_zoom_spin.value(),
             "output_dir": Path(self._output_edit.text().strip()),
+            "map_name": self._map_name_edit.text().strip(),
         }
 
     @property
@@ -308,30 +433,68 @@ class DownloadPanel(QGroupBox):
     # ------------------------------------------------------------------ #
     # 结果展示
     # ------------------------------------------------------------------ #
-    def set_calculation_result(self, tile_count: int, size_text: str) -> None:
+    def set_calculation_result(
+        self, tile_count: int, size_text: str, output_path: str | Path | None = None
+    ) -> None:
         """展示瓦片计算成功的结果。
 
         Args:
             tile_count: 预计瓦片数量。
             size_text: 已格式化好的容量文本（如 ``361.93 MB``），
                 由调用方通过 ``app.geo.format_size`` 生成。
+            output_path: 预计输出的 ``.mbtiles`` 完整路径；``None`` 时该行
+                显示占位符（例如地图名称为空）。
         """
-        self._result_label.setText(
-            f"预计瓦片：{tile_count:,}\n预计容量：{size_text}"
+        lines = [f"预计瓦片：{tile_count:,}", f"预计容量：{size_text}"]
+        lines.append(
+            f"输出文件：{output_path}" if output_path else "输出文件：（请填写地图名称）"
         )
+        self._result_label.set_text("\n".join(lines))
 
     def set_calculation_error(self, message: str) -> None:
         """展示计算失败原因（不弹窗，弹窗由调用方决定）。"""
-        self._result_label.setText(f"计算失败：{message}")
+        self._result_label.set_text(f"计算失败：{message}")
 
     def clear_calculation_result(self) -> None:
         """恢复成未计算状态。"""
-        self._result_label.setText(_RESULT_PLACEHOLDER)
+        self._result_label.set_text(_RESULT_PLACEHOLDER)
 
     @property
     def result_label(self) -> QLabel:
         """暴露结果标签，便于测试与后续扩展。"""
         return self._result_label
+
+    # ------------------------------------------------------------------ #
+    # 下载结果展示（Slice 4）
+    # ------------------------------------------------------------------ #
+    def set_download_result(self, lines: Sequence[str]) -> None:
+        """展示下载结束后的实测结果（多行）。
+
+        内容由 :meth:`app.services.MapDownloadOutcome.as_lines` 生成——
+        面板不参与拼装，避免"UI 里再算一遍瓦片数"这类两处真相问题。
+        """
+        self._download_result_label.set_text("\n".join(lines))
+        self._download_result_group.setVisible(True)
+
+    def set_download_result_error(self, message: str) -> None:
+        """展示下载失败原因。"""
+        self._download_result_label.set_text(f"下载失败：{message}")
+        self._download_result_group.setVisible(True)
+
+    def clear_download_result(self) -> None:
+        """恢复成未下载状态（分组一并收起，不占纵向空间）。"""
+        self._download_result_label.set_text(_DOWNLOAD_RESULT_PLACEHOLDER)
+        self._download_result_group.setVisible(False)
+
+    @property
+    def download_result_label(self) -> QLabel:
+        """暴露下载结果标签。"""
+        return self._download_result_label
+
+    @property
+    def download_result_group(self) -> QGroupBox:
+        """暴露下载结果分组（MainWindow 用它做结果可见性滚动）。"""
+        return self._download_result_group
 
     # ------------------------------------------------------------------ #
     # 连通性测试展示（Slice 2）
@@ -344,19 +507,19 @@ class DownloadPanel(QGroupBox):
         """
         self._test_connection_button.setEnabled(not testing)
         if testing:
-            self._connection_label.setText("正在测试天地图连接…")
+            self._connection_label.set_text("正在测试天地图连接…")
 
     def set_connection_result(self, lines: Sequence[str]) -> None:
         """展示连通性测试结果（多行，每行一条信息）。"""
-        self._connection_label.setText("\n".join(lines))
+        self._connection_label.set_text("\n".join(lines))
 
     def set_connection_error(self, message: str) -> None:
         """展示连通性测试失败原因。"""
-        self._connection_label.setText(f"连接失败：{message}")
+        self._connection_label.set_text(f"连接失败：{message}")
 
     def clear_connection_result(self) -> None:
         """恢复成未测试状态。"""
-        self._connection_label.setText(_CONNECTION_PLACEHOLDER)
+        self._connection_label.set_text(_CONNECTION_PLACEHOLDER)
 
     @property
     def connection_label(self) -> QLabel:
@@ -393,8 +556,18 @@ class DownloadPanel(QGroupBox):
 
     @property
     def mode_notice(self) -> QLabel:
-        """暴露 Slice 3 的"测试模式"提示标签。"""
+        """暴露输出形态说明标签（Slice 4 起说明输出 ``.mbtiles``）。"""
         return self._mode_notice
+
+    @property
+    def map_name_edit(self) -> QLineEdit:
+        """暴露"地图名称"输入框。"""
+        return self._map_name_edit
+
+    @property
+    def output_edit(self) -> QLineEdit:
+        """暴露"输出目录"输入框。"""
+        return self._output_edit
 
     @property
     def start_button(self) -> QPushButton:

@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 from PySide6.QtCore import QThread
+from PySide6.QtWidgets import QLabel, QMessageBox
 
 import app.ui.download_worker as download_worker_module
 import app.ui.main_window as main_window_module
@@ -31,8 +33,10 @@ from app.geo import (
     lon_to_tile_x,
 )
 from app.main import STARTUP_MESSAGES, _report_startup
+from app.mbtiles import MBTilesReader
 from app.models import MapLayerType
 from app.providers import PNG_SIGNATURE, TiandituProvider
+from app.services import build_output_path
 from app.ui.connection_check import ConnectionTestWorker
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
@@ -146,6 +150,7 @@ def test_status_group_shows_defaults(window: MainWindow) -> None:
         "tile_failed",
         "tile_skipped",
         "speed",
+        "downloaded_bytes",
     }
     assert values["task_status"].text() == "空闲"
     assert values["tile_total"].text() == "0"
@@ -153,6 +158,7 @@ def test_status_group_shows_defaults(window: MainWindow) -> None:
     assert values["tile_succeeded"].text() == "0"
     assert values["tile_failed"].text() == "0"
     assert values["tile_skipped"].text() == "0"
+    assert values["downloaded_bytes"].text() == "0 B"
     assert window.progress_bar.value() == 0
 
 
@@ -178,6 +184,7 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
         "min_zoom",
         "max_zoom",
         "output_dir",
+        "map_name",
     }
     assert data["token"] == ""
     assert data["map_type"] is MapLayerType.VECTOR
@@ -185,6 +192,7 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
     assert data["min_zoom"] == settings.DEFAULT_MIN_ZOOM
     assert data["max_zoom"] == settings.DEFAULT_MAX_ZOOM
     assert isinstance(data["output_dir"], Path)
+    assert data["map_name"] == settings.DEFAULT_MAP_NAME
     assert data["west"] < data["east"]
     assert data["south"] < data["north"]
 
@@ -196,6 +204,7 @@ def test_form_data_reflects_edits(window: MainWindow) -> None:
     panel._labels_check.setChecked(False)
     panel._min_zoom_spin.setValue(10)
     panel._max_zoom_spin.setValue(12)
+    panel.map_name_edit.setText("  beijing  ")
 
     data = panel.get_form_data()
     assert data["token"] == "my-token"  # 首尾空白被裁掉
@@ -203,6 +212,7 @@ def test_form_data_reflects_edits(window: MainWindow) -> None:
     assert data["with_labels"] is False
     assert data["min_zoom"] == 10
     assert data["max_zoom"] == 12
+    assert data["map_name"] == "beijing"
 
 
 # --------------------------------------------------------------------------- #
@@ -312,7 +322,8 @@ def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
     expected_size = format_size(estimate_size_bytes(expected_count))
 
     assert panel.result_label.text() == (
-        f"预计瓦片：{expected_count:,}\n预计容量：{expected_size}"
+        f"预计瓦片：{expected_count:,}\n预计容量：{expected_size}\n"
+        f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}"
     )
     assert window._status_values["tile_total"].text() == f"{expected_count:,}"
     assert "瓦片计算完成" in window.log_panel.to_text()
@@ -606,21 +617,24 @@ def test_connection_worker_reports_success(qapp) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# [开始下载] / [暂停] / [继续] 接入下载引擎（Slice 3）
+# [开始下载] / [暂停] / [继续]：下载并写入 MBTiles（Slice 3 引擎 + Slice 4 落盘）
 # --------------------------------------------------------------------------- #
-def _stub_download_transport(
+def _stub_download_service(
     monkeypatch,
     handler,
     *,
     rate_limiter=None,
     policy: RetryPolicy = FAST_POLICY,
+    batch_size: int = 7,
 ) -> None:
-    """让 DownloadWorker 内部的 TileDownloader 走 MockTransport（不触网）。
+    """让 DownloadWorker 内部的 MapDownloadService 走 MockTransport（不触网）。
 
     生产代码里没有任何测试钩子，因此这里替换的是 worker 模块引用的
-    ``TileDownloader`` 名字——顺带把限速/退避调成"测试用"的档位。
+    ``MapDownloadService`` 名字——顺带把限速/退避/批次调成"测试用"的档位。
+    替换 service 而不是 ``TileDownloader``：Slice 4 起下载器由 service 自己创建，
+    在 service 这一层注入才是唯一拦得住的入口。
     """
-    original = download_worker_module.TileDownloader
+    original = download_worker_module.MapDownloadService
 
     def factory(provider: TiandituProvider, **kwargs: object):
         kwargs["transport"] = httpx.MockTransport(handler)
@@ -628,13 +642,20 @@ def _stub_download_transport(
         kwargs["rate_limiter"] = (
             rate_limiter if rate_limiter is not None else RateLimiter.disabled()
         )
+        kwargs["batch_size"] = batch_size
         return original(provider, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(download_worker_module, "TileDownloader", factory)
+    monkeypatch.setattr(download_worker_module, "MapDownloadService", factory)
 
 
-def _fill_small_region(window: MainWindow, zoom: int = 12) -> None:
-    """把表单填成一个"小到能瞬间跑完"的区域。"""
+def _fill_small_region(
+    window: MainWindow, work_dir: Path | None = None, zoom: int = 12
+) -> None:
+    """把表单填成一个"小到能瞬间跑完"的区域。
+
+    Slice 4 起必须显式指定输出目录：否则会往用户主目录里写文件。
+    传 ``None`` 只用于"不打算真的下载"的用例（校验失败、大任务确认等）。
+    """
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
     panel._west_spin.setValue(116.0)
@@ -643,6 +664,14 @@ def _fill_small_region(window: MainWindow, zoom: int = 12) -> None:
     panel._north_spin.setValue(39.1)
     panel._min_zoom_spin.setValue(zoom)
     panel._max_zoom_spin.setValue(zoom)
+    if work_dir is not None:
+        panel._output_edit.setText(str(work_dir))
+    panel.map_name_edit.setText("beijing")
+
+
+def _expected_output_path(window: MainWindow) -> Path:
+    data = window.download_panel.get_form_data()
+    return build_output_path(data["output_dir"], data["map_name"])
 
 
 def _expected_tile_count(window: MainWindow) -> int:
@@ -663,19 +692,36 @@ def _wait_for_download(window: MainWindow, qapp, timeout: int = 20_000) -> None:
         qapp.processEvents()
 
 
-def test_download_test_mode_notice_is_visible(window: MainWindow) -> None:
-    """Spec：UI 必须写明"当前为下载引擎测试模式，Slice 4 起写入 MBTiles"。"""
+def _wait_until(qapp, predicate, timeout_s: float = 8.0) -> bool:
+    """轮询等待条件成立，期间持续处理 Qt 事件（主线程不阻塞）。
+
+    用途：取消类用例需要"任务已经真的写出了一些瓦片"这个中间状态，
+    否则取消发生在第一个请求返回之前，测试就退化成了"取消一个空任务"。
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_download_output_notice_is_visible(window: MainWindow) -> None:
+    """Spec §12：UI 要说明产物是 MBTiles 单文件（不再是"测试模式"）。"""
     notice = window.download_panel.mode_notice.text()
-    assert "下载引擎测试模式" in notice
     assert "MBTiles" in notice
-    assert "不写入磁盘" in notice
+    assert ".mbtiles" in notice
+    assert "osmdroid" in notice
+    assert "测试模式" not in notice
 
 
-def test_start_download_updates_status_and_log(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+def test_start_download_writes_mbtiles(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    _stub_download_transport(monkeypatch, _png_handler())
-    _fill_small_region(window)
+    """Spec §12/§19：点一次「开始下载」必须真的产出可用的 ``.mbtiles``。"""
+    _stub_download_service(monkeypatch, _png_handler())
+    _fill_small_region(window, work_dir)
     expected = _expected_tile_count(window)
 
     assert window._download_worker is None
@@ -691,12 +737,34 @@ def test_start_download_updates_status_and_log(
     assert values["tile_skipped"].text() == "0"
     assert values["current_zoom"].text() == "12"
     assert "瓦片/秒" in values["speed"].text()
+    assert values["downloaded_bytes"].text() != "0 B"
     assert window.progress_bar.value() == 100
+
+    # 产物本身
+    output = _expected_output_path(window)
+    assert output.exists()
+    assert output.suffix == ".mbtiles"
+    # 单文件交付：WAL / SHM 旁挂文件必须已被清理
+    assert sorted(item.name for item in work_dir.iterdir()) == [output.name]
+
+    with MBTilesReader(output) as reader:
+        assert reader.get_tile_count() == expected
+        assert reader.get_zoom_range() == (12, 12)
+        assert reader.get_metadata()["name"] == "beijing"
+
+    # 结果区展示 Spec §12 要求的那几行
+    result = window.download_panel.download_result_label.text()
+    assert "文件：" in result
+    assert f"瓦片：{expected:,}" in result
+    assert "大小：" in result
+    assert "Zoom：12~12" in result
+    assert "验证：PASS" in result
 
     log = window.log_panel.to_text()
     assert "开始下载" in log
     assert "下载完成" in log
-    assert "瓦片未落盘" in log
+    assert f"输出文件：{output}" in log
+    assert "验证 PASS" in log
     assert error_dialogs == []
 
     # 结束后恢复空闲态
@@ -706,15 +774,15 @@ def test_start_download_updates_status_and_log(
 
 
 def test_download_does_not_block_ui_thread(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
     """网络请求必须发生在后台线程：点击后立即返回，界面不冻结。"""
-    _stub_download_transport(
+    _stub_download_service(
         monkeypatch,
         _png_handler(delay=0.3),
         rate_limiter=RateLimiter.disabled(),
     )
-    _fill_small_region(window)
+    _fill_small_region(window, work_dir)
 
     window.download_panel.action_buttons[ACTION_START].click()
 
@@ -735,15 +803,16 @@ def test_download_does_not_block_ui_thread(
 
 
 def test_download_reports_failures(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    _stub_download_transport(
+    """整片失败时：状态、结果区、日志都要说清楚，且库里应当是 0 张瓦片。"""
+    _stub_download_service(
         monkeypatch,
         _png_handler(
             status_code=403, content=b"<html>denied</html>", content_type="text/html"
         ),
     )
-    _fill_small_region(window)
+    _fill_small_region(window, work_dir)
     expected = _expected_tile_count(window)
 
     window.download_panel.action_buttons[ACTION_START].click()
@@ -753,6 +822,14 @@ def test_download_reports_failures(
     assert values["task_status"].text() == "已完成（有失败）"
     assert values["tile_failed"].text() == f"{expected:,}"
     assert values["tile_succeeded"].text() == "0"
+
+    result = window.download_panel.download_result_label.text()
+    assert "验证：FAIL" in result          # 零瓦片的库不是可用地图
+    assert "失败原因：" in result
+    assert "403" in result
+    # Token 无效是常见原因，提示里必须点到
+    assert "Token" in result
+
     assert "下载完成" in window.log_panel.to_text()
 
 
@@ -767,9 +844,9 @@ def test_download_without_token_never_starts_worker(
 
 
 def test_download_with_invalid_bounds_never_starts_worker(
-    window: MainWindow, error_dialogs
+    window: MainWindow, error_dialogs, work_dir: Path
 ) -> None:
-    _fill_small_region(window)
+    _fill_small_region(window, work_dir)
     window.download_panel._east_spin.setValue(100.0)  # east < west
 
     window.download_panel.action_buttons[ACTION_START].click()
@@ -777,14 +854,68 @@ def test_download_with_invalid_bounds_never_starts_worker(
     assert window._download_worker is None
     assert "west 必须小于 east" in window.log_panel.to_text()
     assert error_dialogs and error_dialogs[0][0] == "无法开始下载"
+    # 连数据库都不该被创建
+    assert list(work_dir.iterdir()) == []
 
 
-def test_download_exceeding_test_limit_is_refused(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+def test_download_without_map_name_is_refused(
+    window: MainWindow, error_dialogs, work_dir: Path
 ) -> None:
-    """Spec：超出测试上限必须明确拒绝，**不能静默截断**。"""
-    _stub_download_transport(monkeypatch, _png_handler())
+    """地图名称决定文件名，为空时必须先让用户填，而不是替他编一个。"""
+    _fill_small_region(window, work_dir)
+    window.download_panel.map_name_edit.setText("")
 
+    assert window._resolve_output_path(window.download_panel.get_form_data()) is None
+
+    window.download_panel.action_buttons[ACTION_START].click()
+
+    assert window._download_worker is None
+    assert settings.UI_TEXT_MAP_NAME_REQUIRED in window.log_panel.to_text()
+    assert error_dialogs and error_dialogs[0] == (
+        "无法开始下载",
+        settings.UI_TEXT_MAP_NAME_REQUIRED,
+    )
+    assert list(work_dir.iterdir()) == []
+
+
+def test_output_path_preview_follows_map_name(
+    window: MainWindow, work_dir: Path
+) -> None:
+    """改地图名称 → 预估结果里的「输出文件」行跟着变（不用重算瓦片数）。"""
+    _fill_small_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    total_text = window.download_panel.result_label.text().splitlines()[0]
+    assert f"输出文件：{work_dir / 'beijing.mbtiles'}" in (
+        window.download_panel.result_label.text()
+    )
+
+    window.download_panel.map_name_edit.setText("shanghai")
+
+    text = window.download_panel.result_label.text()
+    assert f"输出文件：{work_dir / 'shanghai.mbtiles'}" in text
+    # 瓦片数没有被重新计算（只是重绘了路径行）
+    assert text.splitlines()[0] == total_text
+
+    window.download_panel.map_name_edit.setText("")
+    assert "（请填写地图名称）" in window.download_panel.result_label.text()
+
+
+def test_map_name_is_sanitized_into_filename(
+    window: MainWindow, error_dialogs, work_dir: Path
+) -> None:
+    """Windows 非法字符不能原样进文件名（否则落盘位置与预期不符）。"""
+    _fill_small_region(window, work_dir)
+    window.download_panel.map_name_edit.setText("北京/2024:地图")
+
+    prepared = window._prepare_download()
+
+    assert prepared is not None
+    assert prepared.output_path.name == "北京_2024_地图.mbtiles"
+    assert prepared.output_path.parent == work_dir
+
+
+def _fill_large_region(window: MainWindow, work_dir: Path) -> int:
+    """把表单填成"预计超过 10,000 张"的大任务，返回预计瓦片数。"""
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
     panel._west_spin.setValue(116.0)
@@ -793,48 +924,130 @@ def test_download_exceeding_test_limit_is_refused(
     panel._north_spin.setValue(40.0)
     panel._min_zoom_spin.setValue(8)
     panel._max_zoom_spin.setValue(17)
+    panel._output_edit.setText(str(work_dir))
+    panel.map_name_edit.setText("big")
+    return _expected_tile_count(window)
 
-    total = _expected_tile_count(window)
-    assert total > settings.GUI_TEST_MAX_TILES
 
-    panel.action_buttons[ACTION_START].click()
+def test_large_task_asks_for_confirmation_without_starting(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """Spec §12：预计 >10000 张时弹确认框，**只提示、不限制**。"""
+    total = _fill_large_region(window, work_dir)
+    assert total > settings.GUI_LARGE_TASK_CONFIRM_TILES
+
+    window.download_panel.action_buttons[ACTION_START].click()
     qapp.processEvents()
 
-    # 一个请求都没发
+    # 任务还没跑起来，但已经被"托住"等用户回答
     assert window._download_worker is None
     assert window.progress_bar.value() == 0
+    assert window._pending_download is not None
+    assert window._pending_download.total == total
+    assert window._confirm_dialog is not None
+    assert list(work_dir.iterdir()) == []
+
+    # 提示里带上总量与容量，且明确说明"不限制规模"
+    text = window._confirm_dialog.text()
+    assert f"{total:,}" in text
+    assert "仅作提醒" in text
+    assert "确认继续下载吗" in text
 
     log = window.log_panel.to_text()
-    assert f"超过 Slice 3 测试上限 {settings.GUI_TEST_MAX_TILES} 张" in log
-    assert "当前 Slice 3 为下载引擎验证模式" in log
-    assert f"最多允许测试 {settings.GUI_TEST_MAX_TILES} 张瓦片" in log
-    assert "Slice 4 接入 MBTiles 后再开放完整任务" in log
-    # 明确提示，而不是悄悄把任务裁小
-    assert "截断" not in log
-    assert error_dialogs and error_dialogs[0][0] == "超出测试上限"
-    assert (
-        f"最多允许测试 {settings.GUI_TEST_MAX_TILES} 张瓦片"
-        in error_dialogs[0][1]
-    )
+    assert "大任务确认框" in log
 
 
-def test_test_limit_matches_settings() -> None:
-    assert settings.GUI_TEST_MAX_TILES == 500
-    assert settings.UI_TEXT_TEST_LIMIT_EXCEEDED.startswith(
-        "当前 Slice 3 为下载引擎验证模式"
-    )
+def test_large_task_confirmed_launches_download(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """点「是」→ 照常启动（这里把真正的启动换掉，避免真跑二十万张）。"""
+    launched: list[object] = []
+    monkeypatch.setattr(window, "_launch_download", launched.append)
+
+    total = _fill_large_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    dialog = window._confirm_dialog
+    assert dialog is not None
+    dialog.button(QMessageBox.StandardButton.Yes).click()
+    qapp.processEvents()
+
+    assert len(launched) == 1
+    assert launched[0].total == total  # type: ignore[attr-defined]
+    assert window._pending_download is None
+    assert window._confirm_dialog is None
+    assert "用户确认继续大任务" in window.log_panel.to_text()
+
+
+def test_large_task_rejected_does_not_start(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """点「否」→ 一个请求都不发，也不留下半个文件。"""
+    _fill_large_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    dialog = window._confirm_dialog
+    assert dialog is not None
+    dialog.button(QMessageBox.StandardButton.No).click()
+    qapp.processEvents()
+
+    assert window._download_worker is None
+    assert window._pending_download is None
+    assert list(work_dir.iterdir()) == []
+    assert "用户取消了大任务下载" in window.log_panel.to_text()
+
+
+def test_large_task_confirm_dialog_does_not_block_event_loop(
+    window: MainWindow, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """确认框必须**不阻塞事件循环**。
+
+    模态 ``exec()`` 会卡住事件循环，在无头环境里直接把用例挂死
+    （Slice 0 踩过的坑）。这里从两个角度锁住这个行为：运行期确认它已经显示
+    且事件仍在流转，外加一条源码级护栏，防止以后有人把 ``show()`` 改成 ``exec()``。
+    """
+    _fill_large_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+
+    dialog = window._confirm_dialog
+    assert dialog is not None
+    assert dialog.isVisible() is True
+
+    # 事件循环没被阻塞：还能继续处理事件、驱动别的动作
+    window.log_panel.append_log("event-loop-alive")
+    qapp.processEvents()
+    assert "event-loop-alive" in window.log_panel.to_text()
+
+    source = inspect.getsource(main_window_module.MainWindow._confirm_large_task)
+    assert ".exec()" not in source
+    assert ".show()" in source
+
+    dialog.button(QMessageBox.StandardButton.No).click()
+    qapp.processEvents()
+
+
+def test_large_task_threshold_matches_settings() -> None:
+    """阈值与文案都在 settings 里，UI 不得自己写死。"""
+    assert settings.GUI_LARGE_TASK_CONFIRM_TILES == 10_000
+    assert "{total" in settings.UI_TEXT_LARGE_TASK_CONFIRM
+    assert "仅作提醒" in settings.UI_TEXT_LARGE_TASK_CONFIRM
+    # Slice 3 的 500 张硬上限已经不存在了
+    assert not hasattr(settings, "GUI_TEST_MAX_TILES")
 
 
 def test_pause_and_resume_buttons_drive_the_engine(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
     """用低速限速器把任务拉长到足以观察暂停 / 继续。"""
-    _stub_download_transport(
+    _stub_download_service(
         monkeypatch,
         _png_handler(),
         rate_limiter=RateLimiter(requests_per_second=3),
     )
-    _fill_small_region(window)
+    _fill_small_region(window, work_dir)
     expected = _expected_tile_count(window)
 
     window.download_panel.action_buttons[ACTION_START].click()
@@ -875,10 +1088,10 @@ def test_resume_without_running_download_is_reported(window: MainWindow) -> None
 
 
 def test_closing_window_cancels_running_download(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    """Spec：窗口关闭时能够取消任务，且不留后台线程。"""
-    _stub_download_transport(
+    """Spec：窗口关闭时能够取消任务，且不留后台线程；已写入的瓦片保留。"""
+    _stub_download_service(
         monkeypatch,
         _png_handler(delay=0.2),
         rate_limiter=RateLimiter.disabled(),
@@ -891,6 +1104,8 @@ def test_closing_window_cancels_running_download(
     panel._north_spin.setValue(39.5)
     panel._min_zoom_spin.setValue(12)
     panel._max_zoom_spin.setValue(12)
+    panel._output_edit.setText(str(work_dir))
+    panel.map_name_edit.setText("beijing")
     assert _expected_tile_count(window) > 20  # 确保关窗时任务还在跑
 
     panel.action_buttons[ACTION_START].click()
@@ -899,33 +1114,98 @@ def test_closing_window_cancels_running_download(
     assert isinstance(worker, QThread)
     assert worker.isRunning() is True
 
+    # 先让任务真的写出一些瓦片，否则"取消后文件里有数据"这条断言没意义
+    assert _wait_until(
+        qapp, lambda: window._status_values["tile_succeeded"].text() not in ("0", "—")
+    ), "下载在超时前没有写出任何瓦片"
+
     window.close()
     qapp.processEvents()
 
     assert worker.isRunning() is False  # 线程已回收，不会留下孤儿
     assert window._download_worker is None
+    # 取消不删除文件：磁盘上留一个可用的（不完整的）mbtiles
+    output = work_dir / "beijing.mbtiles"
+    assert output.exists()
+    with MBTilesReader(output) as reader:
+        assert reader.get_tile_count() > 0
+
+
+def test_cancelled_download_keeps_partial_mbtiles(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """Spec §13：取消后停止下载、drain 写队列、flush、close，**保留**已有数据。"""
+    _stub_download_service(
+        monkeypatch,
+        _png_handler(delay=0.2),
+        rate_limiter=RateLimiter.disabled(),
+    )
+    panel = window.download_panel
+    panel._token_edit.setText(FAKE_TOKEN)
+    panel._west_spin.setValue(116.0)
+    panel._south_spin.setValue(39.0)
+    panel._east_spin.setValue(116.5)
+    panel._north_spin.setValue(39.5)
+    panel._min_zoom_spin.setValue(12)
+    panel._max_zoom_spin.setValue(12)
+    panel._output_edit.setText(str(work_dir))
+    panel.map_name_edit.setText("beijing")
+    total = _expected_tile_count(window)
+    assert total > 20
+
+    panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+    worker = window._download_worker
+    assert isinstance(worker, QThread)
+
+    assert _wait_until(
+        qapp, lambda: window._status_values["tile_succeeded"].text() not in ("0", "—")
+    ), "下载在超时前没有写出任何瓦片"
+    worker.cancel()
+    _wait_for_download(window, qapp)
+
+    output = work_dir / "beijing.mbtiles"
+    assert output.exists()
+    assert sorted(item.name for item in work_dir.iterdir()) == [output.name]
+
+    with MBTilesReader(output) as reader:
+        written = reader.get_tile_count()
+    assert 0 < written < total          # 部分完成，且确实落了盘
+
+    assert window._status_values["task_status"].text() == "已取消"
+    result = window.download_panel.download_result_label.text()
+    assert "已取消" in result
+    assert f"瓦片：{written:,}" in result
+
+    log = window.log_panel.to_text()
+    assert settings.UI_TEXT_CANCELLED_KEEP_TILES.splitlines()[0] in log
+    assert "Slice 5" in log
+    # 本 Slice 不实现断点续传：不能出现"会补下"这类承诺
+    assert "补下" not in log
 
 
 def test_download_log_never_leaks_full_token(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    _stub_download_transport(monkeypatch, _png_handler())
-    _fill_small_region(window)
+    _stub_download_service(monkeypatch, _png_handler())
+    _fill_small_region(window, work_dir)
 
     window.download_panel.action_buttons[ACTION_START].click()
     _wait_for_download(window, qapp)
 
     assert FAKE_TOKEN not in window.log_panel.to_text()
+    # 结果区同样不能带出 Token
+    assert FAKE_TOKEN not in window.download_panel.download_result_label.text()
 
 
 def test_slice0_to_2_features_survive_download(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    """Slice 3 不能破坏前几个 Slice 的功能。"""
+    """Slice 3/4 不能破坏前几个 Slice 的功能。"""
     # 下载走 MockTransport；连通性测试走 Slice 2 的那套打桩，两条链路互不影响
-    _stub_download_transport(monkeypatch, _png_handler())
+    _stub_download_service(monkeypatch, _png_handler())
     _stub_transport(monkeypatch, _png_handler())
-    _fill_small_region(window)
+    _fill_small_region(window, work_dir)
 
     window.download_panel.action_buttons[ACTION_START].click()
     _wait_for_download(window, qapp)
@@ -941,3 +1221,137 @@ def test_slice0_to_2_features_survive_download(
     assert window.status_group.title() == "下载状态"
     assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
 
+
+# --------------------------------------------------------------------------- #
+# 布局护栏（Slice 4 新增了地图名称 / 下载结果 / 已下载字节）
+# --------------------------------------------------------------------------- #
+def test_left_column_has_no_scrollbars_when_idle(window: MainWindow, qapp) -> None:
+    """左列不得挤出滚动条。
+
+    Slice 4 往配置列里加了「地图名称」行和「下载结果」分组，两个真实风险：
+
+    - 结果区要显示 Windows 绝对路径（无空格的长 token），一旦让它可以撑宽布局，
+      就会连带把横向滚动条和纵向滚动条一起拽出来（两者会互相触发）；
+    - 内容一旦高于窗口，纵向滚动条会吃掉 ~17px 可视宽度，横向滚动条随之出现。
+
+    因此这里同时断言两个方向都不溢出。
+    """
+    window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
+    window.show()
+    for _ in range(6):
+        qapp.processEvents()
+
+    scroll = window._left_scroll
+    assert scroll.horizontalScrollBar().maximum() == 0
+    assert scroll.verticalScrollBar().maximum() == 0
+
+
+def test_left_column_keeps_no_horizontal_scroll_with_long_output_path(
+    window: MainWindow, qapp, work_dir: Path
+) -> None:
+    """填上一条很长的输出路径后，仍然不允许出现横向滚动条。"""
+    window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
+    window.show()
+    _fill_small_region(window, work_dir)
+    window.download_panel.map_name_edit.setText("a" * 60)
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    window.download_panel.set_download_result(
+        [
+            "文件：" + str(work_dir / ("a" * 60 + ".mbtiles")),
+            "瓦片：12,345",
+            "大小：352.40 MB",
+            "Zoom：8~16",
+            "验证：PASS",
+        ]
+    )
+    for _ in range(6):
+        qapp.processEvents()
+
+    assert window._left_scroll.horizontalScrollBar().maximum() == 0
+
+
+def test_download_result_group_hidden_until_first_result(window: MainWindow) -> None:
+    """「下载结果」分组在没有结果时要收起，否则会挤掉下方的进度条。"""
+    group = window.download_panel.download_result_group
+    assert group.isHidden() is True
+
+    window.download_panel.set_download_result(["文件：x.mbtiles", "验证：PASS"])
+    assert group.isHidden() is False
+    assert "验证：PASS" in window.download_panel.download_result_label.text()
+
+    window.download_panel.clear_download_result()
+    assert group.isHidden() is True
+
+    window.download_panel.set_download_result_error("磁盘已满")
+    assert group.isHidden() is False
+    assert window.download_panel.download_result_label.text() == "下载失败：磁盘已满"
+
+
+def test_progress_bar_stays_visible_while_downloading(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """下载进行中，「总进度」必须落在可视范围内。
+
+    这是把「下载结果」分组做成按需显示的直接原因：多占 120px 就会把状态区
+    的尾部（含进度条）顶到折叠线以下，而进度条恰恰是下载时最该看见的东西。
+    """
+    _stub_download_service(
+        monkeypatch,
+        _png_handler(delay=0.25),
+        rate_limiter=RateLimiter.disabled(),
+    )
+    window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
+    window.show()
+    _fill_small_region(window, work_dir)
+    window.download_panel.action_buttons[ACTION_START].click()
+    qapp.processEvents()
+    assert window._download_worker is not None
+    assert window._download_worker.isRunning() is True
+
+    viewport = window._left_scroll.viewport()
+    bottom = window.progress_bar.mapTo(
+        viewport, window.progress_bar.rect().bottomLeft()
+    ).y()
+    assert bottom <= viewport.height()
+    assert window._left_scroll.verticalScrollBar().maximum() == 0
+
+    _wait_for_download(window, qapp)
+
+
+
+def test_wrapping_label_never_clips_long_paths(window: MainWindow, qapp) -> None:
+    r"""显示用的长路径必须**在字符处断行**，而不是被横向裁掉。
+
+    ``QLabel.setWordWrap(True)`` 只在单词边界断行，Windows 绝对路径这类
+    超长无空格 token 会被整段裁掉（实测"文件：C:\...\map.mbtiles"只显示到
+    一半，强制重排也无效）。面板因此改用自己按字体宽度折行的标签，
+    这里断言"每一行的宽度都不超过标签宽度"——即不可能发生横向裁切。
+    """
+    panel = window.download_panel
+    window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
+    window.show()
+    long_path = "文件：C:\\" + "a-fairly-long-directory-segment\\" * 8 + "map.mbtiles"
+    panel.set_download_result([long_path, "验证：PASS"])
+    for _ in range(8):
+        qapp.processEvents()
+
+    label = panel.download_result_label
+    rendered = QLabel.text(label)  # 显示用文本（含自动插入的换行）
+    assert "\n" in rendered, "超长路径没有被折行"
+
+    metrics = label.fontMetrics()
+    for line in rendered.splitlines():
+        assert metrics.horizontalAdvance(line) <= label.width(), line
+
+    # text() 仍返回原始文本：折行不污染调用方拿到的内容
+    assert label.text() == long_path + "\n验证：PASS"
+    assert panel.download_result_label.text().count("\n") == 1
+
+
+def test_wrap_anywhere_handles_edge_cases(qapp) -> None:
+    from app.ui.download_panel import _wrap_anywhere
+
+    metrics = QLabel().fontMetrics()
+    assert _wrap_anywhere("abc", 0, metrics) == "abc"      # 宽度无效时原样返回
+    assert _wrap_anywhere("", 100, metrics) == ""          # 空文本不炸
+    assert _wrap_anywhere("ab\ncd", 1000, metrics) == "ab\ncd"  # 已有换行保留

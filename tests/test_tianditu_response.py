@@ -21,6 +21,7 @@ from app.providers import (
     JPEG_SIGNATURE,
     PNG_SIGNATURE,
     TiandituProvider,
+    describe_exception,
     describe_response,
     detect_image_format,
     is_error_content_type,
@@ -299,3 +300,70 @@ def test_test_tile_writes_no_files(monkeypatch) -> None:
     assert result.success is True
     assert written == []
     assert set(os.listdir(Path.cwd())) == cwd_before
+
+
+# --------------------------------------------------------------------------- #
+# describe_exception：异常文案必须**一定**可读（Slice 4 真实网络验证时发现）
+# --------------------------------------------------------------------------- #
+def test_describe_exception_uses_message_when_present() -> None:
+    assert describe_exception(ValueError("boom")) == "boom"
+    assert describe_exception(ValueError("  padded  ")) == "padded"
+
+
+def test_describe_exception_falls_back_to_type_name() -> None:
+    """完全没有文本时也不能返回空串。"""
+    assert describe_exception(OSError()) == "OSError"
+
+
+def test_describe_exception_walks_to_deepest_message() -> None:
+    """顶层无消息时沿 __cause__ 往下找——这正是 httpx 连接层异常的真实形态。"""
+    inner = ValueError("inner detail")
+    middle = RuntimeError()
+    middle.__cause__ = inner
+    outer = OSError()
+    outer.__cause__ = middle
+
+    assert describe_exception(outer) == "OSError：inner detail"
+
+
+def test_describe_exception_reports_chain_when_entirely_silent() -> None:
+    """整条链都没有文本时，至少把类型链给出来。"""
+    leaf = RuntimeError()
+    root = OSError()
+    root.__cause__ = leaf
+
+    text = describe_exception(root)
+    assert text == "OSError ← RuntimeError"
+
+
+def test_describe_exception_handles_cycles() -> None:
+    """异常链理论上可以成环（手工构造），不能因此死循环。"""
+    first = OSError()
+    second = RuntimeError()
+    first.__cause__ = second
+    second.__cause__ = first
+
+    assert describe_exception(first) == "OSError ← RuntimeError"
+
+
+def test_network_error_message_is_never_empty() -> None:
+    """TLS 中断这类"消息消失"的异常，落到日志里必须仍然有可读信息。
+
+    真实形态：``httpx.ConnectError`` 的 ``str()`` 为空，真正的 SSL 错误藏在
+    ``__cause__`` 链的第三层。没有这个回退，用户看到的就只有一句"网络错误："。
+    """
+    ssl_error = RuntimeError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF")
+    # 模拟 httpx.ConnectError：类型在、消息没了（真实形态就是 str() == ""）
+    root = httpx.ConnectError("")
+    root.__cause__ = ssl_error
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise root
+
+    result = request_single_tile(_provider(handler), LAYER, ZOOM, X, Y)
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.strip() != "网络错误："          # 不能只剩一个冒号
+    assert "UNEXPECTED_EOF_WHILE_READING" in result.error
+    assert "ConnectError" in result.error

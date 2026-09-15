@@ -127,17 +127,47 @@ PROGRESS_SPEED_WINDOW_SECONDS: float = 3.0
 #: 与"边下载边消费"的目标相悖。
 QUEUE_CAPACITY_FACTOR: int = 4
 
-#: Slice 3 的 GUI 下载**测试模式**安全上限。
-#: 本 Slice 不落盘，超大区域下载没有意义且会白耗配额；
-#: 超限时明确提示用户而不是静默截断。
-GUI_TEST_MAX_TILES: int = 500
-
 #: 取消 / 暂停时最多在日志里逐条打印多少个失败瓦片（其余只计数）
 MAX_LOGGED_TILE_FAILURES: int = 3
 
 #: 收尾汇总里最多展示几条「失败原因」。失败原因已按张数聚合，
 #: 因此这里限制的是**去重后的原因种类数**，不会因为失败瓦片多而刷屏。
 MAX_REPORTED_FAILURE_REASONS: int = 3
+
+# --------------------------------------------------------------------------- #
+# MBTiles（Slice 4）
+# --------------------------------------------------------------------------- #
+#: MBTiles 单文件扩展名
+MBTILES_FILE_SUFFIX: str = ".mbtiles"
+
+#: 批量事务大小：累计这么多张瓦片就 COMMIT 一次。
+#:
+#: 太小 → 每个瓦片一次 fsync，写盘成为瓶颈；太大 → 崩溃时丢失的已下载瓦片变多。
+#: 200 是"几千张瓦片的任务里提交次数个位数、单次事务体量又不大"的折中。
+DEFAULT_MBTILES_BATCH_SIZE: int = 200
+
+#: 单 Writer 的异步写队列容量。
+#:
+#: 上界存在的意义是**内存**：队列里的元素持有瓦片字节（几十 KB/张），
+#: 队列必须能对下载端形成反压，否则下载速度一快就会把几万张瓦片堆在内存里，
+#: 与"边下载边写盘"的目标直接相悖。下界（100）保证 SQLite 偶发卡顿时
+#: 下载端不至于频繁停顿。取 200 ⇒ 峰值常驻内存约 200 × 30KB ≈ 6MB。
+DEFAULT_MBTILES_QUEUE_CAPACITY: int = 200
+
+#: 写入队列的取值区间（供校验与 UI 提示引用）
+MIN_MBTILES_QUEUE_CAPACITY: int = 100
+MAX_MBTILES_QUEUE_CAPACITY: int = 500
+
+#: 校验器最多抽样检查多少张瓦片的图片 magic bytes。
+#: 全量扫描几十万张瓦片是 Slice 5 之后的事，本 Slice 只做抽样。
+MBTILES_VALIDATE_SAMPLE_LIMIT: int = 20
+
+#: 超过这个瓦片数就在开始前弹一次确认框（**只提示，不限制**）。
+#: 10,000 张 ≈ 300MB 量级，属于"值得先提醒一声"的规模。
+GUI_LARGE_TASK_CONFIRM_TILES: int = 10_000
+
+#: 默认地图名称（用于生成 ``<名称>.mbtiles``）
+DEFAULT_MAP_NAME: str = "offline_map"
 
 # --------------------------------------------------------------------------- #
 # 默认输出
@@ -165,14 +195,25 @@ HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 
-#: Slice 3 下载测试模式的界面提示（瓦片只走回调，不落盘）
-UI_TEXT_DOWNLOAD_TEST_MODE: str = (
-    "当前为下载引擎测试模式：瓦片仅通过回调消费，不写入磁盘；Slice 4 起写入 MBTiles"
+#: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）
+UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
+    "下载结果将写入 MBTiles 单文件（<地图名称>.mbtiles），可直接供 osmdroid 读取"
 )
 
-#: 区域超出测试上限时的提示（明确告知，不做静默截断）
-UI_TEXT_TEST_LIMIT_EXCEEDED: str = (
-    "当前 Slice 3 为下载引擎验证模式，\n"
-    f"最多允许测试 {GUI_TEST_MAX_TILES} 张瓦片。\n"
-    "Slice 4 接入 MBTiles 后再开放完整任务。"
+#: 大任务风险提示（只提示，不限制）
+UI_TEXT_LARGE_TASK_CONFIRM_TITLE: str = "大任务确认"
+UI_TEXT_LARGE_TASK_CONFIRM: str = (
+    "当前范围预计需要下载 {total:,} 张瓦片，\n"
+    "预计容量约 {size}，可能需要较长时间并消耗天地图调用配额。\n\n"
+    "确认继续下载吗？（不会限制下载规模，仅作提醒）"
 )
+
+#: 取消任务后的提示：已写入的瓦片保留
+UI_TEXT_CANCELLED_KEEP_TILES: str = (
+    "任务已取消，已完成瓦片已保留。\n"
+    "Slice 5 将支持从已有 MBTiles 断点续传。"
+)
+
+#: 未指定地图名称时的提示
+UI_TEXT_MAP_NAME_REQUIRED: str = "请先填写地图名称（用于生成 <名称>.mbtiles）"
+
