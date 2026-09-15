@@ -17,6 +17,7 @@ import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from app.main import silence_noisy_http_loggers  # noqa: E402
+from app.ui.preferences import UiPreferences  # noqa: E402
 
 #: 与生产启动保持一致：把 httpx / httpcore 压到 WARNING。
 #:
@@ -70,4 +71,32 @@ def tasks_file() -> Path:
     try:
         yield directory / "tasks.json"
     finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture
+def preferences():
+    """界面偏好（Slice 7）的**隔离**实例：写到临时 ini，而不是注册表。
+
+    这不是"测起来方便"的问题。生产里 ``UiPreferences()`` 会落到
+    ``HKEY_CURRENT_USER\\Software\\MapDownloader\\<APP_NAME>``，而主窗口在
+    ``closeEvent`` 里会 ``save_geometry`` + ``set_output_dir``。测试只要用默认
+    实例，一个用例点过「开始下载」，下一个用例装配窗口时就会**恢复**上一个
+    用例的形状与地图类型：窗口变成 900 宽、下拉框变成"影像"、Zoom 变成 12——
+    于是断言默认值的用例开始成片地红，而且失败信息会指向"业务逻辑坏了"，
+    完全看不出真凶是注册表。
+
+    落点改到临时 ini 之后，每个用例都是一张白纸，注册表也不再被污染。
+
+    Yields:
+        ``UiPreferences`` 实例，底层是临时目录里的 IniFormat ``QSettings``。
+    """
+    from PySide6.QtCore import QSettings  # noqa: PLC0415 - 与 qapp 同层延迟导入
+
+    directory = Path(tempfile.mkdtemp(prefix="prefs-test-"))
+    settings = QSettings(str(directory / "ui.ini"), QSettings.Format.IniFormat)
+    try:
+        yield UiPreferences(settings)
+    finally:
+        settings.clear()
         shutil.rmtree(directory, ignore_errors=True)

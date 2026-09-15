@@ -6,16 +6,21 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 6：底图 × 中文注记图层合成（`vec_w + cva_w` 一次下两层，按 alpha 合成成一张 PNG）
+Slice 7：Windows GUI 下载管理与交互完善（状态机按钮矩阵、后台扫描已有瓦片、
+取消 / 完成 / 失败三条收尾路径、界面偏好记忆、任务列表扩到九列）
 
 完整链路：
 
 ```text
 BoundingBox            (Slice 1：范围与合法性校验)
     ↓
+validate_form          (Slice 7：唯一的下载前校验入口，一次报出全部问题)
+    ↓
 Tile Math              (Slice 1：算出瓦片编号区间)
     ↓
 DownloadTask           (Slice 5：任务记录，落盘到 data/tasks.json；Slice 6 增加 map_type / with_labels)
+    ↓
+ExistingTileScanWorker (Slice 7：后台线程数"已有多少张"——SQLite 不许碰主线程)
     ↓
 MapType → 两个图层      (Slice 6：MAP_TYPE_LAYERS 是全项目唯一的那张映射表)
     ↓
@@ -36,7 +41,75 @@ map.mbtiles
 Validator              (Slice 4：结构 + 抽样数据校验；Slice 6 增加合成信息自洽性)
     ↓
 TaskService            (Slice 5：状态判定 + 落盘；启动时 DOWNLOADING → PAUSED)
+    ↓
+UiTaskState 矩阵        (Slice 7：把"状态"翻译成"哪几个按钮能点"，逐格可断言)
 ```
+
+## Slice 7：Windows GUI 下载管理与交互完善
+
+**按钮的可用性就是用户唯一能看到的那个状态机** —— 九个界面状态到四个动作的映射
+集中在 `app/ui/task_actions.py` 的 `AVAILABLE_ACTIONS` 一张表里，`DownloadPanel`
+只负责照着表 `setEnabled`。这张表是**纯 Python**（不 import Qt），因此每一格都能
+脱离窗口断言。挑几个不那么显然的格子：`SCANNING` 放开「取消」（扫描几十万张要几秒
+到几十秒，四个按钮全灰会让用户以为卡死）；`CONFIRMING` **只**放开「取消」（放开
+「开始下载」等于绕过那次确认，而那正是拦住"静默启动几十万张瓦片"的东西）；
+`PAUSED` / `FAILED` / `CANCELLED` 都放开「开始」（它们没占用下载通道，禁用它们会
+逼用户先删掉记录才能下别的图）。
+
+- **校验只有一个入口** —— `app/ui/validation.py` 的 `validate_form()`，[开始下载] 与
+  [测试连接] 共用同一份规则，**一次报出全部问题**（让用户改一个再被拦一次是最容易
+  让人关掉程序的交互）。它不 import Qt，所以"哪条规则在什么输入下触发"可以逐条单测。
+  校验的边界是"这个任务能不能启动"，不是"这个任务值不值得"——几十万张瓦片不在这里拦
+- **SQLite 绝不碰主线程** —— 「已有多少张瓦片」是一次 `GROUP BY zoom_level` 查询；
+  快不代表可以在 UI 线程跑（它会随用户的库增长而变慢，且出现在两条高频路径上）。
+  Slice 7 把它移进 `ExistingTileScanWorker`（`QThread`），结果经队列信号回主线程。
+  扫描期间界面显示「正在扫描已有瓦片…」并只放开「取消」，而不是僵在那儿
+- **暂停分两步** —— 点下暂停先进 `PAUSING`（显示"正在暂停…"），等引擎真的回了一帧进度
+  （证明它收到了指令、在途请求也落地了）才落成 `PAUSED`。一上来就显示"已暂停"是在替
+  引擎打包票，那一刻它可能还在跑好几张瓦片
+- **取消要二次确认，且绝不删数据** —— 取消是不可逆的**动作**，所以先问一次；确认后
+  停止下载、drain 写队列、flush、close，磁盘上留下一个**可用的（不完整的）**.mbtiles。
+  「继续下载」「重新下载」「取消」三个出口的文案都写明了后果
+- **完成小结带一个出口** —— 成功结束后自动跑 `MBTilesValidator`，然后把结论摆进
+  非模态小结框，并带一个 **[打开目录]** 按钮（`os.startfile`）。地图下完之后用户想做的
+  下一件事必然是"去文件夹里看看那个文件"，让他自己去资源管理器里翻是没道理的
+- **失败也要留住成果** —— 失败时 GUI 不崩、给出原因，并提供 **[继续补齐]**；已经有
+  瓦片不会被丢掉，点一下就接着下缺的那些
+- **关窗先问、再安全收尾** —— 有任务在跑时弹非模态确认框；确认后把任务落盘成
+  `PAUSED`（语义是"暂停"而不是"失败/取消"），取消 worker 并等线程回收，
+  **绝不 `terminate()` QThread**（那会在 SQLite 写事务中间把线程砍掉）
+- **启动恢复只降级、不自动下载** —— 上次异常退出遗留的 `DOWNLOADING` 一律改成 `PAUSED`，
+  重启后用户在列表里看到"有几个任务可以继续"，而不是"程序自己开始跑几十万张瓦片去了"
+- **任务列表扩到九列** —— 名称 / 地图类型 / Zoom / 状态 / 进度 / 成功 / 失败 / 更新时间 /
+  输出文件，数据源仍然只有 `TaskService`（不新建第二份）。测试与调用方通过
+  `row_cells(row)["状态"]` **按列名**取单元格——按行号取值会在插入一列后静默测到另一列
+- **只记住"下次还能用"的东西** —— 输出目录 / 地图类型 / 缩放区间 / 窗口位置走
+  `QSettings`（`app/ui/preferences.py`，Spec §22 明确说"不要做复杂用户配置系统"）。
+  **Token 不在其中**：`SECRET_KEY_FRAGMENTS` 把"不存密钥"变成一条会用 `ValueError`
+  说话的不变量。另外只恢复**仍然存在**的输出目录——照单全收一个已删除的临时目录，
+  用户下次点「开始下载」会立刻撞上"输出目录不存在"的校验错误，一个自己造出来、
+  却要用户去收拾的错误
+- **文件名真的能落盘** —— `sanitize_map_name()` 把 Windows 非法字符（`\ / : * ? " < > |`）
+  与控制字符换成 `_`，去掉结尾的点和空格（文件系统会**静默丢弃**它们，导致实际落盘位置
+  与界面显示的「输出文件」对不上），命中 `CON` / `LPT1` 这类保留名时加后缀
+- **地图名称为空时自动补一个** —— 用中心点坐标生成 `map_39.05N_116.05E`（不用时间戳或
+  随机数）：同一块区域重复下载得到同一个文件名，"已有文件"的确认框才有意义
+- **进度信号源头节流** —— `~0.15s`（约 6 次/秒），几十万张瓦片的任务不会把 Qt 事件队列塞满；
+  日志里也**不逐张打 INFO**（只汇总），Token 在任何一条日志里都不会完整出现
+- **关掉弹窗之后，主窗口还关得掉** —— 所有非模态弹窗都带 `WA_DeleteOnClose`：用户一点
+  「关闭」，C++ 对象当场销毁，而 `MainWindow` 那边还攥着一个空壳。之后关主窗口时
+  `_close_dialogs()` 对空壳调 `close()` 会抛
+  `RuntimeError: Internal C++ object already deleted`，异常从 `closeEvent` 里窜出去，
+  `super().closeEvent()` 根本执行不到——**用户看到的现象是「点了 X，窗口关不掉」**。
+  修法是给弹窗的 `destroyed` 信号接一根线，销毁时把引用清干净，并在 `_close_dialogs`
+  里留一层兜底。这个缺陷**只有在真实平台上点一遍才会出现**（见「界面留档」）
+- **弹窗按钮一律中文** —— `QMessageBox` 的标准按钮（`Yes` / `No` / `Close` / `Ok`）
+  文案来自 Qt 自己，没装 Qt 汉化目录时是英文。于是完成小结变成了
+  「打开目录」和 "Close" 并排。凡是给用户点的标准按钮都显式 `setText` 成中文，
+  文案集中在 `settings.py` 的「通用按钮文案」一段
+
+> **本 Slice 不做**：ADB、Android、manifest、离线包级 SHA256、失败瓦片清单与单点重试、
+> 速度曲线、替换 GUI 框架、重写 Downloader / MBTiles 核心、改动 XYZ/TMS 约定。
 
 ## Slice 6：底图 × 中文注记合成
 
@@ -132,10 +205,15 @@ Slice 0 基础（仍有效）：
 - 基础数据模型：图元类型、下载任务、离线包、Android 设备
 - 统一配置项 `app/config/settings.py`
 
-暂未实现：
+暂未实现（**尚未排期**，不对应任何具体 Slice 号）：
 
-- 地图包 manifest、离线包级 Sha256 校验、离线包体积统计 —— Slice 7
-- ADB / Android 导入 —— Slice 7
+- 地图包 manifest、离线包级 Sha256 校验、离线包体积统计
+- ADB / Android 导入（设备发现、push、设备侧校验）
+- 失败瓦片清单与单点重试、速度曲线
+
+> 这几项曾经被写进"Slice 7"的计划里，但 Slice 7 实际排给了 Windows GUI 下载管理，
+> 因此不再用 Slice 号承诺它们。界面上的设备区会如实说明"本版本不执行 adb 命令"
+> （`app/config/settings.py` 的 `UI_TEXT_DEVICE_HINT`），而不是假装在工作。
 
 ## 环境
 
@@ -156,27 +234,45 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 691 passed
+python -m pytest                # 883 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 ```
 
-与续传相关的用例分散在四个文件里：
+与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
 
 | 文件 | 覆盖 |
 |---|---|
 | `tests/test_task_store.py` | 任务记录读写、原子替换、损坏隔离、状态机、Token 不落盘、进度节流 |
 | `tests/test_resume.py` | `ResumePolicy` / `ExistingTileIndex` 的策略选择、`TileProbe` 依赖方向、坐标语义 |
 | `tests/test_resume_download.py` | 端到端续传：跳过已有、不读 BLOB、一致性拒绝、部分失败→失败→续传补缺口、取消→暂停、日志行 |
-| `tests/test_ui_smoke.py` | GUI：任务面板、启动恢复、已有文件三向确认、退出确认；图层说明与请求量预估、合成接线 |
+| `tests/test_ui_smoke.py` | GUI：任务面板、启动恢复、已有文件三向确认、退出确认、取消 / 完成 / 失败三条收尾路径；图层说明与请求量预估、合成接线 |
 | `tests/test_tile_composer.py` | 合成器：像素级 alpha 正确性、失败分类、尺寸阈值 |
 | `tests/test_composite_downloader.py` | 合成下载器：每张瓦片两次请求、三类失败归类、生命周期约定 |
 | `tests/test_composition_download.py` | 端到端合成：metadata 四字段、产物必须 PNG、参数组合拒绝、续传一致性把关 |
+| `tests/test_task_actions.py` | **Slice 7** 状态 → 按钮矩阵逐格断言、持久化状态映射、瞬时状态不落盘 |
+| `tests/test_ui_validation.py` | **Slice 7** 下载前校验：一次报全部问题、逐条规则、自动地图名称 |
+| `tests/test_filename.py` | **Slice 7** 文件名净化：非法字符 / 控制字符 / 结尾点空格 / Windows 保留名 / 截断 |
+| `tests/test_ui_preferences.py` | **Slice 7** 界面偏好：读写往返、"不存 Token"不变量、损坏值不崩、测试隔离 |
+| `tests/test_tile_scan_worker.py` | **Slice 7** 后台扫描：计数正确性、**确实跑在另一个线程**、放弃标记、失败不冒泡 |
+| `tests/test_download_worker.py` | **Slice 7** 线程胶水：进度先于完成、信号回主线程、暂停 / 取消、异常变信号、Token 无公开出口 |
+| `tests/test_ui_widgets.py` | **Slice 7** 折行标签：逐字符断词、以及"次要文字色"在深浅两套调色板下的对比度 ≥ 4.5:1 |
+
+`tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
+（`test_dismissing_complete_dialog_then_closing_window_is_safe` /
+`..._failed_dialog_...`）：它们断言弹窗销毁后主窗口仍然关得掉。
+这个缺陷是**实机验收脚本**跑出来的，不是 pytest——细节见「界面留档」一节。
 
 测试在 Qt ``offscreen`` 平台下运行（见 `tests/conftest.py`），无需真实显示器；
 瓦片下载与落盘相关用例全部走 **MockTransport / 假数据**，**不访问真实网络**，
 产物写到临时目录（`work_dir` 夹具，不用本机 `tmp_path`——它会被沙箱拦在 `WinError 5`）。
 `tests/conftest.py` 在导入时就压制 `httpx` / `httpcore` 的 INFO 日志：它们会把带
 `tk=<Token>` 的完整 URL 打到控制台，而日志里不允许出现真实 Token。
+
+**界面偏好也必须注入临时实例**（`preferences` 夹具）：生产里 `UiPreferences()` 落在
+注册表，而主窗口在 `closeEvent` 里会 `save_geometry` + `set_output_dir`。测试若用默认
+实例，一个用例点过「开始下载」，下一个用例装配窗口时就会**恢复**上一个用例的窗口形状与
+地图类型——断言默认值的用例开始成片地红，而失败信息指向"业务逻辑坏了"，完全看不出真凶
+是注册表。`tests/test_ui_preferences.py` 有一条用例专门断言落点确实是 ini 文件。
 
 异步用例依赖 `pytest-asyncio`，模式配置在仓库根的 `pytest.ini`（`asyncio_mode = auto`，
 无需给每个用例手写 `@pytest.mark.asyncio`）。
@@ -193,6 +289,34 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 （见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
 
+### 实机验收（Spec §28 场景 A–E）
+
+```bash
+python scripts/verify_slice7_ui.py                 # 真窗口 + 真按钮 + 49 项检查
+python scripts/verify_slice7_ui.py --offscreen     # 无显示环境（CI）
+python scripts/verify_slice7_ui.py --scenes acd    # 只跑指定场次
+python scripts/verify_slice7_ui.py --no-shots      # 不生成截图
+```
+
+**为什么不能只跑 pytest**：pytest 跑在 Qt `offscreen` 平台上——那里没有真实字体、没有
+DPI 缩放、没有系统深浅色主题，`QMessageBox` 也不是真的窗口，而这三样东西恰恰能藏住真实
+缺陷。上面那两个缺陷（关窗抛 `RuntimeError`、弹窗按钮是英文）**全都是这个脚本抓出来的**，
+当时 883 条 pytest 全绿。
+
+脚本真的起 windows 平台插件、真的显示窗口、真的点按钮，全程用 `httpx.MockTransport`
+假服务端（**不触网、不消耗天地图配额**），任务记录与界面偏好都写到临时目录。五个场次：
+
+| 场次 | 验的是什么 | 产出 |
+|---|---|---|
+| A | 空闲 → 计算 → 预估结果六行（含 Zoom 区间与地图类型） | `slice7_scene_a_estimate.png` |
+| B | 预计 > 10,000 张 → 大任务确认框（只提示、不限制） | `slice7_scene_b_large_task.png` |
+| C | 目标 `.mbtiles` 已存在 → 三选一；再走一遍「重新下载」的二次确认 | `slice7_scene_c_existing.png` / `slice7_scene_c2_restart.png` |
+| D | 下载中（限速 10 请求/秒，保证"进行中"是可观察的中间态）→ 暂停 / 继续 → 完成小结 | `slice7_scene_d1_downloading.png` / `slice7_scene_d2_complete.png` |
+| E | 部分瓦片失败 → 失败小结 +「继续补齐」+ 任务落盘为 FAILED | `slice7_scene_e_failed.png` |
+
+它还会顺手查两件只有实机能查的事：**每个弹窗的按钮文案里有没有残留英文**
+（`_english_buttons()`），以及流程跑完**主窗口必须关得掉**。数字对不上就以非 0 退出码结束。
+
 ## 目录结构
 
 ```text
@@ -201,20 +325,25 @@ tianditu-offline-tool/
 │   ├── main.py            入口（日志初始化 + QApplication + MainWindow）
 │   ├── config/settings.py 全局常量，唯一魔数来源
 │   ├── models/            纯数据模型（dataclass / enum），不依赖 UI
-│   ├── ui/                界面层：主窗口 + 各面板 + download_worker.py（QThread 桥接 asyncio）
+│   ├── ui/                界面层：主窗口 + 各面板 + 三个 QThread 桥
+│   │                      （download_worker 跑编排 / connection_check 发 HTTP /
+│   │                       tile_scan_worker 查 SQLite）
+│   │                      外加纯逻辑模块：task_actions（按钮矩阵）/ validation（校验）/
+│   │                       preferences（QSettings 偏好）/ widgets（折行标签）/ desktop（打开目录）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
 │   ├── geo/               瓦片坐标计算：bounds.py + tile_math.py（Slice 1 ✅）
 │   ├── downloader/        下载引擎：models / retry_policy / rate_limiter / tile_downloader / download_manager / resume / composite_tile_downloader（Slice 3 ✅ + Slice 5 ✅ + Slice 6 ✅）
 │   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
 │   ├── composer/          瓦片合成：tile_composer.py（Pillow alpha 合成，无状态可复用）（Slice 6 ✅）
-│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅）
-│   ├── package/           离线包打包与校验（Slice 7）
-│   └── android/           ADB 设备管理与导入（Slice 7）
-├── tests/                  pytest 用例（691 条）
+│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）
+│   ├── package/           离线包打包与校验（尚未排期）
+│   └── android/           ADB 设备管理与导入（尚未排期；目前只有包文档，无实现）
+├── tests/                  pytest 用例（883 条）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
-├── docs/                   设计文档
+├── docs/                   设计文档 + 界面留档截图（slice7_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
+├── scripts/verify_slice7_ui.py Slice 7 实机验收脚本（真窗口 + 49 项检查 + 截图）
 ├── scripts/verify_resume.py 断点续传端到端验证脚本（假服务端，不触网、不耗配额）
 ├── pytest.ini              pytest 配置（asyncio_mode = auto）
 └── requirements.txt
@@ -228,6 +357,10 @@ UI 需要瓦片数据时必须调用 `app.geo`，需要落盘时必须调用 `ap
 所以它能接收 `MBTilesWriter` / `MBTilesReader` 而**不必 import `app.mbtiles`**——依赖保持无环，
 这条约束有专门的测试守着。
 
+`app.ui` 里这几个模块刻意**不 import Qt 之外的任何东西**，因此可以脱离窗口单测：
+`task_actions`（连 Qt 都不 import）、`validation`、`preferences`（只依赖 `QSettings`）。
+界面层不直接做 IO——三件重活各有一个 `QThread`，`MainWindow` 只做装配与信号连接。
+
 ## 用法：测试天地图连接
 
 1. 在「Token」填入天地图控制台申请的服务密钥（`tk`，输入框默认隐藏，可勾选「显示」临时查看）。
@@ -240,16 +373,42 @@ UI 需要瓦片数据时必须调用 `app.geo`，需要落盘时必须调用 `ap
 
 ## 用法：下载并生成 MBTiles
 
+界面布局：左边是「地图配置」+「下载状态」（当前任务），右边是「Android 设备」+
+「下载任务」列表 +「运行日志」。
+
 1. 填好 Token、地图类型、范围与 Zoom 区间（Min Zoom ~ Max Zoom）。
-2. 填「输出目录」与「地图名称」——最终产物是 `<输出目录>/<地图名称>.mbtiles`
-   （名称会被清理成合法文件名，Windows 非法字符 `\ / : * ? " < > |` 替换为 `_`）。
-3. 点 `[开始下载]`：程序先算出总瓦片数与预计容量，并显示输出文件路径；
+2. 填「输出目录」（可点 **[浏览]** 选）与「地图名称」——最终产物是
+   `<输出目录>/<地图名称>.mbtiles`。名称会被清理成合法文件名：Windows 非法字符
+   `\ / : * ? " < > |` 与控制字符替换为 `_`，结尾的点和空格去掉（文件系统会静默丢弃它们），
+   命中 `CON` / `LPT1` 这类保留名时加后缀。**名称留空不会拦住你**——程序会用中心点坐标
+   自动生成一个（`map_39.05N_116.05E`），并在日志里说明。
+3. 点 `[开始下载]`。程序先跑一次**统一的校验**（Token / 经纬度顺序与范围 / Zoom 顺序与范围 /
+   输出目录 / 地图名称），**一次报出全部问题**而不是改一个拦一次；通过后再算总瓦片数、
+   预计容量、预计 WMTS 请求数与输出文件路径，这些都显示在「预估结果」区。
    - 若预计超过 **10,000** 张，会弹一次**确认框**（只提示、不限制规模）；
-   - 确认后在后台线程里跑完整链路，状态区实时刷新
-     `状态 / 当前 Zoom / 总数 / 完成 / 成功 / 失败 / 跳过 / 速度 / 已下载字节 / 总进度`。
-4. `[暂停]` / `[继续]` 可随时切换；关窗时若任务还在跑，会弹确认框——
-   确认退出会把任务标成**已暂停**（不是取消），下次打开程序可以接着下。
-5. 结束后「下载结果」区显示：
+   - 若目标 `.mbtiles` **已经存在**，会先弹「继续下载 / 重新下载 / 取消」三选一，
+     并且**先把文件里已有多少张瓦片数出来**——这次计数走后台线程，所以你会先看到
+     「正在扫描已有瓦片…」而不是界面僵住（SQLite 查询不允许跑在主线程上）；
+   - 确认后在后台线程里跑完整链路，进度区实时刷新十一个字段
+     （任务名称 / 状态 / 当前 Zoom / 总瓦片 / 已完成 / 剩余 / 已有（跳过）/ 本次成功 /
+     失败 / 下载速度 / 已下载），下面是一条总进度条。
+4. 四个动作按钮**按状态启用**，不是永远可点：
+
+   | 状态 | 可点 |
+   |---|---|
+   | 空闲 | 计算 · 开始下载 · 测试天地图连接 |
+   | 扫描已有瓦片 / 等待确认 | 取消 |
+   | 下载中 | 暂停 · 取消 |
+   | 正在暂停 | 取消 |
+   | 已暂停 | 继续 · 取消 |
+   | 已完成 | 开始下载 |
+   | 失败 / 已取消 | 开始下载 · 继续 |
+
+   `[暂停]` 会先进「正在暂停…」——等引擎回一帧进度（证明它在途请求已落地）才变成
+   「已暂停」。`[取消]` 要先确认一次，确认后已下载的瓦片**保留**。
+5. 关窗时若任务还在跑，会弹非模态确认框；确认退出会把任务标成**已暂停**（不是取消），
+   下次打开程序可以接着下。
+6. 结束后「下载结果」区显示：
 
    ```text
    文件：D:\maps\beijing.mbtiles
@@ -260,8 +419,16 @@ UI 需要瓦片数据时必须调用 `app.geo`，需要落盘时必须调用 `ap
    ```
 
    并逐行写入运行日志；若有失败，还会给出 `失败原因：<原因>（N 张）`（最多 3 条，按张数倒序）。
+7. **全部成功时会自动弹一个小结框**（`MBTilesValidator` 已经在后台跑完，这里只是把结论
+   摆出来），框里带一个 **[打开目录]** 按钮，直接用资源管理器打开产物所在目录。
+8. **失败时 GUI 不会崩**：弹出失败小结，说明原因，并给出 **[继续补齐]** 按钮——点一下就
+   只下缺的那些瓦片；已经写进文件的数据原样保留。
 
 取消任务会**保留**已经写入的瓦片，磁盘上留下一个可用的（不完整的）`.mbtiles`，不会自动删除。
+
+下一次打开程序时，程序会**记住**你上次用的输出目录、地图类型、缩放区间与窗口位置
+（存在 `QSettings` 里；**Token 永远不存**）。如果上次的输出目录已经被删掉，程序会退回
+默认目录并在日志里说明——而不是让你在第一次点「开始下载」时撞上"输出目录不存在"。
 
 ## 用法：断点续传（接着上次下）
 
@@ -276,7 +443,8 @@ UI 需要瓦片数据时必须调用 `app.geo`，需要落盘时必须调用 `ap
 
    ```text
    读取任务记录 → 检查 .mbtiles 是否存在（不存在就当全新下载）
-                → 打开已有 MBTiles 读 metadata
+                → 后台线程扫描：打开已有 MBTiles 数已有瓦片
+                     （界面显示「正在扫描已有瓦片…」，不僵住）
                 → 一致性校验（边界 / 缩放 / 图层）  ← 不一致就拒绝，一张都不写
                 → 计算完整瓦片区间
                 → 检测已有瓦片（默认只读坐标三列，不读 BLOB）
@@ -306,10 +474,13 @@ python scripts/verify_resume.py
 
 ## 后续计划
 
-- **Slice 7：离线包打包与校验 + ADB 导入** —— 地图包 manifest、Sha256 校验、离线包体积统计；设备发现、push、设备侧校验
-- GUI 下载管理完善（失败瓦片清单与单点重试、速度曲线）
-- 底图与注记图层合成
+- **离线包打包与校验** —— 地图包 manifest、Sha256 校验、离线包体积统计
+- **ADB 导入** —— 设备发现、push、设备侧校验（`app/android/` 目前只有包文档，无实现）
+- 失败瓦片清单与单点重试、速度曲线
 - Android / osmdroid（端侧读取离线包）
+
+> 以上都**尚未排期**，不再用 Slice 号承诺。Slice 7 排给了 Windows GUI 下载管理，
+> 而 Spec 明确禁止在那个 Slice 里实现 ADB——即不许用设备功能挤掉本 Slice 的交付。
 
 ## 说明与注意事项
 

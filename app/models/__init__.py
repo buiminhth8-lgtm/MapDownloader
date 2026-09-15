@@ -21,9 +21,11 @@ from app.models.map_layer import (
     LAYER_DISPLAY_NAMES,
     MAP_TYPE_DISPLAY_NAMES,
     MAP_TYPE_LAYERS,
+    MAP_TYPE_SHORT_NAMES,
     MapLayerType,
     MapType,
     composition_for,
+    describe_map_type,
     layers_for,
 )
 from app.models.map_package import MapPackage, new_package_id
@@ -34,11 +36,13 @@ __all__ = [
     "MapType",
     "MAP_TYPE_LAYERS",
     "MAP_TYPE_DISPLAY_NAMES",
+    "MAP_TYPE_SHORT_NAMES",
     "LAYER_DISPLAY_NAMES",
     "COMPOSITION_SINGLE",
     "COMPOSITION_MERGED",
     "COMPOSITION_VALUES",
     "composition_for",
+    "describe_map_type",
     "DEFAULT_LAYER_COMBO",
     "layers_for",
     # download_task

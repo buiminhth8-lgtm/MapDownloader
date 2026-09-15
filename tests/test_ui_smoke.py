@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 from PIL import Image
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import QEvent, Qt, QThread
 from PySide6.QtWidgets import QLabel, QMessageBox
 
 import app.ui.download_worker as download_worker_module
@@ -38,7 +38,13 @@ from app.geo import (
 )
 from app.main import STARTUP_MESSAGES, _report_startup
 from app.mbtiles import MBTilesMetadata, MBTilesReader, MBTilesWriter
-from app.models import DownloadTaskStatus, MapLayerType, MapType, composition_for
+from app.models import (
+    DownloadTaskStatus,
+    MapLayerType,
+    MapType,
+    composition_for,
+    describe_map_type,
+)
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import build_output_path
 from app.tasks import TaskService, TaskStore
@@ -46,6 +52,7 @@ from app.ui.connection_check import ConnectionTestWorker
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
     ACTION_CALCULATE,
+    ACTION_CANCEL,
     ACTION_PAUSE,
     ACTION_RESUME,
     ACTION_START,
@@ -55,6 +62,7 @@ from app.ui.download_panel import (
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
+from app.ui.validation import auto_map_name
 
 #: 假 Token（禁止替换为真实密钥）
 FAKE_TOKEN = "abcdefghijklmn"
@@ -83,13 +91,14 @@ FAST_POLICY = RetryPolicy(max_attempts=3, base_delay_seconds=0.0, max_delay_seco
 
 
 @pytest.fixture()
-def window(qapp, tasks_file: Path) -> MainWindow:
+def window(qapp, tasks_file: Path, preferences) -> MainWindow:
     """每个用例一个全新的主窗口。
 
-    任务记录注入临时路径：默认的 ``~/MapDownloader/data/tasks.json`` 会污染
-    真实用户目录，而且用例之间会互相看到对方留下的任务。
+    任务记录与界面偏好都注入临时路径：默认的
+    ``~/MapDownloader/data/tasks.json`` / ``QSettings(ORG_NAME, APP_NAME)``
+    会污染真实用户目录，而且用例之间会互相看到对方留下的任务与窗口形状。
     """
-    win = MainWindow(task_service=TaskService(TaskStore(tasks_file)))
+    win = MainWindow(task_service=TaskService(TaskStore(tasks_file)), preferences=preferences)
     yield win
     # 用例可能留下正在跑的下载。这里把"退出确认"直接跳过（那是有头交互的产物，
     # 不该由夹具去点按钮），改为取消并等线程回收——QThread 在运行时被销毁
@@ -190,26 +199,33 @@ def test_all_sections_present(window: MainWindow) -> None:
 
 
 def test_status_group_shows_defaults(window: MainWindow) -> None:
+    """Slice 7 的进度区是 :class:`TaskProgressPanel`：11 个字段 + 总进度条。"""
     values = window._status_values
     assert set(values) == {
+        "task_name",
         "task_status",
         "current_zoom",
         "tile_total",
         "tile_done",
+        "tile_remaining",
         "tile_succeeded",
         "tile_failed",
         "tile_skipped",
         "speed",
         "downloaded_bytes",
     }
+    assert values["task_name"].text() == "—"
     assert values["task_status"].text() == "空闲"
     assert values["tile_total"].text() == "0"
     assert values["tile_done"].text() == "0"
+    assert values["tile_remaining"].text() == "0"
     assert values["tile_succeeded"].text() == "0"
     assert values["tile_failed"].text() == "0"
     assert values["tile_skipped"].text() == "0"
     assert values["downloaded_bytes"].text() == "0 B"
     assert window.progress_bar.value() == 0
+    # 旧名字仍然可用（转发到同一个面板），Slice 3~6 的调用点不受影响
+    assert window.status_group is window.task_progress
 
 
 def test_device_panel_empty_state(window: MainWindow) -> None:
@@ -271,11 +287,14 @@ def test_form_data_reflects_edits(window: MainWindow) -> None:
 # --------------------------------------------------------------------------- #
 def test_action_buttons_exist(window: MainWindow) -> None:
     buttons = window.download_panel.action_buttons
+    # Slice 7 在「继续」与「测试连接」之间插入了「取消」（Spec §5/§6）：
+    # 暂停 / 继续 / 取消回答的是同一个问题——"现在要不要让它停下来"。
     assert list(buttons) == [
         ACTION_CALCULATE,
         ACTION_START,
         ACTION_PAUSE,
         ACTION_RESUME,
+        ACTION_CANCEL,
         ACTION_TEST_CONNECTION,
     ]
     assert [b.text() for b in buttons.values()] == [
@@ -283,14 +302,16 @@ def test_action_buttons_exist(window: MainWindow) -> None:
         "开始下载",
         "暂停",
         "继续",
+        "取消",
         "测试天地图连接",
     ]
-    # 空闲态：暂停 / 继续没有意义（Slice 3 起按下载状态启用）
+    # 空闲态：暂停 / 继续 / 取消没有意义（按 Spec §6 的状态矩阵启用）
     assert buttons[ACTION_CALCULATE].isEnabled() is True
     assert buttons[ACTION_START].isEnabled() is True
     assert buttons[ACTION_TEST_CONNECTION].isEnabled() is True
     assert buttons[ACTION_PAUSE].isEnabled() is False
     assert buttons[ACTION_RESUME].isEnabled() is False
+    assert buttons[ACTION_CANCEL].isEnabled() is False
 
 
 def test_clicking_action_buttons_does_not_crash(
@@ -321,8 +342,9 @@ def test_device_buttons_do_not_crash(window: MainWindow) -> None:
     refresh_button.click()
     import_button.click()
     text = window.log_panel.to_text()
-    # 设备管理属于 Slice 7（Slice 6 排给了图层合成）；本 Slice 只要"点了不崩 + 如实说明"
-    assert "Slice 7" in text
+    # 设备管理（ADB）不属于本工具的任何 Slice：本 Slice 只要"点了不崩 + 如实说明"。
+    # 文案由 settings 统一给出，UI 不得自己写死（否则改一处漏一处）。
+    assert settings.UI_TEXT_DEVICE_HINT in text
     assert "adb" in text
 
 
@@ -345,7 +367,8 @@ def test_log_panel_append_and_clear(window: MainWindow) -> None:
 def test_startup_messages_are_reported(window: MainWindow) -> None:
     assert STARTUP_MESSAGES == (
         "Application started",
-        "Slice 6 composition enabled (base map + Chinese labels → merged PNG)",
+        "Slice 7 GUI download manager enabled "
+        "(start/pause/resume/cancel + resume across restarts)",
     )
     _report_startup(window)
     text = window.log_panel.to_text()
@@ -377,16 +400,24 @@ def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
     expected_count = estimate_tile_count(bounds, 8, 17)
     expected_size = format_size(estimate_size_bytes(expected_count))
 
-    # Slice 6：多一行请求量。默认勾选了中文注记 → 每张瓦片请求底图 + 注记两次，
-    # 因此这里的请求数必须是瓦片数的两倍，且文案要说清这个倍数从哪来。
+    # 默认勾选了中文注记 → 每张瓦片请求底图 + 注记两次，请求数必须是瓦片数的两倍。
     map_type = data["map_type"]
-    assert panel.result_label.text() == (
-        f"预计瓦片：{expected_count:,}\n预计容量：{expected_size}\n"
-        f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}\n"
-        f"预计 WMTS 请求：{expected_count * 2:,}"
-        f"（{expected_count:,} 张 × 底图+注记 2 层）"
-    )
     assert map_type.request_count_per_tile(data["with_labels"]) == 2
+    # Spec §3 的行序：瓦片数 → 请求量 → 容量 → Zoom → 地图类型 → 输出文件
+    assert panel.result_label.text() == "\n".join(
+        [
+            f"预计瓦片：{expected_count:,}",
+            settings.UI_TEXT_ESTIMATED_REQUESTS_MERGED.format(
+                requests=expected_count * 2, tiles=expected_count
+            ),
+            f"预计容量：{expected_size}",
+            settings.UI_TEXT_ESTIMATED_ZOOM.format(min_zoom=8, max_zoom=17),
+            settings.UI_TEXT_ESTIMATED_MAP_TYPE.format(
+                map_type=describe_map_type(map_type, True)
+            ),
+            f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}",
+        ]
+    )
     assert window._status_values["tile_total"].text() == f"{expected_count:,}"
     assert "瓦片计算完成" in window.log_panel.to_text()
 
@@ -452,8 +483,8 @@ def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
     assert window.device_panel.device_list.count() == 1
     assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
     refresh_button, _ = window.device_panel.buttons
-    refresh_button.click()  # 设备区的占位动作仍然可用（真实实现排在 Slice 7）
-    assert "Slice 7" in window.log_panel.to_text()
+    refresh_button.click()  # 设备区的占位动作仍然可用（真实实现属于 ADB，本工具不做）
+    assert settings.UI_TEXT_DEVICE_HINT in window.log_panel.to_text()
 
 
 # --------------------------------------------------------------------------- #
@@ -813,6 +844,22 @@ def _wait_until(qapp, predicate, timeout_s: float = 8.0) -> bool:
     return False
 
 
+def _wait_for_scan(window: MainWindow, qapp, timeout: int = 10_000) -> None:
+    """等待后台「扫描已有瓦片」线程结束，并把结果送回主线程。
+
+    Slice 7 起，[开始下载] 与任务列表的「继续」在目标 ``.mbtiles`` 已存在时会
+    先起一个 :class:`~app.ui.tile_scan_worker.ExistingTileScanWorker`——数一数
+    里面已有多少张是一次 SQLite 查询，而 Spec §7 明令禁止在 Qt 主线程里做。
+    于是"点一下 + ``processEvents()``"不再足以让三选一弹窗 / 下载线程出现，
+    必须真的等那个后台线程跑完（它结束后会以队列信号的形式回到主线程继续流程）。
+    """
+    scan = window._scan_worker
+    assert scan is not None, "目标文件已存在时应当先启动后台扫描"
+    assert scan.wait(timeout) is True, "后台扫描线程没有在超时前结束"
+    for _ in range(6):
+        qapp.processEvents()
+
+
 def test_download_output_notice_is_visible(window: MainWindow) -> None:
     """Spec §12：UI 要说明产物是 MBTiles 单文件（不再是"测试模式"）。"""
     notice = window.download_panel.mode_notice.text()
@@ -925,7 +972,9 @@ def test_download_reports_failures(
     _wait_for_download(window, qapp)
 
     values = window._status_values
-    assert values["task_status"].text() == "已完成（有失败）"
+    # Slice 7：有瓦片下不到 = 任务 FAILED（Spec §18）。状态文案与按钮矩阵、
+    # 任务列表那一列、以及「继续补齐」的出口必须说的是同一件事。
+    assert values["task_status"].text() == "失败"
     assert values["tile_failed"].text() == f"{expected:,}"
     assert values["tile_succeeded"].text() == "0"
 
@@ -939,14 +988,84 @@ def test_download_reports_failures(
     assert "下载完成" in window.log_panel.to_text()
 
 
+def _dismiss_dialog_and_flush(dialog: QMessageBox, qapp) -> None:
+    """点掉一个非模态弹窗，并把延迟删除真的跑完。
+
+    ``WA_DeleteOnClose`` 走的是 ``DeferredDelete`` 事件，光 ``processEvents()``
+    不保证它被派发；显式 ``sendPostedEvents`` 才能确定 C++ 对象已经没了 ——
+    这条测试要测的恰恰是"对象已经没了"之后的行为。
+    """
+    dialog.button(QMessageBox.StandardButton.Close).click()
+    qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+
+
+def test_dismissing_complete_dialog_then_closing_window_is_safe(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """关掉完成小结之后，主窗口还必须关得掉（Spec §16 + §23）。
+
+    这是**实机验收跑出来的缺陷**的回归守卫：所有非模态弹窗都带
+    ``WA_DeleteOnClose``，用户点一下「关闭」C++ 对象当场就销毁了，而
+    ``MainWindow._complete_dialog`` 还攥着那个空壳。之后关主窗口时
+    ``_close_dialogs()`` 对空壳调 ``close()`` 会抛
+    ``RuntimeError: Internal C++ object already deleted``——异常从
+    ``closeEvent`` 里窜出去，``super().closeEvent()`` 根本执行不到。
+    用户看到的现象是「点了 X，窗口关不掉」，比丢一个弹窗严重得多。
+    """
+    _stub_download_service(monkeypatch, _png_handler())
+    _fill_small_region(window, work_dir)
+
+    window.download_panel.action_buttons[ACTION_START].click()
+    _wait_for_download(window, qapp)
+
+    dialog = window._complete_dialog
+    assert dialog is not None, "成功结束应当弹出完成小结"
+    _dismiss_dialog_and_flush(dialog, qapp)
+    # 销毁回调把引用清干净了，窗口关闭时就再也不会碰到悬空指针
+    assert window._complete_dialog is None
+
+    window._exit_confirmed = True
+    assert window.close() is True
+    assert window.isVisible() is False
+
+
+def test_dismissing_failed_dialog_then_closing_window_is_safe(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
+) -> None:
+    """失败小结同理：它同样带 ``WA_DeleteOnClose`` 且没有 ``finished`` 处理器。"""
+    _stub_download_service(
+        monkeypatch,
+        _png_handler(
+            status_code=403, content=b"<html>denied</html>", content_type="text/html"
+        ),
+    )
+    _fill_small_region(window, work_dir)
+
+    window.download_panel.action_buttons[ACTION_START].click()
+    _wait_for_download(window, qapp)
+
+    dialog = window._failed_dialog
+    assert dialog is not None, "整片失败应当弹出失败小结"
+    assert "继续补齐" in [button.text() for button in dialog.buttons()]
+    _dismiss_dialog_and_flush(dialog, qapp)
+    assert window._failed_dialog is None
+
+    window._exit_confirmed = True
+    assert window.close() is True
+    assert window.isVisible() is False
+
+
 def test_download_without_token_never_starts_worker(
     window: MainWindow, error_dialogs
 ) -> None:
+    """Spec §9/§20：没有 Token 连任务都不该建（校验走统一入口）。"""
     window.download_panel.action_buttons[ACTION_START].click()
 
     assert window._download_worker is None
-    assert "token 不能为空" in window.log_panel.to_text()
-    assert error_dialogs and error_dialogs[0][0] == "无法开始下载"
+    assert window._scan_worker is None
+    assert settings.UI_TEXT_VALIDATION_TOKEN_REQUIRED in window.log_panel.to_text()
+    assert error_dialogs and error_dialogs[0][0] == settings.UI_TEXT_VALIDATION_TITLE
 
 
 def test_download_with_invalid_bounds_never_starts_worker(
@@ -958,30 +1077,39 @@ def test_download_with_invalid_bounds_never_starts_worker(
     window.download_panel.action_buttons[ACTION_START].click()
 
     assert window._download_worker is None
-    assert "west 必须小于 east" in window.log_panel.to_text()
-    assert error_dialogs and error_dialogs[0][0] == "无法开始下载"
+    assert settings.UI_TEXT_VALIDATION_WEST_EAST in window.log_panel.to_text()
+    assert error_dialogs and error_dialogs[0][0] == settings.UI_TEXT_VALIDATION_TITLE
     # 连数据库都不该被创建
     assert list(work_dir.iterdir()) == []
 
 
-def test_download_without_map_name_is_refused(
-    window: MainWindow, error_dialogs, work_dir: Path
+def test_download_with_empty_map_name_is_auto_filled(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    """地图名称决定文件名，为空时必须先让用户填，而不是替他编一个。"""
+    """Spec §2.7：地图名称为空时**自动补一个**（用中心点坐标），而不是拦住用户。
+
+    名称决定文件名，空着会让"输出文件"那一行显示不出来；但为此弹一个错误框
+    纯属给用户添活——坐标已经足够唯一地命名这块区域了。
+    """
+    _stub_download_service(monkeypatch, _png_handler())
     _fill_small_region(window, work_dir)
     window.download_panel.map_name_edit.setText("")
 
+    # 名称为空时，输出路径无法确定（UI 不替用户编）
     assert window._resolve_output_path(window.download_panel.get_form_data()) is None
 
     window.download_panel.action_buttons[ACTION_START].click()
 
-    assert window._download_worker is None
-    assert settings.UI_TEXT_MAP_NAME_REQUIRED in window.log_panel.to_text()
-    assert error_dialogs and error_dialogs[0] == (
-        "无法开始下载",
-        settings.UI_TEXT_MAP_NAME_REQUIRED,
+    expected_name = auto_map_name(116.0, 39.0, 116.1, 39.1)
+    assert window.download_panel.map_name_edit.text() == expected_name
+    assert (
+        settings.UI_TEXT_MAP_NAME_AUTO_GENERATED.format(name=expected_name)
+        in window.log_panel.to_text()
     )
-    assert list(work_dir.iterdir()) == []
+    assert error_dialogs == []
+
+    _wait_for_download(window, qapp)
+    assert (work_dir / f"{expected_name}.mbtiles").exists()
 
 
 def test_output_path_preview_follows_map_name(
@@ -1164,11 +1292,17 @@ def test_pause_and_resume_buttons_drive_the_engine(
     assert worker.isRunning() is True
 
     window.download_panel.action_buttons[ACTION_PAUSE].click()
-    qapp.processEvents()
-    assert window._status_values["task_status"].text() == "已暂停"
+    # Slice 7：点下暂停先进入 PAUSING（"正在暂停…"），等引擎回了一帧进度
+    # （证明它在途请求已落地）才落成 PAUSED。因此这里要等，而不是点完就断言。
+    assert _wait_until(
+        qapp, lambda: window._status_values["task_status"].text() == "已暂停"
+    ), "点暂停后界面没有落到「已暂停」"
+    assert "正在暂停" in window.log_panel.to_text()
     assert "下载已暂停" in window.log_panel.to_text()
     assert window.download_panel.pause_button.isEnabled() is False
     assert window.download_panel.resume_button.isEnabled() is True
+    # 暂停期间「取消」仍然可用：用户随时可以改主意
+    assert window.download_panel.cancel_button.isEnabled() is True
 
     window.download_panel.action_buttons[ACTION_RESUME].click()
     qapp.processEvents()
@@ -1617,9 +1751,14 @@ def test_task_panel_exists_and_starts_empty(window: MainWindow) -> None:
 
 
 def test_task_panel_lists_persisted_tasks_on_startup(
-    window: MainWindow, tasks_file: Path, work_dir: Path, qapp
+    window: MainWindow, tasks_file: Path, work_dir: Path, qapp, preferences
 ) -> None:
-    """重启程序后，磁盘上的任务记录要出现在列表里（Spec §8 / §14）。"""
+    """重启程序后，磁盘上的任务记录要出现在列表里（Spec §8 / §14）。
+
+    断言**按列名**取值（``row_cells``）。Slice 7 把列表从 4 列扩到了 9 列
+    （多了地图类型 / Zoom / 更新时间 / 输出文件），按行号取值会静默地测到
+    别的列——那种错误最阴：它一直是绿的，只是测的东西换了。
+    """
     task = window.task_service.create_task(
         name="上海地图",
         bounds=GeoBounds(121.0, 31.0, 121.2, 31.2),
@@ -1633,14 +1772,20 @@ def test_task_panel_lists_persisted_tasks_on_startup(
     window.task_service.update_progress(task, _FakeProgress(total=500, completed=321))
     window.task_service.save_now(task)
 
-    second = MainWindow(task_service=TaskService(TaskStore(tasks_file)))
+    second = MainWindow(
+        task_service=TaskService(TaskStore(tasks_file)), preferences=preferences
+    )
     try:
         assert second.task_panel.task_count == 1
-        row = second.task_panel.row_text(0)
-        assert row[0] == "上海地图"
-        assert row[1] == "已暂停"
-        assert "321" in row[2] and "500" in row[2]
-        assert row[3] == str(work_dir / "shanghai.mbtiles")
+        row = second.task_panel.row_cells(0)
+        assert row["名称"] == "上海地图"
+        assert row["地图类型"] == "矢量"
+        assert row["Zoom"] == "10-12"
+        assert row["状态"] == "已暂停"
+        assert row["进度"] == "64%"  # 321 / 500
+        assert row["成功"] == "321"
+        assert row["失败"] == "0"
+        assert row["输出文件"] == str(work_dir / "shanghai.mbtiles")
     finally:
         second._exit_confirmed = True
         second.close()
@@ -1648,7 +1793,7 @@ def test_task_panel_lists_persisted_tasks_on_startup(
 
 
 def test_interrupted_task_is_recovered_as_paused_on_startup(
-    tasks_file: Path, work_dir: Path, qapp
+    tasks_file: Path, work_dir: Path, qapp, preferences
 ) -> None:
     """Spec §10：上次异常退出遗留的"下载中"要降级为"已暂停"，且**不自动下载**。"""
     service = TaskService(TaskStore(tasks_file))
@@ -1663,13 +1808,15 @@ def test_interrupted_task_is_recovered_as_paused_on_startup(
     )
     service.start_downloading(task)  # 模拟"进程被强杀时状态还是 downloading"
 
-    window = MainWindow(task_service=TaskService(TaskStore(tasks_file)))
+    window = MainWindow(
+        task_service=TaskService(TaskStore(tasks_file)), preferences=preferences
+    )
     try:
         assert window._download_worker is None, "不允许自动开始下载"
         reloaded = window.task_service.get_task(task.id)
         assert reloaded is not None
         assert reloaded.status is DownloadTaskStatus.PAUSED
-        assert window.task_panel.row_text(0)[1] == "已暂停"
+        assert window.task_panel.row_cells(0)["状态"] == "已暂停"
         log = window.log_panel.to_text()
         assert settings.UI_TEXT_TASK_RECOVERED.splitlines()[0] in log
         assert "标记为「已暂停」" in log
@@ -1688,7 +1835,7 @@ def test_existing_file_asks_before_touching_anything(
     before = path.read_bytes()
 
     window.download_panel.action_buttons[ACTION_START].click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
 
     assert window._download_worker is None
     dialog = _existing_dialog(window)
@@ -1724,7 +1871,7 @@ def test_existing_file_cancel_changes_nothing(
     before = path.read_bytes()
 
     window.download_panel.action_buttons[ACTION_START].click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.Cancel).click()
     qapp.processEvents()
 
@@ -1746,7 +1893,7 @@ def test_existing_file_continue_resumes_and_skips(
     assert total > 3
 
     window.download_panel.action_buttons[ACTION_START].click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.Yes).click()
     qapp.processEvents()
 
@@ -1776,7 +1923,7 @@ def test_existing_file_restart_requires_second_confirm(
     before = path.read_bytes()
 
     window.download_panel.action_buttons[ACTION_START].click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.No).click()
     qapp.processEvents()
 
@@ -1809,7 +1956,7 @@ def test_existing_file_restart_backs_up_then_downloads_from_scratch(
     total = _expected_tile_count(window)
 
     window.download_panel.action_buttons[ACTION_START].click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.No).click()
     qapp.processEvents()
     window._restart_dialog.button(QMessageBox.StandardButton.Yes).click()
@@ -1881,7 +2028,8 @@ def test_task_resume_starts_resume_download(
     window._refresh_task_list(select_id=task.id)
 
     window.task_panel.resume_button.click()
-    qapp.processEvents()
+    # 「继续」要先在后台数清已有多少张（Spec §11），再决定续传多少
+    _wait_for_scan(window, qapp)
 
     worker = window._download_worker
     assert isinstance(worker, DownloadWorker)
@@ -1997,12 +2145,14 @@ def test_task_list_progress_tracks_download_state(
 
     assert isinstance(window._download_worker, DownloadWorker)
     assert window.task_panel.task_count == 1
-    assert window.task_panel.row_text(0)[1] == "下载中"
+    assert window.task_panel.row_cells(0)["状态"] == "下载中"
 
     _wait_for_download(window, qapp)
 
-    assert window.task_panel.row_text(0)[1] == "已完成"
-    assert f"{total:,}" in window.task_panel.row_text(0)[2]
+    cells = window.task_panel.row_cells(0)
+    assert cells["状态"] == "已完成"
+    assert cells["进度"] == "100%"
+    assert cells["成功"] == f"{total:,}"
     assert _task_status(window, _panel_task_id(window)) == "completed"
     assert "任务状态：已完成" in window.log_panel.to_text()
 
@@ -2018,7 +2168,7 @@ def test_failed_task_keeps_failed_status_in_list(
     _wait_for_download(window, qapp)
 
     assert window.task_panel.task_count == 1
-    assert window.task_panel.row_text(0)[1] == "失败"
+    assert window.task_panel.row_cells(0)["状态"] == "失败"
     fresh = window.task_service.get_task(_panel_task_id(window))
     assert fresh is not None
     assert fresh.status is DownloadTaskStatus.FAILED
@@ -2065,7 +2215,7 @@ def test_exit_confirmation_does_not_block_event_loop(
 
     # Spec §17：退出后任务状态是「已暂停」，不是「已取消」
     assert window.task_panel.task_count == 1
-    assert window.task_panel.row_text(0)[1] == "已暂停"
+    assert window.task_panel.row_cells(0)["状态"] == "已暂停"
     assert "任务将暂停" in window.log_panel.to_text()
     assert window._download_worker is None
     fresh = window.task_service.get_task(_panel_task_id(window))
@@ -2348,7 +2498,7 @@ def test_task_started_from_resume_keeps_merged_composition(
     window.download_panel.labels_check.setChecked(False)
 
     window.task_panel.resume_button.click()
-    qapp.processEvents()
+    _wait_for_scan(window, qapp)
 
     plan = window._pending_plan or window._download_worker
     assert plan is not None

@@ -270,15 +270,31 @@ HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 
-#: 设备区占位说明。ADB 属于 Slice 7（Slice 6 排给了"底图 + 中文注记合成"）；
-#: 在此之前界面必须**如实**说明"点了不会执行 adb"，
-#: 不能让人误以为按钮坏了。文案与 ``main_window`` 里的动作提示保持一致。
-UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理将在 Slice 7 实现"
+#: 设备区占位说明。ADB / Android 导入**不在 Slice 7 的范围内**
+#: （Slice 7 排给了"Windows GUI 下载管理"，Spec §29 明确禁止实现 ADB），
+#: 因此这里不再承诺某个具体 Slice 编号，只如实说明"点了不会执行 adb"，
+#: 不能让人误以为按钮坏了。
+#: 文案与 ``main_window`` 里的动作提示保持一致。
+UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理（ADB）尚未实现"
 
 #: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）
 UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
     "下载结果将写入 MBTiles 单文件（<地图名称>.mbtiles），可直接供 osmdroid 读取"
 )
+
+# --------------------------------------------------------------------------- #
+# 通用按钮文案
+# --------------------------------------------------------------------------- #
+#: ``QMessageBox`` 的**标准按钮**（Yes / No / Close / Cancel）文案来自 Qt 自己，
+#: 没有装 Qt 汉化目录时显示的是英文。界面其余部分全是中文，
+#: 于是完成小结会变成「打开目录」和 "Close" 并排——这是 Slice 7 实机验收
+#: 截图里抓到的，纯跑 ``offscreen`` 的 pytest 看不见（那里根本不渲染按钮）。
+#: 约定：凡是给用户点的标准按钮，都显式 ``setText`` 成中文；
+#: 文案集中在这里，不散落到各个弹窗里。
+UI_TEXT_BUTTON_CONFIRM: str = "确认"
+UI_TEXT_BUTTON_CANCEL: str = "取消"
+UI_TEXT_BUTTON_CLOSE: str = "关闭"
+UI_TEXT_BUTTON_OK: str = "确定"
 
 #: 大任务风险提示（只提示，不限制）
 UI_TEXT_LARGE_TASK_CONFIRM_TITLE: str = "大任务确认"
@@ -379,6 +395,12 @@ UI_TEXT_ESTIMATED_REQUESTS_MERGED: str = (
     "预计 WMTS 请求：{requests:,}（{tiles:,} 张 × 底图+注记 2 层）"
 )
 
+#: 「预估结果」里的 Zoom 与地图类型行（Slice 7，Spec §3 要求这两项也显示出来）。
+#: 地图类型的文字由 :func:`app.models.describe_map_type` 生成，
+#: 界面不在这里拼"矢量地图 + 中文注记"。
+UI_TEXT_ESTIMATED_ZOOM: str = "Zoom：{min_zoom} ~ {max_zoom}"
+UI_TEXT_ESTIMATED_MAP_TYPE: str = "地图类型：{map_type}"
+
 #: 已有 MBTiles 的"地图类型 / 注记配置"与当前任务不一致（Spec §12 原文）
 UI_TEXT_RESUME_COMPOSITION_INCOMPATIBLE: str = (
     "现有 MBTiles 地图类型或注记配置与当前任务不一致，"
@@ -388,4 +410,89 @@ UI_TEXT_RESUME_COMPOSITION_INCOMPATIBLE: str = (
 #: 合成模式的任务启动说明（Spec §23）——一次性把"这次到底在下什么"讲清楚
 UI_TEXT_COMPOSITION_SINGLE: str = "single（仅底图）"
 UI_TEXT_COMPOSITION_MERGED: str = "merged（底图 + 中文注记已合成）"
+
+# --------------------------------------------------------------------------- #
+# Windows GUI 下载管理（Slice 7）
+# --------------------------------------------------------------------------- #
+#: 已有瓦片扫描（Spec §11）。扫描走的是 SQLite，**必须**在后台线程里做，
+#: 因此用户在等待期间需要一句明确的话，否则会以为程序没反应。
+UI_TEXT_SCANNING_EXISTING: str = "正在扫描已有瓦片…"
+UI_TEXT_SCAN_RESULT: str = "已有：{existing:,}\n待下载：{remaining:,}"
+
+#: 下载前统一校验（Spec §20）。每条都写成"用户该做什么"，而不是"哪里不合法"——
+#: 弹窗是要给人看的，人关心的永远是下一步。
+UI_TEXT_VALIDATION_TITLE: str = "无法开始下载"
+UI_TEXT_VALIDATION_PREFIX: str = "以下问题需要先修正："
+UI_TEXT_VALIDATION_TOKEN_REQUIRED: str = (
+    "请填写天地图服务密钥（Token）——没有它无法向天地图请求瓦片。"
+)
+UI_TEXT_VALIDATION_WEST_EAST: str = "西经度必须小于东经度（West < East）。"
+UI_TEXT_VALIDATION_SOUTH_NORTH: str = "南纬度必须小于北纬度（South < North）。"
+UI_TEXT_VALIDATION_LONGITUDE_RANGE: str = "经度必须在 -180 ~ 180 之间。"
+UI_TEXT_VALIDATION_LATITUDE_RANGE: str = "纬度必须在 -90 ~ 90 之间。"
+UI_TEXT_VALIDATION_ZOOM_ORDER: str = "Min Zoom 不能大于 Max Zoom。"
+UI_TEXT_VALIDATION_ZOOM_RANGE: str = (
+    "缩放级别必须在 {low} ~ {high} 之间（与 Tile Math 的服务范围保持一致）。"
+)
+UI_TEXT_VALIDATION_OUTPUT_DIR_REQUIRED: str = "请选择输出目录（.mbtiles 的存放位置）。"
+UI_TEXT_VALIDATION_OUTPUT_DIR_IS_FILE: str = (
+    "输出目录指向的是一个文件，不是目录：{path}"
+)
+
+#: 地图名称为空时自动生成（Spec §2.7）。生成规则见
+#: :func:`app.ui.validation.auto_map_name`——用中心点坐标，保证同名区域得到
+#: 同一个名字、不同区域不会撞名。
+UI_TEXT_MAP_NAME_AUTO_GENERATED: str = "地图名称为空，已自动生成：{name}"
+
+#: 取消下载的二次确认（Spec §15）。必须明说"数据会保留"——
+#: 否则用户会因为怕丢成果而不敢点，或者点完以为白下了几个小时。
+UI_TEXT_CANCEL_TITLE: str = "取消下载任务"
+UI_TEXT_CANCEL_CONFIRM: str = (
+    "确定取消当前下载任务？\n\n"
+    "已经下载的地图数据将保留，以后仍可继续。"
+)
+
+#: 下载完成弹窗（Spec §16）
+UI_TEXT_COMPLETE_TITLE: str = "下载完成"
+UI_TEXT_COMPLETE_BODY: str = (
+    "文件：{path}\n"
+    "地图：{map_type}\n"
+    "Zoom：{zooms}\n"
+    "瓦片：{tiles:,}\n"
+    "文件大小：{size}\n"
+    "验证：{validation}"
+)
+UI_TEXT_OPEN_DIRECTORY: str = "打开目录"
+UI_TEXT_OPEN_DIRECTORY_FAILED: str = "无法打开目录：{path}\n（{error}）"
+UI_TEXT_OPEN_DIRECTORY_NEED_PATH: str = "还没有输出文件，暂时无法打开目录"
+
+#: 任务失败提示（Spec §17）。重点是两句：为什么失败、以及成果还在。
+UI_TEXT_FAILED_TITLE: str = "任务失败"
+UI_TEXT_FAILED_BODY: str = (
+    "原因：{reason}\n\n"
+    "本次成功：{succeeded:,} 张\n"
+    "本次失败：{failed:,} 张\n\n"
+    "已有地图数据已保留。可以点「继续」补齐缺失的瓦片。"
+)
+
+#: 日志区「自动滚动」开关（Spec §18）
+UI_TEXT_LOG_AUTOSCROLL: str = "自动滚动"
+UI_TEXT_LOG_AUTOSCROLL_HINT: str = (
+    "开启后日志自动滚到最新一行；查看历史时建议关掉，否则会被不断顶走"
+)
+
+#: 任务列表下方的选中信息区（Spec §10）。Token 不在其中——
+#: 任务记录里没有它，回填时也只说"需要重新填写"。
+UI_TEXT_TASK_INFO_EMPTY: str = "选中一条任务可查看详情"
+UI_TEXT_TASK_INFO: str = (
+    "任务信息：{name}\n"
+    "状态：{status}（Zoom {min_zoom} ~ {max_zoom}，{map_type}）\n"
+    "MBTiles：{path}\n"
+    "{file_state}"
+)
+#: 文件状态两句话都只说"能不能继续"，**不说"已有多少张瓦片"**：
+#: 数瓦片要查 SQLite，而那是禁止在 Qt 主线程做的事（Spec §7）。
+#: 想要那个数字，路径就在上面，点「继续」时程序会去扫描并报出来。
+UI_TEXT_TASK_INFO_FILE_EXISTS: str = "文件已存在（{size}），继续时已有瓦片会自动跳过"
+UI_TEXT_TASK_INFO_FILE_MISSING: str = "文件尚不存在，继续时会新建"
 

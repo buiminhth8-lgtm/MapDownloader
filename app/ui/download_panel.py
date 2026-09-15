@@ -12,8 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal, Slot
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import QSize, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,7 +25,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -39,14 +37,22 @@ from app.config.settings import (
     DEFAULT_OUTPUT_DIR,
     MAX_SUPPORTED_ZOOM,
     MIN_SUPPORTED_ZOOM,
+    UI_TEXT_ESTIMATED_MAP_TYPE,
     UI_TEXT_ESTIMATED_REQUESTS_MERGED,
     UI_TEXT_ESTIMATED_REQUESTS_SINGLE,
+    UI_TEXT_ESTIMATED_ZOOM,
     UI_TEXT_LAYER_OUTPUT_MERGED,
     UI_TEXT_LAYER_OUTPUT_SINGLE,
     UI_TEXT_LAYER_PLAN,
     UI_TEXT_MBTILES_OUTPUT_NOTICE,
 )
-from app.models.map_layer import MAP_TYPE_DISPLAY_NAMES, MapType
+from app.models.map_layer import (
+    MAP_TYPE_DISPLAY_NAMES,
+    MapType,
+    describe_map_type,
+)
+from app.ui.task_actions import TaskAction, UiTaskState, actions_for
+from app.ui.validation import auto_map_name
 
 #: 地图类型下拉框的可选项（Slice 6，Spec §2）。
 #:
@@ -64,7 +70,29 @@ ACTION_CALCULATE = "calculate"
 ACTION_START = "start"
 ACTION_PAUSE = "pause"
 ACTION_RESUME = "resume"
+ACTION_CANCEL = "cancel"
 ACTION_TEST_CONNECTION = "test_connection"
+
+#: :class:`~app.ui.task_actions.TaskAction` → 动作标识。
+#:
+#: 两个枚举不能合成一个：``TaskAction`` 是"用户可以干什么"（纯逻辑，不 import Qt，
+#: 因此可以脱离窗口单测），``ACTION_*`` 是信号里的字符串载荷（UI 内部协议）。
+#: 这张表是它们之间**唯一**的翻译点。
+_ACTION_IDS: dict[TaskAction, str] = {
+    TaskAction.START: ACTION_START,
+    TaskAction.PAUSE: ACTION_PAUSE,
+    TaskAction.RESUME: ACTION_RESUME,
+    TaskAction.CANCEL: ACTION_CANCEL,
+}
+
+#: 按钮上显示的中文（与 ``TaskAction.display_name`` 同义，
+#: 但按钮文案属于本面板，留在本面板）
+_ACTION_LABELS: dict[TaskAction, str] = {
+    TaskAction.START: "开始下载",
+    TaskAction.PAUSE: "暂停",
+    TaskAction.RESUME: "继续",
+    TaskAction.CANCEL: "取消",
+}
 
 #: 经纬度输入框的最小宽度。
 #: QDoubleSpinBox 的 ``minimumSizeHint`` 会按最大位数（``-180.000000``，11 字符）
@@ -81,88 +109,12 @@ _CONNECTION_PLACEHOLDER = "尚未测试"
 #: 尚未下载时"下载结果"区的占位文案
 _DOWNLOAD_RESULT_PLACEHOLDER = "尚未下载"
 
-#: 标签尚未完成首次布局时使用的折行宽度（配置列的典型内宽）。
-#: 首次 ``set_text`` 时控件宽度还是 0，只能用这个估值；随后的 ``resizeEvent``
-#: 会按真实宽度重排，因此它只影响一帧，不会留下错误换行。
-_LABEL_FALLBACK_WIDTH = 420
-
-
-def _wrap_anywhere(text: str, width: int, metrics: QFontMetrics) -> str:
-    """按**字符**宽度折行，返回插入显式换行符后的文本。
-
-    与 ``QLabel`` 的自动折行相对：那个只在"单词边界"断行，遇到 Windows 绝对
-    路径 / SSL 错误文本这类超长无空格 token 时找不到断点，于是**不折行、直接
-    横向裁掉**。这里逐字符累加宽度，超过就断，任何文本都不会溢出。
-
-    Args:
-        text: 原始文本（可含换行）。
-        width: 可用宽度（像素）。``<= 0`` 时原样返回。
-        metrics: 用于测量宽度的字体度量。
-
-    Returns:
-        折行后的文本。
-    """
-    if width <= 0:
-        return text
-
-    lines: list[str] = []
-    for raw_line in text.splitlines() or [""]:
-        current = ""
-        for char in raw_line:
-            if current and metrics.horizontalAdvance(current + char) > width:
-                lines.append(current)
-                current = char
-            else:
-                current += char
-        lines.append(current)
-    return "\n".join(lines)
-
-
-class _WrappingLabel(QLabel):
-    """多行说明标签：**自己按字符折行**，不依赖 ``QLabel.setWordWrap``。
-
-    为什么不用 ``setWordWrap(True)``：它按单词边界断行，长路径这类无空格
-    token 会被整段横向裁掉（实测在 460px 宽的配置列里，"文件：C:\\...\\x.mbtiles"
-    只显示到一半，且强制重排也修不好）。本类把"折行"这一步拿回自己手里，
-    文本里全是显式换行符，布局结果完全确定。
-
-    用法上仍兼容 ``QLabel``：``set_text()`` 传原始文本，``text()`` 取回原始
-    文本（不是折行后的），因此调用方与断言不必关心折行细节。
-    """
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        # 水平方向 Ignored：本标签**不得**反过来决定配置列的宽度
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self._source_text = ""
-        self._wrapped_width = -1
-        self.set_text(text)
-
-    def set_text(self, text: str) -> None:
-        """设置原始文本（显示时会按当前宽度折行）。"""
-        self._source_text = text
-        self._rewrap(force=True)
-
-    def text(self) -> str:  # noqa: A003 - 与 QLabel 同名，便于替换
-        """返回**原始**文本（不含自动插入的换行符）。"""
-        return self._source_text
-
-    def _rewrap(self, *, force: bool = False) -> None:
-        width = self.width()
-        if width <= 0:
-            width = _LABEL_FALLBACK_WIDTH
-        if not force and width == self._wrapped_width:
-            return
-        self._wrapped_width = width
-
-        wrapped = _wrap_anywhere(self._source_text, width, self.fontMetrics())
-        if wrapped != super().text():
-            super().setText(wrapped)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 命名约定
-        super().resizeEvent(event)
-        self._rewrap()
+#: 折行标签（Slice 7 起放在 ``app.ui.widgets`` 里，三个面板共用）。
+#: 这里保留 ``_WrappingLabel`` / ``_wrap_anywhere`` 两个名字：
+#: 本模块内的用法与既有测试都按这两个私有名引用，改成新名字没有任何收益。
+from app.ui.widgets import WrappingLabel as _WrappingLabel  # noqa: E402
+from app.ui.widgets import apply_secondary_text as _apply_secondary_text  # noqa: E402
+from app.ui.widgets import wrap_anywhere as _wrap_anywhere  # noqa: E402
 
 
 class _CoordSpinBox(QDoubleSpinBox):
@@ -211,6 +163,10 @@ class DownloadPanel(QGroupBox):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
+
+        #: 当前界面状态（决定四个动作按钮的可用性）。必须在构建按钮**之前**
+        #: 初始化：``_build_buttons`` 结尾就会调一次 ``apply_task_state``。
+        self._task_state: UiTaskState = UiTaskState.IDLE
 
         self._build_general_form()
         self._build_area_form()
@@ -340,19 +296,27 @@ class DownloadPanel(QGroupBox):
 
     def _build_buttons(self) -> None:
         self._calculate_button = QPushButton("计算", self)
-        self._start_button = QPushButton("开始下载", self)
-        self._pause_button = QPushButton("暂停", self)
-        self._resume_button = QPushButton("继续", self)
+        self._start_button = QPushButton(_ACTION_LABELS[TaskAction.START], self)
+        self._pause_button = QPushButton(_ACTION_LABELS[TaskAction.PAUSE], self)
+        self._resume_button = QPushButton(_ACTION_LABELS[TaskAction.RESUME], self)
+        self._cancel_button = QPushButton(_ACTION_LABELS[TaskAction.CANCEL], self)
+        self._cancel_button.setToolTip(
+            "取消当前任务。已下载的瓦片会保留在 .mbtiles 里，以后仍可继续"
+        )
         self._test_connection_button = QPushButton("测试天地图连接", self)
         self._test_connection_button.setToolTip(
             "取当前范围的中心点，请求单张瓦片验证 Token 与网络（不会下载整个区域）"
         )
 
+        # 顺序即界面上从左到右的顺序：先"算清楚"，再"开跑"，最后是跑起来之后的
+        # 三个控制动作。「取消」紧挨着「暂停 / 继续」——它们回答的是同一个问题
+        # （"现在要不要让它停"），放在一起用户才不用来回找。
         self._action_buttons: dict[str, QPushButton] = {
             ACTION_CALCULATE: self._calculate_button,
             ACTION_START: self._start_button,
             ACTION_PAUSE: self._pause_button,
             ACTION_RESUME: self._resume_button,
+            ACTION_CANCEL: self._cancel_button,
             ACTION_TEST_CONNECTION: self._test_connection_button,
         }
 
@@ -367,10 +331,11 @@ class DownloadPanel(QGroupBox):
         # Slice 4 起瓦片真的会落盘：这里说明输出产物形态（不再是"测试模式"）。
         self._mode_notice = QLabel(UI_TEXT_MBTILES_OUTPUT_NOTICE, self)
         self._mode_notice.setWordWrap(True)
-        self._mode_notice.setStyleSheet("color: palette(mid);")
+        # 深色主题下 palette(mid) ≈ 背景色，字会整片消失（见 app/ui/widgets.py）
+        _apply_secondary_text(self._mode_notice)
 
-        # 初始态：暂停 / 继续没有意义，保持禁用
-        self.set_download_running(False)
+        # 初始态：四个控制动作都没有意义，全部保持禁用
+        self.apply_task_state(UiTaskState.IDLE)
 
     def _build_result_area(self) -> None:
         """瓦片计算结果区。
@@ -482,6 +447,52 @@ class DownloadPanel(QGroupBox):
         self.layer_plan_changed.emit()
 
     # ------------------------------------------------------------------ #
+    # 地图名称与配置摘要（Slice 7）
+    # ------------------------------------------------------------------ #
+    def map_name_text(self) -> str:
+        """当前地图名称（已去掉首尾空白）。"""
+        return self._map_name_edit.text().strip()
+
+    def set_map_name(self, name: str) -> None:
+        """写入地图名称（回填与自动生成共用）。"""
+        self._map_name_edit.setText(str(name))
+
+    def ensure_map_name(self) -> str | None:
+        """地图名称为空时自动补一个（Spec §2.7）。
+
+        规则在 :func:`app.ui.validation.auto_map_name`（用范围中心点），本方法
+        只负责"写回输入框"——写回而不是悄悄用在内部，是因为用户必须**看得见**
+        将要生成的文件叫什么；否则他会在"输出文件"那一行看到一个自己没写过的
+        名字，怀疑程序弄错了。
+
+        Returns:
+            本次自动生成的名称；名称本来就非空、或范围非法导致无法生成时返回
+            ``None``（后一种情况由校验层去报错，这里不抢着下结论）。
+        """
+        if self.map_name_text():
+            return None
+        data = self.get_form_data()
+        try:
+            name = auto_map_name(
+                float(data["west"]),
+                float(data["south"]),
+                float(data["east"]),
+                float(data["north"]),
+            )
+        except (TypeError, ValueError):  # pragma: no cover - 防御性分支
+            return None
+        self.set_map_name(name)
+        return name
+
+    def map_type_plan_text(self) -> str:
+        """当前"地图类型 + 中文注记"的一行摘要（如 ``矢量地图 + 中文注记``）。"""
+        return describe_map_type(self.current_map_type(), self.with_labels_selected())
+
+    def zoom_range_text(self) -> str:
+        """当前缩放区间（如 ``8 ~ 17``）。"""
+        return f"{self._min_zoom_spin.value()} ~ {self._max_zoom_spin.value()}"
+
+    # ------------------------------------------------------------------ #
     # 对外接口
     # ------------------------------------------------------------------ #
     def get_form_data(self) -> dict:
@@ -520,6 +531,39 @@ class DownloadPanel(QGroupBox):
     def action_buttons(self) -> dict[str, QPushButton]:
         """动作按钮字典（只读用途，如测试点击或后续禁用/启用）。"""
         return dict(self._action_buttons)
+
+    # ------------------------------------------------------------------ #
+    # 直接写入单项（Slice 7：恢复界面偏好 / 回填任务参数用）
+    # ------------------------------------------------------------------ #
+    def set_map_type(self, map_type: MapType) -> bool:
+        """选中指定的地图类型。
+
+        Returns:
+            ``True`` 表示下拉框里有这一项；``False`` 表示当前版本不支持
+            （此时保持原选项不动——换成一个用户没选过的类型更糟）。
+        """
+        for index in range(self._map_type_combo.count()):
+            if self._map_type_combo.itemData(index) is map_type:
+                self._map_type_combo.setCurrentIndex(index)
+                return True
+        return False
+
+    def set_with_labels(self, value: bool) -> None:
+        """设置「下载中文注记图层」。"""
+        self._labels_check.setChecked(bool(value))
+
+    def set_zoom_range(self, min_zoom: int, max_zoom: int) -> None:
+        """设置缩放区间。
+
+        传进来的值可能超出控件范围（例如来自旧版本的偏好或任务记录）：
+        ``setValue`` 会自动 clamp，不会抛异常。
+        """
+        self._min_zoom_spin.setValue(int(min_zoom))
+        self._max_zoom_spin.setValue(int(max_zoom))
+
+    def set_output_dir(self, path: str | Path) -> None:
+        """设置输出目录。"""
+        self._output_edit.setText(str(path))
 
     # ------------------------------------------------------------------ #
     # 反向填充（Slice 5：从任务记录恢复表单）
@@ -573,7 +617,7 @@ class DownloadPanel(QGroupBox):
     def set_calculation_result(
         self, tile_count: int, size_text: str, output_path: str | Path | None = None
     ) -> None:
-        """展示瓦片计算成功的结果。
+        """展示瓦片计算成功的结果（Slice 7 起含 Zoom 与地图类型，Spec §3）。
 
         Args:
             tile_count: 预计瓦片数量。
@@ -582,14 +626,13 @@ class DownloadPanel(QGroupBox):
             output_path: 预计输出的 ``.mbtiles`` 完整路径；``None`` 时该行
                 显示占位符（例如地图名称为空）。
 
-        请求量行（Slice 6）由本面板按**当前**的地图类型 / 注记勾选算出来，
-        因此不需要调用方多传参数：勾上中文注记后请求量翻倍这件事，
+        请求量行（Slice 6）与 Zoom / 地图类型行（Slice 7）都由本面板按**当前**
+        的输入算出来，因此不需要调用方多传参数：勾上中文注记后请求量翻倍这件事，
         与"面板上现在选的是什么"永远一致，不会出现两处算出不同数字。
+
+        行序与 Spec §3 一致：瓦片数 → 请求量 → 容量 → Zoom → 地图类型，
+        最后是本项目的补充（输出文件）——它是"这些东西要落到哪儿"的答案。
         """
-        lines = [f"预计瓦片：{tile_count:,}", f"预计容量：{size_text}"]
-        lines.append(
-            f"输出文件：{output_path}" if output_path else "输出文件：（请填写地图名称）"
-        )
         map_type = self.current_map_type()
         with_labels = self.with_labels_selected()
         requests = tile_count * map_type.request_count_per_tile(with_labels)
@@ -598,8 +641,21 @@ class DownloadPanel(QGroupBox):
             if with_labels
             else UI_TEXT_ESTIMATED_REQUESTS_SINGLE
         )
-        # 单层模板里没有 ``{tiles}``，多传一个键不会报错（str.format 忽略多余键）
-        lines.append(template.format(requests=requests, tiles=tile_count))
+
+        lines = [
+            f"预计瓦片：{tile_count:,}",
+            # 单层模板里没有 ``{tiles}``，多传一个键不会报错（str.format 忽略多余键）
+            template.format(requests=requests, tiles=tile_count),
+            f"预计容量：{size_text}",
+            UI_TEXT_ESTIMATED_ZOOM.format(
+                min_zoom=self._min_zoom_spin.value(),
+                max_zoom=self._max_zoom_spin.value(),
+            ),
+            UI_TEXT_ESTIMATED_MAP_TYPE.format(
+                map_type=describe_map_type(map_type, with_labels)
+            ),
+            f"输出文件：{output_path}" if output_path else "输出文件：（请填写地图名称）",
+        ]
         self._result_label.set_text("\n".join(lines))
 
     def set_calculation_error(self, message: str) -> None:
@@ -707,27 +763,66 @@ class DownloadPanel(QGroupBox):
         return self._test_connection_button
 
     # ------------------------------------------------------------------ #
-    # 下载状态（Slice 3）
+    # 下载状态（Slice 3；Slice 7 改为按状态矩阵统一控制）
     # ------------------------------------------------------------------ #
+    def apply_task_state(self, state: UiTaskState) -> None:
+        """按界面状态切换按钮可用性（Slice 7，Spec §6）。
+
+        规则本身在 :data:`app.ui.task_actions.AVAILABLE_ACTIONS` 里，本方法只做
+        "读表 → 设 ``setEnabled``"。这样"哪个状态下允许点哪个"可以被逐格断言，
+        而不用把界面点一遍。
+
+        除四个控制动作外，「计算」与「测试天地图连接」在有任务占用通道时也一并
+        禁用：它们读的是**当前表单**，而表单在下载期间已经不再与正在跑的任务
+        对应（用户可以随手改范围），放行只会制造"界面显示的和实际在下的是两回事"。
+
+        Args:
+            state: 目标界面状态。
+        """
+        self._task_state = state
+        allowed = actions_for(state)
+
+        for action, action_id in _ACTION_IDS.items():
+            button = self._action_buttons.get(action_id)
+            if button is not None:
+                button.setEnabled(action in allowed)
+
+        # 表单编辑类动作：只有"没有任务占用下载通道"时才可用
+        idle = not state.is_busy
+        self._calculate_button.setEnabled(idle)
+        self._test_connection_button.setEnabled(idle)
+
+    @property
+    def task_state(self) -> UiTaskState:
+        """当前界面状态。"""
+        return self._task_state
+
     def set_download_running(self, running: bool, *, paused: bool = False) -> None:
-        """按下载引擎的当前状态切换按钮可用性。
+        """按"是否在跑 / 是否暂停"切换按钮可用性（Slice 3 的旧入口）。
 
-        规矩很简单：**会造成冲突的动作一律禁用**。
-
-        - 下载中：不能再点「开始下载」（会启动第二个任务），也不能点「计算」/
-          「测试天地图连接」（它们用的是同一份表单，改配置会让正在跑的任务
-          和界面显示对不上）。
-        - 只有跑起来之后「暂停」才有意义；只有暂停之后「继续」才有意义。
+        保留它是因为 Slice 3~6 的调用点与测试都在用；实现已改为转发到
+        :meth:`apply_task_state`，因此两条路径不可能给出不同的按钮状态。
 
         Args:
             running: 是否有下载在跑。
             paused: 下载是否处于暂停态（仅 ``running=True`` 时有意义）。
         """
-        self._start_button.setEnabled(not running)
-        self._calculate_button.setEnabled(not running)
-        self._test_connection_button.setEnabled(not running)
-        self._pause_button.setEnabled(running and not paused)
-        self._resume_button.setEnabled(running and paused)
+        if not running:
+            self.apply_task_state(UiTaskState.IDLE)
+        elif paused:
+            self.apply_task_state(UiTaskState.PAUSED)
+        else:
+            self.apply_task_state(UiTaskState.DOWNLOADING)
+
+    def set_scanning(self, scanning: bool) -> None:
+        """进入 / 退出"正在扫描已有瓦片"（Spec §11）。
+
+        扫描期间四个控制动作里只放开「取消」：用户可以反悔"这次不下了"，
+        但不该在还没算清要下多少张的时候点「开始下载」。
+        """
+        self.apply_task_state(
+            UiTaskState.SCANNING if scanning else UiTaskState.IDLE
+        )
 
     @property
     def mode_notice(self) -> QLabel:
@@ -758,6 +853,11 @@ class DownloadPanel(QGroupBox):
     def resume_button(self) -> QPushButton:
         """暴露"继续"按钮。"""
         return self._resume_button
+
+    @property
+    def cancel_button(self) -> QPushButton:
+        """暴露"取消"按钮（Slice 7）。"""
+        return self._cancel_button
 
     # ------------------------------------------------------------------ #
     # 内部槽

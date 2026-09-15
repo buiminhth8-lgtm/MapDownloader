@@ -3,10 +3,29 @@
 本文件只做三件事：**装配界面、连接信号、把用户动作转成日志与状态栏提示**。
 任何计算 / 下载 / 打包 / 设备通信的逻辑都必须放到对应的业务包中，
 通过 ``self.log_panel`` 汇报进展，禁止在此堆积实现细节。
+
+Qt / asyncio 边界（Slice 7，Spec §7）
+-------------------------------------
+
+主线程里**不允许**出现：HTTP 请求、SQLite 查询、Pillow 编解码、MBTiles 校验、
+大量瓦片计算、等待 asyncio。本模块据此把三件事全部推给后台线程：
+
+===========  ==========================================  ==============================
+工作          为什么不能在主线程                          落在哪个 worker
+===========  ==========================================  ==============================
+连通性测试    发 HTTP                                     ``ConnectionTestWorker``
+瓦片下载      发 HTTP / SQLite / Pillow / asyncio 事件循环  ``DownloadWorker``
+已有瓦片扫描  SQLite 计数查询                              ``ExistingTileScanWorker``
+===========  ==========================================  ==============================
+
+主线程这边只剩"读表单 → 校验 → 起线程 → 收信号 → 改控件"。
+``MainWindow`` 里不出现 ``httpx`` / ``sqlite3`` / ``PIL`` 的任何符号，
+这条规则由 ``tests/test_ui_smoke.py`` 里的一致性断言守着。
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -14,12 +33,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
-    QFormLayout,
     QGroupBox,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QScrollArea,
     QSplitter,
     QStyle,
@@ -38,16 +55,27 @@ from app.config.settings import (
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     GUI_LARGE_TASK_CONFIRM_TILES,
+    UI_TEXT_BUTTON_CANCEL,
+    UI_TEXT_BUTTON_CLOSE,
+    UI_TEXT_BUTTON_CONFIRM,
+    UI_TEXT_BUTTON_OK,
     UI_TEXT_CANCELLED_KEEP_TILES,
+    UI_TEXT_CANCEL_CONFIRM,
+    UI_TEXT_CANCEL_TITLE,
+    UI_TEXT_COMPLETE_BODY,
+    UI_TEXT_COMPLETE_TITLE,
     UI_TEXT_COMPOSITION_MERGED,
     UI_TEXT_COMPOSITION_SINGLE,
+    UI_TEXT_DEVICE_HINT,
     UI_TEXT_EXIT_CANCEL,
     UI_TEXT_EXIT_CONFIRM,
     UI_TEXT_EXIT_WITH_TASK,
     UI_TEXT_EXIT_WITH_TASK_TITLE,
+    UI_TEXT_FAILED_BODY,
+    UI_TEXT_FAILED_TITLE,
     UI_TEXT_LARGE_TASK_CONFIRM,
     UI_TEXT_LARGE_TASK_CONFIRM_TITLE,
-    UI_TEXT_MAP_NAME_REQUIRED,
+    UI_TEXT_MAP_NAME_AUTO_GENERATED,
     UI_TEXT_MBTILES_EXISTS,
     UI_TEXT_MBTILES_EXISTS_CANCEL,
     UI_TEXT_MBTILES_EXISTS_CONTINUE,
@@ -55,9 +83,14 @@ from app.config.settings import (
     UI_TEXT_MBTILES_EXISTS_TITLE,
     UI_TEXT_MBTILES_RESTART_CONFIRM,
     UI_TEXT_MBTILES_RESTART_TITLE,
+    UI_TEXT_OPEN_DIRECTORY,
+    UI_TEXT_OPEN_DIRECTORY_FAILED,
+    UI_TEXT_OPEN_DIRECTORY_NEED_PATH,
     UI_TEXT_RESUME_TOKEN_REQUIRED,
+    UI_TEXT_SCANNING_EXISTING,
     UI_TEXT_TASK_DELETE_HINT,
     UI_TEXT_TASK_RECOVERED,
+    UI_TEXT_VALIDATION_TITLE,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
 )
@@ -72,18 +105,19 @@ from app.geo import (
     lon_to_tile_x,
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
-from app.models.map_layer import MapLayerType, MapType
+from app.models.map_layer import MapLayerType, MapType, describe_map_type
 from app.providers import TiandituProvider, TileTestResult, mask_url
 from app.services import (
     MapDownloadOutcome,
     build_output_path,
-    count_existing_tiles,
 )
 from app.tasks import TaskService, TaskStoreError
 from app.ui.connection_check import ConnectionTestWorker
+from app.ui.desktop import open_directory
 from app.ui.device_panel import DevicePanel
 from app.ui.download_panel import (
     ACTION_CALCULATE,
+    ACTION_CANCEL,
     ACTION_PAUSE,
     ACTION_RESUME,
     ACTION_START,
@@ -92,7 +126,12 @@ from app.ui.download_panel import (
 )
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
+from app.ui.preferences import UiPreferences
+from app.ui.task_actions import UiTaskState
 from app.ui.task_panel import TaskPanel
+from app.ui.task_progress_panel import TaskProgressPanel
+from app.ui.tile_scan_worker import ExistingTileScan, ExistingTileScanWorker
+from app.ui.validation import validate_form
 
 #: 左侧配置列的偏好宽度（实际取值为它与"内容最小宽度"的较大者）
 _LEFT_COLUMN_WIDTH = 460
@@ -143,40 +182,14 @@ def _describe_plan(
     return f"天地图 {layers} z{min_zoom}~{max_zoom} {bounds.as_tuple()}"
 
 #: 各动作对应的说明（下载相关动作在 Slice 3 已实现，Slice 4 起落盘为 MBTiles，
-#: Slice 5 起支持断点续传与任务恢复）
+#: Slice 5 起支持断点续传与任务恢复，Slice 7 起补上取消与完整的按钮状态机）
 _ACTION_HINTS: dict[str, str] = {
     ACTION_CALCULATE: "按当前范围计算瓦片数量与预估容量（Slice 1 已实现）",
     ACTION_TEST_CONNECTION: "取范围中心点测试单瓦片连通性（Slice 2 已实现）",
     ACTION_START: "下载瓦片并写入 MBTiles（Slice 4；已有文件会提示续传，Slice 5）",
     ACTION_PAUSE: "暂停下载：不再发起新请求，已发出的请求允许完成（Slice 3 已实现）",
     ACTION_RESUME: "继续下载：放行当前任务的闸门（Slice 3；跨进程续传见「下载任务」）",
-}
-
-
-#: 下载状态区的行标题（键顺序即展示顺序）
-_STATUS_LABELS: dict[str, str] = {
-    "task_status": "任务状态",
-    "current_zoom": "当前 Zoom",
-    "tile_total": "瓦片总数",
-    "tile_done": "已完成",
-    "tile_succeeded": "成功",
-    "tile_failed": "失败数量",
-    "tile_skipped": "已跳过",
-    "speed": "下载速度",
-    "downloaded_bytes": "已下载字节",
-}
-
-#: 下载状态区的初始值
-_STATUS_DEFAULTS: dict[str, str] = {
-    "task_status": "空闲",
-    "current_zoom": "—",
-    "tile_total": "0",
-    "tile_done": "0",
-    "tile_succeeded": "0",
-    "tile_failed": "0",
-    "tile_skipped": "0",
-    "speed": "0 瓦片/秒",
-    "downloaded_bytes": "0 B",
+    ACTION_CANCEL: "取消下载：已写入的瓦片保留，任务可以稍后再继续（Slice 7）",
 }
 
 
@@ -264,6 +277,7 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         *,
         task_service: TaskService | None = None,
+        preferences: UiPreferences | None = None,
     ) -> None:
         """
         Args:
@@ -271,6 +285,9 @@ class MainWindow(QMainWindow):
             task_service: 任务服务；``None`` 时用默认的
                 ``~/MapDownloader/data/tasks.json``。
                 测试会注入一个指向临时目录的实例，避免污染用户主目录。
+            preferences: 界面偏好（Slice 7）；``None`` 时用默认的
+                ``QSettings(ORG_NAME, APP_NAME)``——在 Windows 上落到注册表。
+                测试会注入一个 ``IniFormat`` 的临时实例，理由同 ``task_service``。
         """
         super().__init__(parent)
 
@@ -280,10 +297,13 @@ class MainWindow(QMainWindow):
 
         #: 任务持久化服务（Slice 5）
         self.task_service = task_service or TaskService()
+        #: 界面偏好（Slice 7，Spec §22）。**不存 Token。**
+        self.preferences = preferences or UiPreferences()
 
-        # 四大面板 + 下载状态区
+        # 四大面板 + 当前任务进度区
         self.download_panel = DownloadPanel(self)
-        self.status_group = self._build_status_group()
+        #: 当前任务进度面板（Slice 7，Spec §5）。
+        self.task_progress = TaskProgressPanel(self)
         self.device_panel = DevicePanel(self)
         self.task_panel = TaskPanel(self)
         self.log_panel = LogPanel(self)
@@ -295,15 +315,26 @@ class MainWindow(QMainWindow):
 
         #: 后台下载线程（同一时刻最多一个）
         self._download_worker: DownloadWorker | None = None
+        #: 后台已有瓦片扫描线程（Slice 7；同一时刻最多一个）
+        self._scan_worker: ExistingTileScanWorker | None = None
         #: 正在进行的任务记录（用于收尾时写状态、关窗时写 PAUSED）
         self._current_task: DownloadTask | None = None
-        #: 等待用户确认的下载计划（大任务确认 / 已有文件选择，都是非模态）
+        #: 等待用户确认的下载计划（大任务确认 / 已有文件选择 / 取消，都是非模态）
         self._pending_plan: _DownloadPlan | None = None
+        #: 用户已经在"取消吗"的弹窗里变成确认后，等待扫描结果的那份计划
+        self._scan_followup = None
+        #: 已请求暂停、但引擎还没确认（Spec §13 的 PAUSING 阶段）
+        self._pause_pending = False
+        #: 当前界面状态（Spec §6 的按钮矩阵据此驱动）
+        self._task_state = UiTaskState.IDLE
         #: 非模态弹窗实例（持有引用避免被 GC 提前回收）
         self._confirm_dialog: QMessageBox | None = None
         self._exists_dialog: QMessageBox | None = None
         self._restart_dialog: QMessageBox | None = None
         self._exit_dialog: QMessageBox | None = None
+        self._cancel_dialog: QMessageBox | None = None
+        self._complete_dialog: QMessageBox | None = None
+        self._failed_dialog: QMessageBox | None = None
         #: 关窗确认结果（Spec §17：先提示，用户确认后才真正退出）
         self._exit_confirmed = False
         #: 最近一次"计算"的结果，用于输出路径变化时重绘「输出文件」行
@@ -313,7 +344,26 @@ class MainWindow(QMainWindow):
         self._build_central_widget()
         self._build_status_bar()
         self._connect_signals()
+        self._apply_preferences()
         self._recover_tasks()
+
+    # ------------------------------------------------------------------ #
+    # 兼容入口（Slice 3~6 的调用点与测试都用这几个名字）
+    # ------------------------------------------------------------------ #
+    @property
+    def status_group(self) -> TaskProgressPanel:
+        """当前任务进度区（Slice 7 起是 :class:`TaskProgressPanel` 的实例）。"""
+        return self.task_progress
+
+    @property
+    def _status_values(self) -> dict[str, QLabel]:
+        """进度区的字段标签表（旧名字，转发到进度面板）。"""
+        return self.task_progress.values
+
+    @property
+    def progress_bar(self):
+        """总进度条（旧名字，转发到进度面板）。"""
+        return self.task_progress.progress_bar
 
     # ------------------------------------------------------------------ #
     # 界面装配
@@ -331,34 +381,12 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
 
-    def _build_status_group(self) -> QGroupBox:
-        """下载状态区。Slice 0 全部展示默认值，Slice 3 起由下载器驱动。"""
-        self._status_values: dict[str, QLabel] = {}
-
-        group = QGroupBox("下载状态", self)
-        form = QFormLayout(group)
-        for key, text in _STATUS_DEFAULTS.items():
-            value_label = QLabel(text, group)
-            value_label.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-            self._status_values[key] = value_label
-            form.addRow(_STATUS_LABELS[key], value_label)
-
-        self.progress_bar = QProgressBar(group)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("总进度 %p%")
-        form.addRow("总进度", self.progress_bar)
-
-        return group
-
     def _build_central_widget(self) -> None:
         # 左列：配置 + 状态，放在滚动区里以适配小屏 / 高 DPI
         left_content = QWidget(self)
         left_layout = QVBoxLayout(left_content)
         left_layout.addWidget(self.download_panel)
-        left_layout.addWidget(self.status_group)
+        left_layout.addWidget(self.task_progress)
         left_layout.addStretch(1)
 
         left_scroll = QScrollArea(self)
@@ -425,6 +453,8 @@ class MainWindow(QMainWindow):
         self.task_panel.resume_requested.connect(self._on_task_resume_requested)
         self.task_panel.delete_requested.connect(self._on_task_delete_requested)
         self.task_panel.task_activated.connect(self._on_task_activated)
+        # Slice 7：选中任务后，四个动作按钮要跟着那个任务的状态走（Spec §6）
+        self.task_panel.selection_changed.connect(self._on_task_selection_changed)
 
     # ------------------------------------------------------------------ #
     # 槽：下载动作
@@ -436,6 +466,7 @@ class MainWindow(QMainWindow):
         if action in (ACTION_CALCULATE, ACTION_START):
             self._log_form_snapshot()
         if action == ACTION_CALCULATE:
+            self._fill_auto_map_name()
             self._run_tile_math()
             return
         if action == ACTION_TEST_CONNECTION:
@@ -450,7 +481,23 @@ class MainWindow(QMainWindow):
         if action == ACTION_RESUME:
             self._resume_download()
             return
+        if action == ACTION_CANCEL:
+            self._cancel_download()
+            return
         self.statusBar().showMessage(hint, 5000)
+
+    def _fill_auto_map_name(self) -> str | None:
+        """地图名称为空时补一个并写回输入框（Spec §2.7），返回被补上的名字。
+
+        「计算」与「开始下载」都会先调它，于是用户在**看到预估结果的同时**
+        也看到了将来那个文件叫什么；不会出现"下载完了才发现文件名叫 map_39.05N_116.05E"。
+        """
+        generated = self.download_panel.ensure_map_name()
+        if generated:
+            self.log_panel.append_log(
+                UI_TEXT_MAP_NAME_AUTO_GENERATED.format(name=generated)
+            )
+        return generated
 
     # ------------------------------------------------------------------ #
     # 槽：瓦片计算（Slice 1）
@@ -523,15 +570,81 @@ class MainWindow(QMainWindow):
         self._show_error_dialog("瓦片计算失败", message)
 
     def _show_error_dialog(self, title: str, message: str) -> None:
-        """非模态错误提示。
+        """非模态错误 / 警告提示（Spec §20 要求"用 QMessageBox 警告用户"）。
 
-        刻意不用 ``QMessageBox.warning()``（它会阻塞事件循环，
-        在无头测试环境里会直接把用例挂死）；这里用 ``show()`` 走非阻塞路径，
-        错误信息同时已经落到结果区、日志和状态栏，不会被漏掉。
+        刻意**不用** ``QMessageBox.warning()``：那个静态方法是模态的（内部
+        ``exec()``），会阻塞 Qt 事件循环——在无头测试里直接把用例挂死，
+        在有头环境里也会让"下载进行中"的弹窗把整个界面冻住（Slice 0 踩过这个坑）。
+        这里用 :class:`QMessageBox` 的 ``Icon.Warning`` + ``show()``：
+        对用户而言同样是"一个必须看见的警告框"，但事件循环照常转。
+        与此同时，信息已经落到结果区 / 日志 / 状态栏，不会被漏掉。
         """
         dialog = QMessageBox(QMessageBox.Icon.Warning, title, message, parent=self)
+        # 不显式建按钮的话 Qt 会给一个英文 "OK"（同"通用按钮文案"一节的理由）
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.button(QMessageBox.StandardButton.Ok).setText(UI_TEXT_BUTTON_OK)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.show()
+
+    def _report_validation_error(self, validation) -> None:
+        """下载前校验失败的统一出口（Spec §20）。
+
+        逐条写进日志（用户事后能翻），弹窗里是编号列表（用户当下要照着改）。
+        """
+        for error in validation.errors:
+            self.log_panel.append_log(error, "ERROR")
+        self.statusBar().showMessage("无法开始下载：请先修正表单上的问题", 8000)
+        self._show_error_dialog(UI_TEXT_VALIDATION_TITLE, validation.message)
+
+    def _ask_confirmation(
+        self,
+        title: str,
+        message: str,
+        *,
+        on_answered,
+        attr: str,
+        yes_text: str | None = None,
+        no_text: str | None = None,
+        default_yes: bool = False,
+        log: str = "",
+    ) -> QMessageBox:
+        """弹一个"是 / 否"确认框（**非模态**），把结果交给回调。
+
+        抽出来的理由：取消、退出、重新下载三处要的完全是同一种交互，
+        而"非模态 + ``finished`` 信号 + 断开连接"这套写法有足够多的细节
+        （信号重连、被 GC 回收、关窗时假日志）值得只写一遍。
+
+        Args:
+            title: 弹窗标题。
+            message: 正文。
+            on_answered: 收到 ``finished(int)`` 时的槽。
+            attr: 存放该弹窗的实例属性名（防止被 GC 提前回收）。
+            yes_text / no_text: 两个按钮的文案；``None`` 表示用 Qt 默认。
+            default_yes: 默认按钮是"是"还是"否"。破坏性操作应默认"否"。
+            log: 写进日志的一句话。
+
+        Returns:
+            弹窗对象（已 ``show()``）。
+        """
+        dialog = QMessageBox(QMessageBox.Icon.Question, title, message, parent=self)
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        default = (
+            QMessageBox.StandardButton.Yes if default_yes else QMessageBox.StandardButton.No
+        )
+        dialog.setDefaultButton(default)
+        if yes_text:
+            dialog.button(QMessageBox.StandardButton.Yes).setText(yes_text)
+        if no_text:
+            dialog.button(QMessageBox.StandardButton.No).setText(no_text)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.finished.connect(on_answered)
+        setattr(self, attr, dialog)
+        if log:
+            self.log_panel.append_log(log, "WARNING")
+        dialog.show()
+        return dialog
 
     def _log_form_snapshot(self) -> None:
         """把当前表单内容落到日志，验证 UI -> 数据模型 的读取链路。"""
@@ -662,22 +775,44 @@ class MainWindow(QMainWindow):
         self._show_error_dialog("天地图连接测试失败", message)
 
     # ------------------------------------------------------------------ #
-    # 槽：批量下载（Slice 3）
+    # 槽：批量下载（Slice 3；Slice 7 起校验与扫描都走了正确的线程）
     # ------------------------------------------------------------------ #
+    def _busy_worker(self):
+        """当前占着下载通道的后台线程（下载优先），没有则返回 ``None``。
+
+        Spec §6 的"不要允许用户重复点击开始创建多个相同 Worker"靠它兜底：
+        按钮已经被状态矩阵禁掉了，但信号还可能从别处来（快捷键、程序化调用），
+        因此真正的闸门必须在这里，而不是只在界面上。
+        """
+        download = self._download_worker
+        if download is not None and download.isRunning():
+            return download
+        scan = self._scan_worker
+        if scan is not None and scan.isRunning():
+            return scan
+        return None
+
     @Slot()
     def _start_download(self) -> None:
         """启动"下载 → 写入 MBTiles"。
 
-        链路：读表单 → ``app.geo`` 统计瓦片数 → 若目标 ``.mbtiles`` 已存在则先问
-        "继续 / 重下 / 取消" → 大任务风险提示 → ``app.services`` 在后台线程跑完整
-        落盘流程 → 进度 / 结果回主线程展示。
+        链路：读表单 → 统一校验（:func:`app.ui.validation.validate_form`）→
+        建计划（纯计算，不碰磁盘）→ **后台**扫描已有瓦片 → 已有文件选择 /
+        大任务提示 → ``app.services`` 在后台线程跑完整落盘流程。
+
+        Slice 5 时"数一数已有多少张"是在这里同步做的；Slice 7 把它移到了
+        :class:`~app.ui.tile_scan_worker.ExistingTileScanWorker`——那是一次
+        SQLite 查询，而 Spec §7 明确禁止在 Qt 主线程里碰 SQLite。
 
         本方法不含任何瓦片公式、URL 拼接、并发或 SQLite 逻辑。
         """
-        running = self._download_worker
-        if running is not None and running.isRunning():
-            self.log_panel.append_log("上一次下载尚未结束，已忽略本次请求", "WARNING")
+        if self._busy_worker() is not None:
+            self.log_panel.append_log("上一次任务尚未结束，已忽略本次请求", "WARNING")
+            self.statusBar().showMessage("当前有任务正在进行，无法同时开始另一个", 5000)
             return
+
+        # Spec §2.7：名称为空先补一个，用户才不会在"输出文件"里看到陌生文件名
+        self._fill_auto_map_name()
 
         plan = self._prepare_download()
         if plan is None:
@@ -685,11 +820,19 @@ class MainWindow(QMainWindow):
 
         if plan.output_path.exists():
             # Spec §15：绝不静默覆盖（更不静默删除）用户上次下载的成果，
-            # 先把选择权交出去。
-            self._ask_existing_file(plan)
+            # 先把选择权交出去。但要问"继续 / 重下"，得先知道里面有多少张。
+            self._begin_scan(plan, self._on_prepare_scan_done, purpose="检查已有文件")
             return
 
         self._continue_plan(plan)
+
+    def _on_prepare_scan_done(self, plan: _DownloadPlan, scan: ExistingTileScan) -> None:
+        """"要开始下载时发现文件已存在"这条路径的扫描回调。"""
+        plan = self._apply_scan(plan, scan)
+        self.log_panel.append_log(
+            f"已有文件：{plan.output_path}（{plan.existing_tiles:,} 张瓦片）"
+        )
+        self._ask_existing_file(plan)
 
     def _continue_plan(self, plan: _DownloadPlan) -> None:
         """"已有文件"这一关过了之后：先看规模，再决定要不要弹大任务确认框。
@@ -704,21 +847,87 @@ class MainWindow(QMainWindow):
 
         self._launch_download(plan)
 
-    def _prepare_download(self) -> _DownloadPlan | None:
-        """读表单 + 校验 + 算总量与输出路径 + 建任务记录。
+    # ------------------------------------------------------------------ #
+    # 后台扫描已有瓦片（Slice 7，Spec §7 / §11）
+    # ------------------------------------------------------------------ #
+    def _begin_scan(self, plan: _DownloadPlan, on_done, *, purpose: str) -> None:
+        """在后台数一数目标文件里已有多少张瓦片。
 
-        失败时统一走 :meth:`_report_download_error` 并把原因返回给用户，
+        Args:
+            plan: 当前计划；扫描结果会 patch 到它的
+                ``existing_tiles`` / ``effective_tiles`` / ``requests``。
+            on_done: 扫描结束后的回调 ``(plan, scan) -> None``，在**主线程**执行。
+            purpose: 日志里说明这次扫描是为了什么（"检查已有文件" /
+                "恢复任务"），否则用户会看到两处一模一样的"正在扫描已有瓦片"。
+        """
+        self._scan_followup = (on_done, plan)
+        self.download_panel.set_scanning(True)
+        self.task_progress.reset(plan.total, name=plan.map_name)
+        self.task_progress.show_scanning()
+        self.log_panel.append_log(f"{UI_TEXT_SCANNING_EXISTING}（{purpose}）")
+        self.statusBar().showMessage(f"{UI_TEXT_SCANNING_EXISTING}（{purpose}）")
+
+        worker = ExistingTileScanWorker(
+            plan.output_path,
+            list(range(plan.min_zoom, plan.max_zoom + 1)),
+            parent=self,
+        )
+        worker.scanned.connect(self._on_scan_finished)
+        self._scan_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_scan_finished(self, scan: ExistingTileScan) -> None:
+        """扫描线程结束，回主线程继续原来的流程。"""
+        self._scan_worker = None
+        self.download_panel.set_scanning(False)
+        followup = self._scan_followup
+        self._scan_followup = None
+        if followup is None:
+            # 用户在扫描期间点了「取消」：结果照收，但不再往下走。
+            self.log_panel.append_log("已放弃本次下载（扫描结果不再使用）", "WARNING")
+            self._refresh_action_state()
+            return
+
+        on_done, plan = followup
+        if scan.error:
+            # 扫不出来不该阻断下载：当作"没有已有瓦片"，最多多下几张。
+            # 写库是 INSERT OR REPLACE，重复写同一张是安全的。
+            self.log_panel.append_log(f"{scan.error}（按无已有瓦片继续）", "WARNING")
+        on_done(plan, scan)
+
+    @staticmethod
+    def _apply_scan(plan: _DownloadPlan, scan: ExistingTileScan) -> _DownloadPlan:
+        """把扫描结果并进计划（已有张数 → 真正要下的张数 → 预计请求数）。"""
+        existing = max(0, int(scan.tiles))
+        effective = max(0, plan.total - existing)
+        map_type = plan.map_type or MapType.from_layer(plan.layer)
+        return replace(
+            plan,
+            existing_tiles=existing,
+            effective_tiles=effective,
+            requests=effective * map_type.request_count_per_tile(plan.with_labels),
+        )
+
+    def _prepare_download(self) -> _DownloadPlan | None:
+        """读表单 + 统一校验 + 算总量与输出路径 + 建任务记录。
+
+        失败时统一走 :meth:`_report_validation_error` /
+        :meth:`_report_download_error` 并把原因返回给用户，
         返回 ``None`` 表示"没准备好，别启动"。
 
-        任务记录在这里就落盘（状态 ``CREATED``）：之后无论是"大任务确认"还是
-        "已有文件选择"，用户点取消都只是删掉一条 ``CREATED`` 记录，
+        任务记录在这里就落盘（状态 ``CREATED``）：之后无论是"大任务确认"、
+        "已有文件选择"还是"取消"，用户放弃时都只是删掉一条 ``CREATED`` 记录，
         而不会出现"下载跑起来却没有任务记录"这种反向缺口。
+
+        **不查磁盘**：已有瓦片数由调用方在后台扫描后补进来（Spec §7）。
         """
         data = self.download_panel.get_form_data()
-        if not data["map_name"]:
-            self._report_download_error(
-                UI_TEXT_MAP_NAME_REQUIRED, dialog_title="无法开始下载"
-            )
+
+        # Spec §20：一个统一的校验入口，一次报出全部问题
+        validation = validate_form(data)
+        if not validation.ok:
+            self._report_validation_error(validation)
             return None
 
         try:
@@ -740,16 +949,8 @@ class MainWindow(QMainWindow):
             total = estimate_tile_count(bounds, min_zoom, max_zoom)
             output_path = build_output_path(data["output_dir"], data["map_name"])
         except ValueError as exc:
-            self._report_download_error(str(exc), dialog_title="无法开始下载")
+            self._report_download_error(str(exc), dialog_title=UI_TEXT_VALIDATION_TITLE)
             return None
-
-        # 已有文件时顺手数一下里面有多少张（GROUP BY 计数，**不读 BLOB**）
-        existing = (
-            count_existing_tiles(output_path, range(min_zoom, max_zoom + 1))
-            if output_path.exists()
-            else 0
-        )
-        effective = max(0, total - existing)
 
         try:
             task = self.task_service.create_task(
@@ -765,7 +966,7 @@ class MainWindow(QMainWindow):
         except (TaskStoreError, OSError) as exc:
             self._report_download_error(
                 f"无法创建任务记录（{self.task_service.store.path}）：{exc}",
-                dialog_title="无法开始下载",
+                dialog_title=UI_TEXT_VALIDATION_TITLE,
             )
             return None
 
@@ -783,13 +984,14 @@ class MainWindow(QMainWindow):
             total=total,
             size_text=format_size(estimate_size_bytes(total)),
             task=task,
-            existing_tiles=existing,
+            # 已有张数未知，先当作 0；扫描完成后由 _apply_scan 修正
+            existing_tiles=0,
             # 全新下载默认"不跳过"：目标文件本来就不该有内容，跳过只会掩盖问题
             resume_policy=ResumePolicy.disabled(),
-            effective_tiles=effective,
+            effective_tiles=total,
             map_type=map_type,
             with_labels=with_labels,
-            requests=effective * map_type.request_count_per_tile(with_labels),
+            requests=total * map_type.request_count_per_tile(with_labels),
         )
 
     def _discard_plan(self, plan: _DownloadPlan) -> None:
@@ -799,15 +1001,18 @@ class MainWindow(QMainWindow):
         用户取消它只是"这次不继续"，记录本身还要留在列表里等下次。
         """
         if plan.resume_task is not None:
+            self._refresh_action_state()
             return
         task = plan.task
         if task is None:  # pragma: no cover - 防御性分支
+            self._refresh_action_state()
             return
         try:
             self.task_service.delete_task(task.id)
         except (TaskStoreError, OSError) as exc:  # pragma: no cover - 磁盘异常
             self.log_panel.append_log(f"清理任务记录失败：{exc}", "WARNING")
         self._refresh_task_list()
+        self._refresh_action_state()
 
     def _log_resume_counts(self, existing: int, total: int) -> None:
         """Spec §16 要求的三段信息：**已有多少 / 目标多少 / 还要下多少**。
@@ -828,6 +1033,7 @@ class MainWindow(QMainWindow):
         ``finished`` 信号，把"用户点了哪个按钮"变成一次正常的事件回调。
         """
         self._pending_plan = plan
+        self._refresh_action_state()
         dialog = QMessageBox(
             QMessageBox.Icon.Question,
             UI_TEXT_LARGE_TASK_CONFIRM_TITLE,
@@ -842,6 +1048,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        # 标准按钮默认是英文（Yes / No），显式改成中文（理由见 settings 里的
+        # 「通用按钮文案」一段）
+        dialog.button(QMessageBox.StandardButton.Yes).setText(UI_TEXT_BUTTON_CONFIRM)
+        dialog.button(QMessageBox.StandardButton.No).setText(UI_TEXT_BUTTON_CANCEL)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.finished.connect(self._on_large_task_answered)
         self._confirm_dialog = dialog
@@ -885,6 +1095,7 @@ class MainWindow(QMainWindow):
         同样是**非模态**弹窗，理由见 :meth:`_confirm_large_task`。
         """
         self._pending_plan = plan
+        self._refresh_action_state()
         dialog = QMessageBox(
             QMessageBox.Icon.Question,
             UI_TEXT_MBTILES_EXISTS_TITLE,
@@ -958,6 +1169,7 @@ class MainWindow(QMainWindow):
     def _confirm_restart(self, plan: _DownloadPlan) -> None:
         """"重新下载"的二次确认：先告诉用户旧文件会被挪到哪儿。"""
         self._pending_plan = plan
+        self._refresh_action_state()
         backup = _backup_path(plan.output_path)
         dialog = QMessageBox(
             QMessageBox.Icon.Warning,
@@ -969,6 +1181,8 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
         dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.button(QMessageBox.StandardButton.Yes).setText(UI_TEXT_BUTTON_CONFIRM)
+        dialog.button(QMessageBox.StandardButton.Cancel).setText(UI_TEXT_BUTTON_CANCEL)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.finished.connect(self._on_restart_answered)
         self._restart_dialog = dialog
@@ -1033,10 +1247,11 @@ class MainWindow(QMainWindow):
         # 续传模式下服务的参数以**任务记录**为准，界面只补充 Token
         resume_task = task if plan.skips_existing else None
 
-        self.download_panel.set_download_running(True, paused=False)
         self.download_panel.clear_download_result()
         self._current_task = task
         self._reset_status_for_download(plan)
+        self._pause_pending = False
+        self._refresh_action_state("续传中" if plan.skips_existing else "下载中")
         try:
             self.task_service.start_downloading(task, total_tiles=plan.total)
         except (TaskStoreError, OSError) as exc:  # pragma: no cover - 磁盘异常
@@ -1044,9 +1259,7 @@ class MainWindow(QMainWindow):
         self._refresh_task_list(select_id=task.id)
 
         token = self.download_panel.get_form_data()["token"]
-        type_text = (
-            plan.map_type.display_name if plan.map_type is not None else plan.layer.value
-        )
+        type_text = describe_map_type(plan.map_type, plan.with_labels, missing=plan.layer.value)
         self.log_panel.append_log(
             f"开始下载：地图类型={type_text}，图层={plan.layer.value}，"
             f"范围={plan.bounds.as_tuple()}，"
@@ -1105,33 +1318,32 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _reset_status_for_download(self, plan: _DownloadPlan) -> None:
-        """开工前把状态区清成"从零开始"，避免上一轮的残留数字造成误读。"""
-        values = self._status_values
-        values["task_status"].setText("续传中" if plan.skips_existing else "下载中")
-        values["current_zoom"].setText("—")
-        values["tile_total"].setText(f"{plan.total:,}")
-        values["tile_done"].setText("0")
-        values["tile_succeeded"].setText("0")
-        values["tile_failed"].setText("0")
-        values["tile_skipped"].setText("0")
-        values["speed"].setText("0 瓦片/秒")
-        values["downloaded_bytes"].setText("0 B")
-        self.progress_bar.setValue(0)
+        """开工前把进度区清成"从零开始"，避免上一轮的残留数字造成误读。
+
+        **不设状态文案、不动按钮**：那两件事统一由 :meth:`_refresh_action_state`
+        按状态矩阵给（否则"这里写死一句 下载中、那里又按状态算一遍"迟早对不上）。
+        """
+        self.task_progress.reset(
+            plan.total, name=plan.map_name, skipped=plan.existing_tiles
+        )
 
     @Slot(object)
     def _on_download_progress(self, progress: DownloadProgress) -> None:
-        """后台进度更新（已由引擎节流到约 6 次/秒），回主线程刷界面。"""
-        values = self._status_values
-        values["tile_total"].setText(f"{progress.total:,}")
-        values["tile_done"].setText(f"{progress.completed:,}")
-        values["tile_succeeded"].setText(f"{progress.succeeded:,}")
-        values["tile_failed"].setText(f"{progress.failed:,}")
-        values["tile_skipped"].setText(f"{progress.skipped:,}")
-        values["speed"].setText(f"{progress.tiles_per_second:.1f} 瓦片/秒")
-        values["downloaded_bytes"].setText(format_size(progress.bytes_downloaded))
-        if progress.current_zoom is not None:
-            values["current_zoom"].setText(str(progress.current_zoom))
-        self.progress_bar.setValue(int(progress.percent))
+        """后台进度更新（已由引擎节流到约 6 次/秒），回主线程刷界面。
+
+        节流发生在**数据源头**（``DownloadService`` 的进度转发器，间隔
+        ``PROGRESS_EMIT_INTERVAL_SECONDS`` ≈ 0.15s），因此这里每收到一帧就是
+        真的该刷一帧——几十万张瓦片的任务不会把 Qt 事件队列塞满（Spec §8）。
+        """
+        self.task_progress.apply_progress(progress)
+        # 引擎已经报告过一帧，说明它确实收到了暂停指令、在途请求也落地了：
+        # 此刻才把 PAUSING 落成 PAUSED（Spec §13）。
+        if self._pause_pending and self._download_worker is not None:
+            self._pause_pending = False
+            self._refresh_action_state()
+            self.log_panel.append_log("下载已暂停（已写入的瓦片已保留，可随时继续）")
+            self.statusBar().showMessage("下载已暂停", 5000)
+
         tail = f"（成功 {progress.succeeded:,} · 失败 {progress.failed:,}"
         if progress.skipped:
             tail += f" · 跳过 {progress.skipped:,}"
@@ -1147,23 +1359,18 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_download_finished(self, outcome: MapDownloadOutcome) -> None:
-        """任务结束：先把任务状态落盘，再展示实测结果。"""
+        """任务结束：先把任务状态落盘，再展示实测结果（Spec §15 / §16 / §17）。"""
         self._download_worker = None
-        self.download_panel.set_download_running(False)
+        self._pause_pending = False
         task = self._current_task
         self._current_task = None
         self._finalize_task(task, outcome)
 
-        summary = outcome.summary
-        if outcome.cancelled:
-            status_text = "已取消"
-        elif outcome.is_success:
-            status_text = "已完成"
-        else:
-            status_text = "已完成（有失败）"
-        self._status_values["task_status"].setText(status_text)
         if not outcome.cancelled:
-            self.progress_bar.setValue(100)
+            self.task_progress.set_percent(100)
+        # 按钮与状态文案统一由状态机算：此刻没有 worker 了，选中任务的状态
+        # 刚被 _finalize_task 写成终态，于是按钮正好落在矩阵里该有的那一格。
+        self._refresh_action_state()
 
         lines = outcome.as_lines()
         self.download_panel.set_download_result(lines)
@@ -1181,6 +1388,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        summary = outcome.summary
         level = "INFO" if outcome.is_success else "WARNING"
         self.log_panel.append_log(
             f"下载完成：成功 {summary.succeeded:,} 张，失败 {summary.failed:,} 张，"
@@ -1191,18 +1399,104 @@ class MainWindow(QMainWindow):
             f"验证 {outcome.validation.status_text}。",
             level,
         )
-        if not outcome.is_success:
-            # §18/§19：没达标就把"还差什么"说清楚，用户才知道再点一次「继续」有没有用
-            reason = outcome.failure_text or "未达到完成条件"
-            self.log_panel.append_log(
-                f"任务未完成：{reason}。可在「下载任务」里点「继续」补齐缺失瓦片。",
-                "WARNING",
+
+        if outcome.is_success:
+            # Spec §16：成功结束后弹出完成小结（MBTilesValidator 已经由 service
+            # 在后台跑完，这里只是把它的结论摆出来，外加一个「打开目录」的出口）
+            self._show_complete_dialog(outcome)
+            self.statusBar().showMessage(
+                f"下载完成 · {outcome.tile_count:,} 张 · {outcome.size_text}"
+                f" · 验证 {outcome.validation.status_text}",
+                10000,
             )
-        self.statusBar().showMessage(
-            f"下载完成 · {outcome.tile_count:,} 张 · {outcome.size_text}"
-            f" · 验证 {outcome.validation.status_text}",
-            10000,
+            return
+
+        # §17：失败时 GUI 不能崩，还要把"为什么"和"成果还在"一起说清楚
+        reason = outcome.failure_text or "未达到完成条件"
+        self.log_panel.append_log(
+            f"任务未完成：{reason}。可在「下载任务」里点「继续」补齐缺失瓦片。",
+            "WARNING",
         )
+        self._show_failed_dialog(outcome, reason)
+        self.statusBar().showMessage(f"任务未完成：{reason}", 10000)
+
+    def _show_complete_dialog(self, outcome: MapDownloadOutcome) -> None:
+        """下载完成小结（Spec §16）。
+
+        非模态（同 :meth:`_show_error_dialog` 的理由），并且**带一个「打开目录」
+        按钮**：地图下完之后用户想做的下一件事必然是"去文件夹里看看那个文件"，
+        让他自己去资源管理器里翻是没道理的。
+        """
+        box = QMessageBox(QMessageBox.Icon.Information, UI_TEXT_COMPLETE_TITLE, "", parent=self)
+        box.setText(UI_TEXT_COMPLETE_BODY.format(
+            path=outcome.output_path,
+            map_type=describe_map_type(
+                MapType.parse(outcome.map_type), outcome.with_labels,
+                missing=outcome.map_type or "—",
+            ),
+            zooms=outcome.validation.zoom_text,
+            tiles=outcome.tile_count,
+            size=outcome.size_text,
+            validation=outcome.validation.status_text,
+        ))
+        open_button = box.addButton(UI_TEXT_OPEN_DIRECTORY, QMessageBox.ButtonRole.ActionRole)
+        close_button = box.addButton(QMessageBox.StandardButton.Close)
+        close_button.setText(UI_TEXT_BUTTON_CLOSE)
+        open_button.clicked.connect(
+            lambda: self._open_output_directory(outcome.output_path)
+        )
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._complete_dialog = box
+        self._forget_dialog_on_destroy("_complete_dialog", box)
+        box.show()
+
+    def _show_failed_dialog(self, outcome: MapDownloadOutcome, reason: str) -> None:
+        """任务失败提示（Spec §17）。
+
+        按钮给「继续」而不是「关闭」：失败几乎总是"缺了一部分瓦片"，用户接下来
+        唯一想做的事就是补上——把入口直接放在他眼前。
+        """
+        box = QMessageBox(QMessageBox.Icon.Warning, UI_TEXT_FAILED_TITLE, "", parent=self)
+        box.setText(UI_TEXT_FAILED_BODY.format(
+            reason=reason,
+            succeeded=outcome.summary.succeeded,
+            failed=outcome.summary.failed,
+        ))
+        resume_button = box.addButton("继续补齐", QMessageBox.ButtonRole.ActionRole)
+        close_button = box.addButton(QMessageBox.StandardButton.Close)
+        close_button.setText(UI_TEXT_BUTTON_CLOSE)
+        resume_button.clicked.connect(self._on_failed_dialog_resume)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._failed_dialog = box
+        self._forget_dialog_on_destroy("_failed_dialog", box)
+        box.show()
+
+    @Slot()
+    def _on_failed_dialog_resume(self) -> None:
+        """失败提示框里的「继续补齐」：与列表里的「继续」走同一条路。"""
+        task = self.task_panel.selected_task_id()
+        if task:
+            self._on_task_resume_requested(task)
+            return
+        self.log_panel.append_log("没有可继续的任务：请在「下载任务」里选中它", "WARNING")
+
+    def _open_output_directory(self, path) -> None:
+        """打开输出文件所在的目录（Spec §16）。
+
+        打不开不是错误——用户可能已经把文件挪走了。这里只把原因说出来，
+        不弹错误框：他点「打开目录」是为了看文件，不是为了看另一个错误。
+        """
+        if path is None:
+            self.log_panel.append_log(UI_TEXT_OPEN_DIRECTORY_NEED_PATH, "WARNING")
+            self.statusBar().showMessage(UI_TEXT_OPEN_DIRECTORY_NEED_PATH, 5000)
+            return
+        ok, error = open_directory(path)
+        if ok:
+            self.log_panel.append_log(f"已打开输出目录：{Path(str(path)).parent}")
+            return
+        message = UI_TEXT_OPEN_DIRECTORY_FAILED.format(path=path, error=error)
+        self.log_panel.append_log(message, "WARNING")
+        self.statusBar().showMessage(message.replace("\n", " "), 8000)
 
     def _finalize_task(
         self, task: DownloadTask | None, outcome: MapDownloadOutcome
@@ -1256,10 +1550,14 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_download_failed(self, message: str) -> None:
-        """下载线程异常终止（含写库失败这类无法继续的错误）。"""
+        """下载线程异常终止（含写库失败这类无法继续的错误）。
+
+        Spec §17：GUI **不能崩**，而且要把"任务失败 / 原因 / 已成功多少 /
+        已有数据已保留 / 可以继续"一次说完。这里的"继续"按钮直接指向补齐
+        缺失瓦片——失败几乎总是缺了一部分瓦片。
+        """
         self._download_worker = None
-        self.download_panel.set_download_running(False)
-        self._status_values["task_status"].setText("失败")
+        self._pause_pending = False
         self.download_panel.set_download_result_error(message)
         self._reveal_download_result()
 
@@ -1273,7 +1571,8 @@ class MainWindow(QMainWindow):
                 self.log_panel.append_log(f"任务状态落盘失败：{exc}", "WARNING")
             self._refresh_task_list(select_id=task.id)
 
-        self._report_download_error(message, dialog_title="下载失败")
+        self._refresh_action_state()
+        self._report_download_error(message, dialog_title=UI_TEXT_FAILED_TITLE)
 
     def _report_download_error(self, message: str, *, dialog_title: str) -> None:
         """下载相关的错误出口：日志 + 状态栏 + 非模态弹窗。"""
@@ -1283,33 +1582,194 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _pause_download(self) -> None:
-        """暂停：不再发起新请求，已发出的请求允许完成。"""
+        """暂停：不再发起新请求，已发出的请求允许完成（Spec §13）。
+
+        界面状态先进入 ``PAUSING``，等到下一个进度帧（说明引擎确实收到了暂停
+        指令、在途请求也已落地）再落成 ``PAUSED``。一上来就显示"已暂停"是
+        在替引擎打包票：那一刻它可能还在跑好几张瓦片。
+        """
         worker = self._download_worker
         if worker is None or not worker.isRunning():
             self.log_panel.append_log("当前没有正在运行的下载任务", "WARNING")
             self.statusBar().showMessage("当前没有正在运行的下载任务", 5000)
+            self._refresh_action_state()
             return
         worker.pause()
-        self.download_panel.set_download_running(True, paused=True)
-        self._status_values["task_status"].setText("已暂停")
+        self._pause_pending = True
+        self._refresh_action_state("正在暂停")
         self._set_current_task_status(DownloadTaskStatus.PAUSED)
-        self.log_panel.append_log("下载已暂停（已发出的请求会正常完成）")
-        self.statusBar().showMessage("下载已暂停")
+        self.log_panel.append_log("正在暂停：已发出的请求会正常完成，然后停下来")
+        self.statusBar().showMessage("正在暂停…")
 
     @Slot()
     def _resume_download(self) -> None:
-        """继续：放行闸门。"""
+        """继续：放行闸门。
+
+        Spec §14 要求恢复的依据是 **TaskStore + MBTiles 已有内容**，而不是内存里
+        的旧状态。因此这里分两种情况：
+
+        - 有一个暂停中的后台线程 → 放行它（同一个任务、同一份内存状态）；
+        - 没有后台线程（程序重启过，或任务是从列表里恢复的）→ 走
+          :meth:`_on_task_resume_requested`，由它从任务记录 + 已有文件重建计划。
+
+        两条路都通向"跳过已有瓦片、只下缺的那些"，因此用户看到的按钮行为一致。
+        """
         worker = self._download_worker
-        if worker is None or not worker.isRunning():
-            self.log_panel.append_log("当前没有可继续的下载任务", "WARNING")
-            self.statusBar().showMessage("当前没有可继续的下载任务", 5000)
+        if worker is not None and worker.isRunning():
+            worker.resume()
+            self._pause_pending = False
+            self._refresh_action_state("下载中")
+            self._set_current_task_status(DownloadTaskStatus.DOWNLOADING)
+            self.log_panel.append_log("下载已继续")
+            self.statusBar().showMessage("下载已继续")
             return
-        worker.resume()
-        self.download_panel.set_download_running(True, paused=False)
-        self._status_values["task_status"].setText("下载中")
-        self._set_current_task_status(DownloadTaskStatus.DOWNLOADING)
-        self.log_panel.append_log("下载已继续")
-        self.statusBar().showMessage("下载已继续")
+
+        task = self._selected_task()
+        if task is not None and task.can_resume:
+            self.log_panel.append_log(
+                f"从任务记录恢复下载：{task.name}（{task.status.display_name}）"
+            )
+            self._on_task_resume_requested(task.id)
+            return
+
+        if task is not None:
+            self.log_panel.append_log(
+                f"任务已完成，无需继续：{task.name}", "WARNING"
+            )
+            self.statusBar().showMessage("该任务已完成", 5000)
+            return
+
+        self.log_panel.append_log("当前没有可继续的下载任务", "WARNING")
+        self.statusBar().showMessage("当前没有可继续的下载任务", 5000)
+        self._refresh_action_state()
+
+    @Slot()
+    def _cancel_download(self) -> None:
+        """取消当前任务（Spec §15）。
+
+        必须先确认：取消是不可逆的**动作**（虽然数据不丢，但这一轮不会再继续跑）。
+        确认后恢复的路径有两条——下载线程在跑就取消它；只是停在扫描/确认框阶段
+        就把计划丢掉、扫描结果作废。
+
+        无论如何都**不删** ``.mbtiles``：那是用户已经花掉的配额与时间。
+        """
+        worker = self._download_worker
+        running = worker is not None and worker.isRunning()
+        scan = self._scan_worker
+        scanning = scan is not None and scan.isRunning()
+        pending = self._pending_plan is not None
+
+        if not (running or scanning or pending):
+            self.log_panel.append_log("当前没有可取消的任务", "WARNING")
+            self.statusBar().showMessage("当前没有可取消的任务", 5000)
+            self._refresh_action_state()
+            return
+
+        self._cancel_dialog = self._ask_confirmation(
+            UI_TEXT_CANCEL_TITLE,
+            UI_TEXT_CANCEL_CONFIRM,
+            on_answered=self._on_cancel_answered,
+            attr="_cancel_dialog",
+            yes_text="取消任务",
+            no_text="继续下载",
+            default_yes=False,
+            log="已弹出取消确认框（已下载的数据会保留）",
+        )
+
+    @Slot(int)
+    def _on_cancel_answered(self, result: int) -> None:
+        """取消确认的答复。"""
+        self._cancel_dialog = None
+        if result != int(QMessageBox.StandardButton.Yes):
+            self.log_panel.append_log("已取消「取消」：任务继续")
+            self.statusBar().showMessage("任务继续", 5000)
+            return
+
+        worker = self._download_worker
+        if worker is not None and worker.isRunning():
+            self.log_panel.append_log("正在取消下载任务…")
+            worker.cancel()
+            # 线程会在收尾（drain 队列 → flush → 关闭数据库）后发出 completed，
+            # 由 _on_download_finished 统一落状态；这里只把界面切到"正在取消"。
+            self._status_values["task_status"].setText("正在取消")
+            self.statusBar().showMessage("正在取消下载任务…")
+            return
+
+        scan = self._scan_worker
+        if scan is not None and scan.isRunning():
+            self.log_panel.append_log("已取消：扫描结果不再使用，未写入任何数据")
+            scan.abandon()
+            self._scan_followup = None
+            self.download_panel.set_scanning(False)
+        else:
+            self.log_panel.append_log("已取消：未写入任何数据")
+
+        plan = self._pending_plan
+        if plan is not None:
+            self._pending_plan = None
+            self._discard_plan(plan)
+        self._refresh_action_state()
+        self.statusBar().showMessage("已取消下载", 5000)
+
+    # ------------------------------------------------------------------ #
+    # 动作状态机（Spec §6）
+    # ------------------------------------------------------------------ #
+    def _selected_task(self):
+        """任务列表里当前选中的任务对象（没有选中时 ``None``）。
+
+        取的是面板**内存中**的那一份，不重读 ``tasks.json``：
+        选中一行不该产生磁盘 IO。
+        """
+        task_id = self.task_panel.selected_task_id()
+        if not task_id:
+            return None
+        return self.task_panel.task(task_id)
+
+    def _refresh_action_state(self, status_text: str | None = None) -> None:
+        """按当前现实重算按钮状态（Spec §6）。
+
+        状态的唯一真相源是"有没有后台线程在跑"，再加上"列表里选中的是哪条任务"。
+        统一在这里算、而不是在每个槽里各写一遍 ``if/else``——六个槽各写一遍的
+        结果是某天只改了五处，而漏掉的那处只在特定顺序下才会显形。
+
+        Args:
+            status_text: 状态行的文案；``None`` 表示用状态本身的名字。
+                暂停瞬间要显示"正在暂停"而不是"已暂停"，所以留了这个出口。
+        """
+        download = self._download_worker
+        if download is not None and download.isRunning():
+            if self._pause_pending:
+                state = UiTaskState.PAUSING
+            elif download.pause_requested:
+                state = UiTaskState.PAUSED
+            else:
+                state = UiTaskState.DOWNLOADING
+        elif self._scan_worker is not None and self._scan_worker.isRunning():
+            state = UiTaskState.SCANNING
+        elif self._pending_plan is not None:
+            # 弹着确认框：这会儿放开「开始下载」就等于绕过那次确认
+            state = UiTaskState.CONFIRMING
+        else:
+            task = self._selected_task()
+            state = UiTaskState.IDLE if task is None else UiTaskState.from_status(task.status)
+
+        self._task_state = state
+        self.download_panel.apply_task_state(state)
+        self.task_progress.set_status(status_text or state.display_name)
+
+    @Slot(str)
+    def _on_task_selection_changed(self, task_id: str) -> None:
+        """任务列表选中项变化（Spec §10）：按钮跟着那条任务的状态走。"""
+        if not task_id:
+            self._refresh_action_state()
+            return
+        task = self.task_panel.task(task_id)
+        if task is not None:
+            self.log_panel.append_log(
+                f"选中任务：{task.name}（{task.status.display_name}，"
+                f"{task.progress_text()}）"
+            )
+        self._refresh_action_state()
 
     def _set_current_task_status(self, status: DownloadTaskStatus) -> None:
         """把"当前任务"的状态**立即**落盘（暂停 / 继续不走节流）。
@@ -1379,11 +1839,13 @@ class MainWindow(QMainWindow):
         参数只来自任务记录（Spec §16）：表单里的范围 / 缩放不参与——否则用户
         改了表单再点「继续」，会以为"改了范围它就会少下一半"，而实际行为完全
         取决于记录（这是对的，但必须让人看得出来）。
+
+        Slice 7 起，"数一数已有多少张"这一步走后台（Spec §11 要求先显示
+        "正在扫描已有瓦片…"，而不是让界面僵在原地）。
         """
-        running = self._download_worker
-        if running is not None and running.isRunning():
-            self.log_panel.append_log("上一次下载尚未结束，已忽略本次请求", "WARNING")
-            self.statusBar().showMessage("当前有下载正在进行，无法同时继续另一个任务", 5000)
+        if self._busy_worker() is not None:
+            self.log_panel.append_log("上一次任务尚未结束，已忽略本次请求", "WARNING")
+            self.statusBar().showMessage("当前有任务正在进行，无法同时继续另一个任务", 5000)
             return
 
         task = self.task_service.get_task(task_id)
@@ -1419,7 +1881,7 @@ class MainWindow(QMainWindow):
         # Slice 6：地图类型与"要不要合成"都从任务记录还原。
         # 老记录（Slice ≤5）没有这两项 —— 那时的产物一定是单层底图，
         # 因此 source_map_type 空串、with_labels 为 False 都是**正确**的还原结果。
-        map_type = MapType.parse(getattr(task, "source_map_type", "")) 
+        map_type = task.source_map_type
         if map_type is None:
             map_type = MapType.from_layer(layer)
         with_labels = bool(getattr(task, "with_labels", False))
@@ -1428,15 +1890,8 @@ class MainWindow(QMainWindow):
         total = task.total_tiles or estimate_tile_count(
             bounds, task.min_zoom, task.max_zoom
         )
-        existing = (
-            count_existing_tiles(path, task.zoom_levels) if path.is_file() else 0
-        )
-        remaining = max(0, total - existing)
 
-        # Spec §16 要求的三行信息：已有多少 / 目标多少 / 还要下多少
         self.log_panel.append_log(f"Resume task: {task.id}")
-        self._log_resume_counts(existing, total)
-
         plan = _DownloadPlan(
             provider=TiandituProvider(token),
             bounds=bounds,
@@ -1457,12 +1912,24 @@ class MainWindow(QMainWindow):
             resume_policy=ResumePolicy(),
             resume_task=task,
             task=task,
-            existing_tiles=existing,
-            effective_tiles=remaining,
+            existing_tiles=0,
+            effective_tiles=total,
             map_type=map_type,
             with_labels=with_labels,
-            requests=remaining * map_type.request_count_per_tile(with_labels),
+            requests=total * map_type.request_count_per_tile(with_labels),
         )
+        # 扫描走后台：它是一次 SQLite 查询，而 Spec §7 禁止在 Qt 主线程里做。
+        # 目标文件不存在时没有任何可扫的东西，直接按"全新下载"往下走。
+        if path.is_file():
+            self._begin_scan(plan, self._on_resume_scan_done, purpose="恢复任务")
+            return
+        self._continue_plan(plan)
+
+    def _on_resume_scan_done(self, plan: _DownloadPlan, scan: ExistingTileScan) -> None:
+        """"从任务列表继续"这条路径的扫描回调（Spec §11）。"""
+        plan = self._apply_scan(plan, scan)
+        # Spec §11 要求把三件事同时说清楚：已有多少 / 目标多少 / 还要下多少
+        self._log_resume_counts(plan.existing_tiles, plan.total)
         self._continue_plan(plan)
 
     @Slot(str)
@@ -1520,14 +1987,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     @Slot()
     def _on_refresh_devices(self) -> None:
-        message = "刷新设备：本版本不执行 adb，设备发现将在 Slice 7 实现"
+        message = UI_TEXT_DEVICE_HINT
         self.log_panel.append_log(message)
         self.device_panel.clear_devices()
         self.statusBar().showMessage(message, 5000)
 
     @Slot()
     def _on_import_to_android(self) -> None:
-        message = "导入到 Android：需要 adb 设备管理，将在 Slice 7 实现"
+        message = UI_TEXT_DEVICE_HINT
         self.log_panel.append_log(message, "WARNING")
         self.statusBar().showMessage(message, 5000)
 
@@ -1541,8 +2008,56 @@ class MainWindow(QMainWindow):
             f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
             "Windows 端生成天地图离线地图包，后续导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 6（底图与中文注记图层合成）。",
+            "当前进度：Slice 7（Windows GUI 下载管理与交互完善）。",
         )
+
+    # ------------------------------------------------------------------ #
+    # 界面偏好（Slice 7，Spec §22）
+    # ------------------------------------------------------------------ #
+    def _apply_preferences(self) -> None:
+        """启动时恢复上次的输出目录 / 地图类型 / 缩放区间 / 窗口位置。
+
+        恢复**逐项独立**：某一项读不出来或已经被删除（比如上次用的盘符没了）
+        只跳过那一项，不影响其余。偏好是锦上添花，不该有任何一条路径让程序起不来。
+
+        Token 不在其中——它从来没被写进偏好里（Spec §9 / §22）。
+        """
+        prefs = self.preferences
+
+        output_dir = prefs.output_dir
+        # 只恢复**仍然存在**的目录。上次用过的临时目录 / 被删掉的外接盘符如果照单
+        # 全收，用户下次点「开始下载」会立刻撞上"输出目录不存在"的校验错误——
+        # 一个自己造出来的、却要用户去收拾的错误。跳过它，退回默认目录即可。
+        if output_dir and os.path.isdir(output_dir):
+            self.download_panel.set_output_dir(output_dir)
+        elif output_dir:
+            self.log_panel.append_log(
+                f"上次的输出目录已不存在，已退回默认目录：{output_dir}", "WARNING"
+            )
+
+        map_type = MapType.parse(prefs.map_type)
+        if map_type is not None:
+            self.download_panel.set_map_type(map_type)
+
+        zoom = prefs.zoom_range
+        if zoom is not None:
+            self.download_panel.set_zoom_range(zoom[0], zoom[1])
+
+        if prefs.restore_geometry(self):
+            self.log_panel.append_log("已恢复上次的窗口位置与大小")
+
+    def _save_preferences(self) -> None:
+        """关闭时记下这次的输出目录 / 地图类型 / 缩放区间 / 窗口位置。
+
+        存的是**当前界面上的值**（而不是下载任务记录里的值）：用户下次打开
+        想看到的是"我上次调到哪儿了"，而不是"上次跑的那个任务用的参数"。
+        """
+        prefs = self.preferences
+        data = self.download_panel.get_form_data()
+        prefs.set_output_dir(str(data["output_dir"]))
+        prefs.set_map_type(data["map_type"].value)
+        prefs.set_zoom_range(data["min_zoom"], data["max_zoom"])
+        prefs.save_geometry(self)
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -1550,14 +2065,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名约定
         """关闭前收尾：确认、取消下载、写盘、等线程结束。
 
-        两件事，顺序不能换：
+        顺序不能换：
 
-        1. **Spec §17**：还有任务在下载时先问一次"退出后任务将暂停，是否退出？"
+        1. **Spec §23**：还有任务在下载时先问一次"退出后任务将暂停，是否退出？"
            用户说"不"就 ``ignore()`` 掉这次关闭，下载继续跑。
-        2. 真正退出时取消后台下载并 ``wait()``。否则 ``QThread`` 可能在运行时被
-           销毁，Qt 会直接中止进程。取消**不会**丢弃已写入的瓦片：service 会
-           drain 写队列、flush 并关闭数据库，磁盘上留下一个可用的（不完整的）
-           ``.mbtiles``；任务记录写成 ``PAUSED``，下次启动可以继续。
+        2. 真正退出时取消后台下载（含扫描线程）并 ``wait()``。否则 ``QThread``
+           可能在运行时被销毁，Qt 会直接中止进程。取消**不会**丢弃已写入的瓦片：
+           service 会 drain 写队列、flush 并关闭数据库，磁盘上留下一个可用的
+           （不完整的）``.mbtiles``；任务记录写成 ``PAUSED``，下次启动可以继续。
+        3. 最后落下界面偏好（Spec §22）。
         """
         # 还开着的非模态弹窗先关掉，避免它们引用着已销毁的父窗口。
         # 关之前要断开 finished 连接：``close()`` 会发出 Rejected，
@@ -1579,6 +2095,16 @@ class MainWindow(QMainWindow):
             self.log_panel.append_log("等待连接测试线程结束…")
             worker.wait(_THREAD_SHUTDOWN_WAIT_MS)
 
+        # 扫描线程还没结束的话，关窗时它可能正在读那个 .mbtiles。
+        # 它只读不写，等它一下比让它握着已析构的父窗口更安全。
+        scan = self._scan_worker
+        if scan is not None and scan.isRunning():
+            self.log_panel.append_log("等待已有瓦片扫描结束…")
+            scan.abandon()
+            scan.wait(_THREAD_SHUTDOWN_WAIT_MS)
+        self._scan_worker = None
+        self._scan_followup = None
+
         if running and download is not None:
             self.log_panel.append_log("任务将暂停：正在收尾并写盘…")
             download.cancel()
@@ -1592,7 +2118,31 @@ class MainWindow(QMainWindow):
                 )
         self._download_worker = None
         self._current_task = None
+
+        if self._exit_confirmed or not running:
+            # 正常退出才写偏好：用户点"取消退出"时窗口还开着，没必要写一遍。
+            self._save_preferences()
+
         super().closeEvent(event)
+
+    def _forget_dialog_on_destroy(self, attr: str, dialog: QMessageBox) -> None:
+        """弹窗被销毁时把持有它的属性清成 ``None``。
+
+        这一条不是洁癖，是**实机验收跑出来的缺陷**：所有非模态弹窗都带
+        ``WA_DeleteOnClose``，用户一点「关闭」（或右上角 X）C++ 对象当场就没了，
+        但 Python 这边的属性还攥着一个壳。之后关主窗口时
+        :meth:`_close_dialogs` 会对这个壳调 ``close()``，抛
+        ``RuntimeError: Internal C++ object already deleted`` ——异常从
+        ``closeEvent`` 里窜出去，``super().closeEvent()`` 根本执行不到，
+        用户看到的现象是「点了 X，窗口关不掉」。
+        """
+        dialog.destroyed.connect(
+            lambda *_args, _attr=attr, _box=dialog: (
+                setattr(self, _attr, None)
+                if getattr(self, _attr, None) is _box
+                else None
+            )
+        )
 
     def _close_dialogs(self) -> None:
         """关掉所有还开着的非模态弹窗（并断开它们的 finished 连接）。"""
@@ -1601,16 +2151,27 @@ class MainWindow(QMainWindow):
             ("_exists_dialog", self._on_existing_file_answered),
             ("_restart_dialog", self._on_restart_answered),
             ("_exit_dialog", self._on_exit_confirmed),
+            ("_cancel_dialog", self._on_cancel_answered),
+            # 完成 / 失败提示没有连接 finished（它们用的是自定义按钮的角色信号），
+            # 但仍要把引用清掉，否则父窗口析构后会留着悬空的 QWidget 指针。
+            ("_complete_dialog", None),
+            ("_failed_dialog", None),
         ):
             dialog = getattr(self, attr)
             if dialog is None:
                 continue
             setattr(self, attr, None)
+            if slot is not None:
+                try:
+                    dialog.finished.disconnect(slot)
+                except (RuntimeError, TypeError):  # pragma: no cover - 本来就没连上
+                    pass
+            # 兜底：万一还有哪条路径漏了销毁回调，也绝不能让异常从 closeEvent
+            # 里抛出去——那会让主窗口关不掉（比丢一个弹窗严重得多）。
             try:
-                dialog.finished.disconnect(slot)
-            except (RuntimeError, TypeError):  # pragma: no cover - 本来就没连上
+                dialog.close()
+            except RuntimeError:  # pragma: no cover - 见 _forget_dialog_on_destroy
                 pass
-            dialog.close()
 
     def _ask_exit_with_running_task(self, event: QCloseEvent) -> None:
         """Spec §17：还有任务在下载 → 先问一次（非模态，理由同大任务确认）。"""

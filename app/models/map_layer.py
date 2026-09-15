@@ -38,12 +38,14 @@ __all__ = [
     "MapType",
     "MAP_TYPE_LAYERS",
     "MAP_TYPE_DISPLAY_NAMES",
+    "MAP_TYPE_SHORT_NAMES",
     "LAYER_DISPLAY_NAMES",
     "COMPOSITION_SINGLE",
     "COMPOSITION_MERGED",
     "COMPOSITION_VALUES",
     "DEFAULT_LAYER_COMBO",
     "composition_for",
+    "describe_map_type",
     "layers_for",
 ]
 
@@ -264,6 +266,13 @@ MAP_TYPE_DISPLAY_NAMES: dict[MapType, str] = {
     MapType.IMAGE: "影像地图",
 }
 
+#: 地图类型的**短**名称。任务列表要给 9 列留位置，「矢量地图 + 中文注记」
+#: 这样的长文案会把窄列挤爆，因此另存一份短的。
+MAP_TYPE_SHORT_NAMES: dict[MapType, str] = {
+    MapType.VECTOR: "矢量",
+    MapType.IMAGE: "影像",
+}
+
 #: 图层类型的可读名称（Slice 2 起保留：日志与连接测试里按"单个图层"展示）
 LAYER_DISPLAY_NAMES: dict[MapLayerType, str] = {
     MapLayerType.VECTOR: "矢量底图",
@@ -299,6 +308,44 @@ DEFAULT_LAYER_COMBO: tuple[MapLayerType, ...] = (
     MapLayerType.VECTOR,
     MapLayerType.VECTOR_LABEL,
 )
+
+
+def describe_map_type(
+    map_type: "MapType | None",
+    with_labels: bool,
+    *,
+    short: bool = False,
+    missing: str = "—",
+) -> str:
+    """把"地图类型 + 是否含中文注记"说成一句人能读的话（Slice 7）。
+
+    这个组合在界面上要出现至少五处（预估结果、任务列表、下载完成弹窗、
+    失败弹窗、启动日志）。每处各拼一遍 ``f"{名字} + 中文注记"`` 的结果是
+    某天改文案时只剩四处跟着改了——而且不会有人发现那处漏的。
+
+    Args:
+        map_type: 地图类型；``None``（老记录认不出来）时返回 ``missing``。
+        with_labels: 是否把中文注记合成进了瓦片。
+        short: ``True`` 时用短名（``矢量+注记``），给窄列用。
+        missing: ``map_type`` 为 ``None`` 时的占位文案。
+
+    Returns:
+        诸如 ``矢量地图 + 中文注记`` / ``影像`` / ``—`` 的字符串。
+
+    >>> describe_map_type(MapType.VECTOR, True)
+    '矢量地图 + 中文注记'
+    >>> describe_map_type(MapType.IMAGE, False, short=True)
+    '影像'
+    >>> describe_map_type(None, True)
+    '—'
+    """
+    if map_type is None:
+        return missing
+    if short:
+        base = MAP_TYPE_SHORT_NAMES[map_type]
+        return f"{base}+注记" if with_labels else base
+    base = MAP_TYPE_DISPLAY_NAMES[map_type]
+    return f"{base} + 中文注记" if with_labels else base
 
 
 def layers_for(

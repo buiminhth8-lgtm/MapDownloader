@@ -1,7 +1,12 @@
 """Android 设备面板。
 
-只做展示与用户动作转发，不调用 adb（Slice 6 起由 ``app.android`` 提供设备列表，
-本面板通过 ``set_devices`` 被动接收数据）。
+只做展示与用户动作转发，**不调用 adb**：设备列表将来由 ``app.android`` 的
+``AdbClient`` 提供，本面板通过 ``set_devices`` 被动接收数据。
+
+设备管理（ADB）不在任何已排期的 Slice 范围内——Spec 明确把 Windows GUI 下载
+管理（Slice 7）与 Android 导入分开，而后者尚未排期。因此本面板目前是"占位但
+如实"的：按钮点了不崩，日志里说明本版本不执行 adb 命令
+（文案见 :data:`app.config.settings.UI_TEXT_DEVICE_HINT`）。
 """
 
 from __future__ import annotations

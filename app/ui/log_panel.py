@@ -14,6 +14,7 @@ from datetime import datetime
 from PySide6.QtCore import Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -23,7 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config.settings import APP_VERSION
+from app.config.settings import (
+    APP_VERSION,
+    UI_TEXT_LOG_AUTOSCROLL,
+    UI_TEXT_LOG_AUTOSCROLL_HINT,
+)
 
 #: 日志区最多保留的行数，防止长时间运行内存膨胀
 MAX_LOG_BLOCKS = 5000
@@ -52,9 +57,16 @@ class LogPanel(QGroupBox):
         self._clear_button = QPushButton("清空", self)
         self._clear_button.setToolTip("清空当前日志显示（不影响控制台输出）")
 
+        #: 「自动滚动」（Spec §18）。默认开着——绝大多数时候用户想看的是最新一行；
+        #: 但翻历史时它会把视口顶走，因此必须能关。
+        self._autoscroll_check = QCheckBox(UI_TEXT_LOG_AUTOSCROLL, self)
+        self._autoscroll_check.setChecked(True)
+        self._autoscroll_check.setToolTip(UI_TEXT_LOG_AUTOSCROLL_HINT)
+
         header = QHBoxLayout()
         header.addWidget(QLabel(f"v{APP_VERSION}", self))
         header.addStretch(1)
+        header.addWidget(self._autoscroll_check)
         header.addWidget(self._clear_button)
 
         layout = QVBoxLayout(self)
@@ -72,15 +84,21 @@ class LogPanel(QGroupBox):
 
         Args:
             message: 日志正文。
-            level: 级别标记，仅用于展示（如 ``INFO`` / ``WARNING``）。
+            level: 级别标记，仅用于展示（如 ``INFO`` / ``WARNING`` / ``ERROR``）。
         """
         timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
         line = f"{timestamp} [{level.upper()}] {message}"
         self._text.appendPlainText(line)
-        # 自动滚动到底部，查看最新日志无需手动下拉
-        self._text.verticalScrollBar().setValue(
-            self._text.verticalScrollBar().maximum()
-        )
+        self._autoscroll_to_bottom()
+
+    @property
+    def autoscroll_enabled(self) -> bool:
+        """是否自动滚动到最新一行。"""
+        return self._autoscroll_check.isChecked()
+
+    def set_autoscroll(self, enabled: bool) -> None:
+        """开关自动滚动（关掉时会保留当前位置）。"""
+        self._autoscroll_check.setChecked(bool(enabled))
 
     @Slot()
     def clear_log(self) -> None:
@@ -96,9 +114,21 @@ class LogPanel(QGroupBox):
         """暴露底层控件，便于测试与后续扩展。"""
         return self._text
 
+    @property
+    def autoscroll_check(self) -> QCheckBox:
+        """暴露「自动滚动」复选框。"""
+        return self._autoscroll_check
+
     # ------------------------------------------------------------------ #
-    # 内部槽
+    # 内部
     # ------------------------------------------------------------------ #
+    def _autoscroll_to_bottom(self) -> None:
+        """滚到最新一行；未开启时什么都不做（让用户安静地翻他的历史）。"""
+        if not self.autoscroll_enabled:
+            return
+        bar = self._text.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     @Slot()
     def _on_clear_clicked(self) -> None:
         self.clear_log()
