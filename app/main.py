@@ -23,6 +23,8 @@ from PySide6.QtWidgets import QApplication
 from app.config.settings import (
     APP_NAME,
     APP_VERSION,
+    HTTP_LIBRARY_LOG_LEVEL,
+    HTTP_LIBRARY_LOGGER_NAMES,
     LOG_DATE_FORMAT,
     LOG_FORMAT,
     LOG_LEVEL,
@@ -39,6 +41,20 @@ STARTUP_MESSAGES: tuple[str, ...] = (
 )
 
 
+def silence_noisy_http_loggers() -> None:
+    """压掉 httpx / httpcore 的 INFO 日志。
+
+    ``httpx`` 每发一个请求都会在 INFO 级别打印完整 URL，而天地图的 URL 里带着
+    ``tk=<Token>``。根 logger 是 INFO 级别，所以不加这一步就等于把 Token 明文
+    打到控制台——违反"日志中禁止出现完整 Token"的硬性约定。
+
+    这里不改根 logger 的级别：本项目自己的 INFO 日志是需要的，
+    只把不必要的第三方噪音关掉。
+    """
+    for name in HTTP_LIBRARY_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(HTTP_LIBRARY_LOG_LEVEL)
+
+
 def setup_logging() -> None:
     """初始化 ``logging``：控制台输出、UTF-8 友好、INFO 级别。
 
@@ -49,6 +65,7 @@ def setup_logging() -> None:
     if stream is None:
         # pythonw.exe 场景下没有标准输出，退化为仅配置根 logger
         logging.basicConfig(level=LOG_LEVEL, force=True)
+        silence_noisy_http_loggers()
         return
 
     encoding = (getattr(stream, "encoding", "") or "").lower()
@@ -63,6 +80,7 @@ def setup_logging() -> None:
     handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     logging.basicConfig(level=LOG_LEVEL, handlers=[handler], force=True)
+    silence_noisy_http_loggers()
 
 
 def install_excepthook() -> None:

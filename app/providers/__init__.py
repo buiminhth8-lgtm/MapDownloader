@@ -9,6 +9,8 @@ Slice 2 已实现（天地图 WMTS Provider 与单瓦片连通性验证）：
 - :func:`~app.providers.tianditu.test_tile` —— 单张瓦片连通性测试（不落盘）
 - :func:`~app.providers.tianditu.is_valid_tile_response` —— 按 magic bytes
   判定 PNG / JPEG，识别 HTML / XML / JSON / 纯文本错误页
+- :func:`~app.providers.tianditu.http_error_message` —— HTTP 状态码语义的唯一
+  出处（连通性测试与批量下载引擎共用，避免各自抄一份映射表）
 - Token 脱敏工具 :func:`~app.providers.tianditu.mask_token` /
   :func:`~app.providers.tianditu.mask_url`
 
@@ -23,6 +25,7 @@ from app.providers.tianditu import (
     TiandituProvider,
     describe_response,
     detect_image_format,
+    http_error_message,
     is_error_content_type,
     is_valid_tile_response,
     mask_token,
@@ -43,6 +46,7 @@ __all__ = [
     "is_error_content_type",
     "describe_response",
     "detect_image_format",
+    "http_error_message",
     "mask_token",
     "mask_url",
     "server_index",

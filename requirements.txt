@@ -9,3 +9,4 @@ httpx>=0.27
 
 # 测试
 pytest>=8.0
+pytest-asyncio>=1.0   # 异步用例（Slice 3 起），asyncio_mode=auto 见 pytest.ini

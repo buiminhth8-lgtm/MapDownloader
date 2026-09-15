@@ -36,6 +36,7 @@ from app.config.settings import (
     DEFAULT_OUTPUT_DIR,
     MAX_SUPPORTED_ZOOM,
     MIN_SUPPORTED_ZOOM,
+    UI_TEXT_DOWNLOAD_TEST_MODE,
 )
 from app.models.map_layer import LAYER_DISPLAY_NAMES, MapLayerType
 
@@ -98,6 +99,7 @@ class DownloadPanel(QGroupBox):
         layout.addWidget(self._area_group)
         layout.addLayout(self._output_form)
         layout.addLayout(self._button_row)
+        layout.addWidget(self._mode_notice)
         layout.addWidget(self._result_group)
         layout.addWidget(self._connection_group)
         layout.addStretch(1)
@@ -204,6 +206,15 @@ class DownloadPanel(QGroupBox):
                 lambda _checked=False, a=action: self.action_requested.emit(a)
             )
             self._button_row.addWidget(button)
+
+        # Slice 3 只是下载引擎验证：瓦片不落盘，UI 必须把这件事说清楚，
+        # 免得用户以为"开始下载"之后磁盘上会出现离线包。
+        self._mode_notice = QLabel(UI_TEXT_DOWNLOAD_TEST_MODE, self)
+        self._mode_notice.setWordWrap(True)
+        self._mode_notice.setStyleSheet("color: palette(mid);")
+
+        # 初始态：暂停 / 继续没有意义，保持禁用
+        self.set_download_running(False)
 
     def _build_result_area(self) -> None:
         """瓦片计算结果区。
@@ -356,6 +367,49 @@ class DownloadPanel(QGroupBox):
     def test_connection_button(self) -> QPushButton:
         """暴露"测试天地图连接"按钮。"""
         return self._test_connection_button
+
+    # ------------------------------------------------------------------ #
+    # 下载状态（Slice 3）
+    # ------------------------------------------------------------------ #
+    def set_download_running(self, running: bool, *, paused: bool = False) -> None:
+        """按下载引擎的当前状态切换按钮可用性。
+
+        规矩很简单：**会造成冲突的动作一律禁用**。
+
+        - 下载中：不能再点「开始下载」（会启动第二个任务），也不能点「计算」/
+          「测试天地图连接」（它们用的是同一份表单，改配置会让正在跑的任务
+          和界面显示对不上）。
+        - 只有跑起来之后「暂停」才有意义；只有暂停之后「继续」才有意义。
+
+        Args:
+            running: 是否有下载在跑。
+            paused: 下载是否处于暂停态（仅 ``running=True`` 时有意义）。
+        """
+        self._start_button.setEnabled(not running)
+        self._calculate_button.setEnabled(not running)
+        self._test_connection_button.setEnabled(not running)
+        self._pause_button.setEnabled(running and not paused)
+        self._resume_button.setEnabled(running and paused)
+
+    @property
+    def mode_notice(self) -> QLabel:
+        """暴露 Slice 3 的"测试模式"提示标签。"""
+        return self._mode_notice
+
+    @property
+    def start_button(self) -> QPushButton:
+        """暴露"开始下载"按钮。"""
+        return self._start_button
+
+    @property
+    def pause_button(self) -> QPushButton:
+        """暴露"暂停"按钮。"""
+        return self._pause_button
+
+    @property
+    def resume_button(self) -> QPushButton:
+        """暴露"继续"按钮。"""
+        return self._resume_button
 
     # ------------------------------------------------------------------ #
     # 内部槽

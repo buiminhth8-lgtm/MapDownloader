@@ -25,16 +25,23 @@ from PySide6.QtWidgets import (
 from app.config.settings import (
     APP_NAME,
     APP_VERSION,
+    DEFAULT_DOWNLOAD_CONCURRENCY,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_REQUESTS_PER_SECOND,
     DEFAULT_TILE_TIMEOUT_SECONDS,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
+    GUI_TEST_MAX_TILES,
+    UI_TEXT_TEST_LIMIT_EXCEEDED,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
 )
+from app.downloader import DownloadProgress, DownloadSummary
 from app.geo import (
     GeoBounds,
     calculate_tile_ranges,
     estimate_size_bytes,
+    estimate_tile_count,
     format_size,
     lat_to_tile_y,
     lon_to_tile_x,
@@ -51,6 +58,7 @@ from app.ui.download_panel import (
     ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
+from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 
 #: 左侧配置列的偏好宽度（实际取值为它与"内容最小宽度"的较大者）
@@ -59,16 +67,19 @@ _LEFT_COLUMN_WIDTH = 460
 #: 右侧设备/日志列的最小宽度
 _RIGHT_COLUMN_WIDTH = 360
 
-#: 关闭窗口时等待后台连通性测试线程退出的上限（毫秒）
+#: 关闭窗口时等待后台线程退出的上限（毫秒）
 _THREAD_SHUTDOWN_WAIT_MS = 3000
 
-#: 各占位动作对应的"未来实现位置"说明
+#: 关闭窗口时等待下载任务取消的上限（毫秒）。超时后就不再等，避免关窗卡死。
+_DOWNLOAD_CANCEL_WAIT_MS = 5000
+
+#: 各动作对应的说明（下载相关动作在 Slice 3 已实现）
 _ACTION_HINTS: dict[str, str] = {
     ACTION_CALCULATE: "按当前范围计算瓦片数量与预估容量（Slice 1 已实现）",
     ACTION_TEST_CONNECTION: "取范围中心点测试单瓦片连通性（Slice 2 已实现）",
-    ACTION_START: "瓦片下载器尚未实现（当前只做单瓦片连通性验证）",
-    ACTION_PAUSE: "暂停 / 继续会随下载器一起实现",
-    ACTION_RESUME: "暂停 / 继续会随下载器一起实现",
+    ACTION_START: "启动批量下载引擎（Slice 3 已实现）",
+    ACTION_PAUSE: "暂停下载：不再发起新请求，已发出的请求允许完成（Slice 3 已实现）",
+    ACTION_RESUME: "继续下载（Slice 3 已实现）",
 }
 
 
@@ -78,8 +89,22 @@ _STATUS_LABELS: dict[str, str] = {
     "current_zoom": "当前 Zoom",
     "tile_total": "瓦片总数",
     "tile_done": "已完成",
+    "tile_succeeded": "成功",
     "tile_failed": "失败数量",
+    "tile_skipped": "已跳过",
     "speed": "下载速度",
+}
+
+#: 下载状态区的初始值
+_STATUS_DEFAULTS: dict[str, str] = {
+    "task_status": "空闲",
+    "current_zoom": "—",
+    "tile_total": "0",
+    "tile_done": "0",
+    "tile_succeeded": "0",
+    "tile_failed": "0",
+    "tile_skipped": "0",
+    "speed": "0 瓦片/秒",
 }
 
 
@@ -104,6 +129,9 @@ class MainWindow(QMainWindow):
         #: 最近一次测试的上下文，用于结果展示：(图层, zoom, x, y, 脱敏 URL)
         self._connection_context: tuple[MapLayerType, int, int, int, str] | None = None
 
+        #: 后台下载线程（同一时刻最多一个）
+        self._download_worker: DownloadWorker | None = None
+
         self._build_menu_bar()
         self._build_central_widget()
         self._build_status_bar()
@@ -126,19 +154,12 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def _build_status_group(self) -> QGroupBox:
-        """下载状态区。Slice 0 全部展示默认值，Slice 2 起由下载器驱动。"""
+        """下载状态区。Slice 0 全部展示默认值，Slice 3 起由下载器驱动。"""
         self._status_values: dict[str, QLabel] = {}
 
         group = QGroupBox("下载状态", self)
         form = QFormLayout(group)
-        for key, text in (
-            ("task_status", "空闲"),
-            ("current_zoom", "—"),
-            ("tile_total", "0"),
-            ("tile_done", "0"),
-            ("tile_failed", "0"),
-            ("speed", "0 瓦片/秒"),
-        ):
+        for key, text in _STATUS_DEFAULTS.items():
             value_label = QLabel(text, group)
             value_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
@@ -217,6 +238,15 @@ class MainWindow(QMainWindow):
             return
         if action == ACTION_TEST_CONNECTION:
             self._start_connection_test()
+            return
+        if action == ACTION_START:
+            self._start_download()
+            return
+        if action == ACTION_PAUSE:
+            self._pause_download()
+            return
+        if action == ACTION_RESUME:
+            self._resume_download()
             return
         self.statusBar().showMessage(hint, 5000)
 
@@ -402,6 +432,202 @@ class MainWindow(QMainWindow):
         self._show_error_dialog("天地图连接测试失败", message)
 
     # ------------------------------------------------------------------ #
+    # 槽：批量下载（Slice 3）
+    # ------------------------------------------------------------------ #
+    @Slot()
+    def _start_download(self) -> None:
+        """启动下载引擎。
+
+        链路：读表单 → ``app.geo`` 统计瓦片数 → 安全上限检查 →
+        ``app.downloader`` 在后台线程跑 → 进度/结果回主线程展示。
+
+        本方法不含任何瓦片公式、URL 拼接或并发逻辑。
+        """
+        running = self._download_worker
+        if running is not None and running.isRunning():
+            self.log_panel.append_log("上一次下载尚未结束，已忽略本次请求", "WARNING")
+            return
+
+        data = self.download_panel.get_form_data()
+        try:
+            provider = TiandituProvider(data["token"])
+            bounds = GeoBounds(
+                west=data["west"],
+                south=data["south"],
+                east=data["east"],
+                north=data["north"],
+            )
+            layer = data["map_type"].base_layer
+            min_zoom = int(data["min_zoom"])
+            max_zoom = int(data["max_zoom"])
+            # 先算总量再决定要不要开工——不能"跑起来才发现太大"
+            total = estimate_tile_count(bounds, min_zoom, max_zoom)
+        except ValueError as exc:
+            self._report_download_error(str(exc), dialog_title="无法开始下载")
+            return
+
+        if total > GUI_TEST_MAX_TILES:
+            self._report_test_limit_exceeded(total)
+            return
+
+        self.download_panel.set_download_running(True, paused=False)
+        self._reset_status_for_download(total)
+        self.log_panel.append_log(
+            f"开始下载：图层={layer.value}，范围={bounds.as_tuple()}，"
+            f"缩放={min_zoom}~{max_zoom}，瓦片总数={total:,}，"
+            f"并发={DEFAULT_DOWNLOAD_CONCURRENCY}，"
+            f"限速={DEFAULT_REQUESTS_PER_SECOND:g} 请求/秒，"
+            f"超时={DEFAULT_TILE_TIMEOUT_SECONDS:g}s，"
+            f"最大尝试={DEFAULT_MAX_RETRIES} 次"
+        )
+        self.log_panel.append_log(
+            f"注意：本 Slice 为下载引擎测试模式，共 {total:,} 张瓦片"
+            f"（上限 {GUI_TEST_MAX_TILES} 张），瓦片不会写入磁盘。",
+            "WARNING",
+        )
+        self.statusBar().showMessage(f"下载中… 0/{total:,}")
+
+        worker = DownloadWorker(
+            provider,
+            bounds,
+            min_zoom,
+            max_zoom,
+            layer,
+            concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
+            timeout=DEFAULT_TILE_TIMEOUT_SECONDS,
+            parent=self,
+        )
+        worker.progress_changed.connect(self._on_download_progress)
+        worker.completed.connect(self._on_download_finished)
+        worker.failed.connect(self._on_download_failed)
+        self._download_worker = worker
+        worker.start()
+
+    def _report_test_limit_exceeded(self, total: int) -> None:
+        """区域超出 Slice 3 的测试上限：明确告知，**不做静默截断**。"""
+        self.log_panel.append_log(
+            f"下载未开始：当前范围共 {total:,} 张瓦片，"
+            f"超过 Slice 3 测试上限 {GUI_TEST_MAX_TILES} 张。",
+            "ERROR",
+        )
+        for line in UI_TEXT_TEST_LIMIT_EXCEEDED.splitlines():
+            self.log_panel.append_log(line)
+        self.statusBar().showMessage("下载未开始：超出测试上限", 8000)
+        self._show_error_dialog("超出测试上限", UI_TEXT_TEST_LIMIT_EXCEEDED)
+
+    def _reset_status_for_download(self, total: int) -> None:
+        """开工前把状态区清成"从零开始"，避免上一轮的残留数字造成误读。"""
+        self._status_values["task_status"].setText("下载中")
+        self._status_values["current_zoom"].setText("—")
+        self._status_values["tile_total"].setText(f"{total:,}")
+        self._status_values["tile_done"].setText("0")
+        self._status_values["tile_succeeded"].setText("0")
+        self._status_values["tile_failed"].setText("0")
+        self._status_values["tile_skipped"].setText("0")
+        self._status_values["speed"].setText("0 瓦片/秒")
+        self.progress_bar.setValue(0)
+
+    @Slot(object)
+    def _on_download_progress(self, progress: DownloadProgress) -> None:
+        """后台进度更新（已由引擎节流到约 6 次/秒），回主线程刷界面。"""
+        values = self._status_values
+        values["tile_total"].setText(f"{progress.total:,}")
+        values["tile_done"].setText(f"{progress.completed:,}")
+        values["tile_succeeded"].setText(f"{progress.succeeded:,}")
+        values["tile_failed"].setText(f"{progress.failed:,}")
+        values["tile_skipped"].setText(f"{progress.skipped:,}")
+        values["speed"].setText(f"{progress.tiles_per_second:.1f} 瓦片/秒")
+        if progress.current_zoom is not None:
+            values["current_zoom"].setText(str(progress.current_zoom))
+        self.progress_bar.setValue(int(progress.percent))
+        self.statusBar().showMessage(
+            f"下载中… {progress.completed:,}/{progress.total:,}"
+            f"（成功 {progress.succeeded:,} · 失败 {progress.failed:,}）"
+        )
+
+    @Slot(object)
+    def _on_download_finished(self, summary: DownloadSummary) -> None:
+        """下载结束，展示汇总并恢复按钮状态。"""
+        self._download_worker = None
+        self.download_panel.set_download_running(False)
+
+        status_text = "已取消" if summary.cancelled else (
+            "已完成" if summary.failed == 0 else "已完成（有失败）"
+        )
+        self._status_values["task_status"].setText(status_text)
+        self.progress_bar.setValue(int(min(100.0, summary.total and
+                                            summary.completed / summary.total * 100.0 or 0)))
+
+        for line in summary.as_lines():
+            self.log_panel.append_log(line)
+
+        if summary.cancelled:
+            self.log_panel.append_log(
+                f"下载已取消：已下载 {summary.completed:,} 张，"
+                f"跳过 {summary.skipped:,} 张（本 Slice 不支持断点续传，不会补下）",
+                "WARNING",
+            )
+            self.statusBar().showMessage("下载已取消", 8000)
+            return
+
+        level = "INFO" if summary.failed == 0 else "WARNING"
+        self.log_panel.append_log(
+            f"下载完成：成功 {summary.succeeded:,} 张，失败 {summary.failed:,} 张，"
+            f"共 {format_size(summary.bytes_downloaded)}，"
+            f"耗时 {summary.duration_seconds:.2f}s，"
+            f"平均 {summary.average_tiles_per_second:.1f} 瓦片/秒。"
+            "（瓦片未落盘，Slice 4 起写入 MBTiles）",
+            level,
+        )
+        self.statusBar().showMessage(
+            f"下载完成：成功 {summary.succeeded:,} · 失败 {summary.failed:,}"
+            f" · {summary.duration_seconds:.2f}s",
+            10000,
+        )
+
+    @Slot(str)
+    def _on_download_failed(self, message: str) -> None:
+        """下载线程异常终止（不应发生，但必须有出口）。"""
+        self._download_worker = None
+        self.download_panel.set_download_running(False)
+        self._status_values["task_status"].setText("失败")
+        self._report_download_error(message, dialog_title="下载失败")
+
+    def _report_download_error(self, message: str, *, dialog_title: str) -> None:
+        """下载相关的错误出口：日志 + 状态栏 + 非模态弹窗。"""
+        self.log_panel.append_log(f"{dialog_title}：{message}", "ERROR")
+        self.statusBar().showMessage(f"{dialog_title}：{message}", 8000)
+        self._show_error_dialog(dialog_title, message)
+
+    @Slot()
+    def _pause_download(self) -> None:
+        """暂停：不再发起新请求，已发出的请求允许完成。"""
+        worker = self._download_worker
+        if worker is None or not worker.isRunning():
+            self.log_panel.append_log("当前没有正在运行的下载任务", "WARNING")
+            self.statusBar().showMessage("当前没有正在运行的下载任务", 5000)
+            return
+        worker.pause()
+        self.download_panel.set_download_running(True, paused=True)
+        self._status_values["task_status"].setText("已暂停")
+        self.log_panel.append_log("下载已暂停（已发出的请求会正常完成）")
+        self.statusBar().showMessage("下载已暂停")
+
+    @Slot()
+    def _resume_download(self) -> None:
+        """继续：放行闸门。"""
+        worker = self._download_worker
+        if worker is None or not worker.isRunning():
+            self.log_panel.append_log("当前没有可继续的下载任务", "WARNING")
+            self.statusBar().showMessage("当前没有可继续的下载任务", 5000)
+            return
+        worker.resume()
+        self.download_panel.set_download_running(True, paused=False)
+        self._status_values["task_status"].setText("下载中")
+        self.log_panel.append_log("下载已继续")
+        self.statusBar().showMessage("下载已继续")
+
+    # ------------------------------------------------------------------ #
     # 槽：设备动作
     # ------------------------------------------------------------------ #
     @Slot()
@@ -427,14 +653,14 @@ class MainWindow(QMainWindow):
             f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
             "Windows 端生成天地图离线地图包，后续导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 2（天地图 Provider 与单瓦片连通性验证）。",
+            "当前进度：Slice 3（异步瓦片下载引擎；瓦片暂不落盘）。",
         )
 
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名约定
-        """关闭前等待后台测试线程结束。
+        """关闭前取消下载并等待后台线程结束。
 
         否则 ``QThread`` 可能仍在运行时被销毁，Qt 会直接中止进程。
         """
@@ -442,4 +668,15 @@ class MainWindow(QMainWindow):
         if worker is not None and worker.isRunning():
             self.log_panel.append_log("等待连接测试线程结束…")
             worker.wait(_THREAD_SHUTDOWN_WAIT_MS)
+
+        download = self._download_worker
+        if download is not None and download.isRunning():
+            self.log_panel.append_log("正在取消下载任务并等待后台线程结束…")
+            download.cancel()
+            if not download.wait(_DOWNLOAD_CANCEL_WAIT_MS):
+                # 极端情况下（网络卡住）不能再等，否则关窗会一直挂住。
+                self.log_panel.append_log(
+                    "后台下载线程未能及时结束，已放弃等待", "WARNING"
+                )
+        self._download_worker = None
         super().closeEvent(event)

@@ -88,6 +88,54 @@ HTTP_USER_AGENT: str = f"{ORG_NAME}/{APP_VERSION}"
 MAX_TILE_RESPONSE_BYTES: int = 4 * 1024 * 1024
 
 # --------------------------------------------------------------------------- #
+# 批量下载引擎（Slice 3）
+# --------------------------------------------------------------------------- #
+#: 每个瓦片的请求超时（秒）。
+#:
+#: 刻意与 ``DEFAULT_TILE_TIMEOUT_SECONDS`` 分开：那个是"人点一下等结果"的
+#: 单瓦片连通性测试超时，这个是批量下载时单请求的上限，二者会随使用场景分叉
+#: （批量场景更希望快速失败并交给重试，而不是长时间挂住一个 worker）。
+DEFAULT_REQUEST_TIMEOUT: float = 10.0
+
+#: 默认并发 worker 数
+DEFAULT_DOWNLOAD_CONCURRENCY: int = 6
+
+#: 并发下限与上限。上限存在的理由是"不要打爆服务端"——
+#: 天地图对未授权/超额的调用会直接拒绝，过高的并发只会换来一片失败。
+MIN_DOWNLOAD_CONCURRENCY: int = 1
+MAX_DOWNLOAD_CONCURRENCY: int = 16
+
+#: 默认最大尝试次数（含首次请求）。``3`` 表示最多重试 2 次。
+DEFAULT_MAX_RETRIES: int = 3
+
+#: 重试退避：``base * 2**(attempt-1)``，并以 ``max`` 封顶
+DEFAULT_RETRY_BASE_DELAY_SECONDS: float = 0.5
+DEFAULT_RETRY_MAX_DELAY_SECONDS: float = 5.0
+
+#: 默认请求速率上限（每秒请求数）。``<= 0`` 表示关闭限速。
+DEFAULT_REQUESTS_PER_SECOND: float = 8.0
+
+#: 进度回调的最小间隔（秒）。约 6.7 次/秒，落在"5~10 次/秒"的建议区间内，
+#: 避免高频 Signal 把 PySide6 事件队列压垮。
+PROGRESS_EMIT_INTERVAL_SECONDS: float = 0.15
+
+#: 计算 tiles/s 的滑动窗口长度（秒）
+PROGRESS_SPEED_WINDOW_SECONDS: float = 3.0
+
+#: 队列容量倍数：``queue_maxsize = concurrency * QUEUE_CAPACITY_FACTOR``。
+#: 队列必须是有界的——否则生产端会抢在消费端前面把整个瓦片列表塞进内存，
+#: 与"边下载边消费"的目标相悖。
+QUEUE_CAPACITY_FACTOR: int = 4
+
+#: Slice 3 的 GUI 下载**测试模式**安全上限。
+#: 本 Slice 不落盘，超大区域下载没有意义且会白耗配额；
+#: 超限时明确提示用户而不是静默截断。
+GUI_TEST_MAX_TILES: int = 500
+
+#: 取消 / 暂停时最多在日志里逐条打印多少个失败瓦片（其余只计数）
+MAX_LOGGED_TILE_FAILURES: int = 3
+
+# --------------------------------------------------------------------------- #
 # 默认输出
 # --------------------------------------------------------------------------- #
 DEFAULT_OUTPUT_DIR: Path = Path.home() / "MapDownloader" / "output"
@@ -99,8 +147,28 @@ LOG_LEVEL: int = 20  # logging.INFO，避免在此 import logging 造成额外�
 LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
 
+#: 需要单独压级别的第三方日志器。
+#:
+#: ``httpx`` 在 INFO 级别会把**完整请求 URL** 打进日志，而天地图的 URL 里带着
+#: ``tk=`` 参数——等于把 Token 明文写进控制台。这属于硬性禁止项，因此这些
+#: 日志器一律压到 WARNING（只在真正出问题时才出声）。
+HTTP_LIBRARY_LOGGER_NAMES: tuple[str, ...] = ("httpx", "httpcore")
+HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
+
 # --------------------------------------------------------------------------- #
 # UI 文案（集中管理，便于后续国际化）
 # --------------------------------------------------------------------------- #
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
+
+#: Slice 3 下载测试模式的界面提示（瓦片只走回调，不落盘）
+UI_TEXT_DOWNLOAD_TEST_MODE: str = (
+    "当前为下载引擎测试模式：瓦片仅通过回调消费，不写入磁盘；Slice 4 起写入 MBTiles"
+)
+
+#: 区域超出测试上限时的提示（明确告知，不做静默截断）
+UI_TEXT_TEST_LIMIT_EXCEEDED: str = (
+    "当前 Slice 3 为下载引擎验证模式，\n"
+    f"最多允许测试 {GUI_TEST_MAX_TILES} 张瓦片。\n"
+    "Slice 4 接入 MBTiles 后再开放完整任务。"
+)

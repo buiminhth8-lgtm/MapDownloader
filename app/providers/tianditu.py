@@ -61,6 +61,7 @@ __all__ = [
     "detect_image_format",
     "is_valid_tile_response",
     "describe_response",
+    "http_error_message",
     "test_tile",
 ]
 
@@ -436,16 +437,26 @@ class TiandituProvider:
 
 
 # --------------------------------------------------------------------------- #
-# 单瓦片连通性测试
+# HTTP 状态码 -> 人话
 # --------------------------------------------------------------------------- #
-def _http_error_message(status_code: int) -> str:
-    """把 HTTP 状态码翻译成带排查提示的错误文案。"""
+def http_error_message(status_code: int) -> str:
+    """把 HTTP 状态码翻译成带排查提示的错误文案。
+
+    公开导出是因为它是"状态码语义"的唯一出处：单瓦片连通性测试（本模块）与
+    批量下载引擎（``app.downloader``）都依赖它，不允许各自再抄一份映射表。
+
+    >>> http_error_message(403)
+    'HTTP 403 — Token 可能无效，或该服务未在控制台开通'
+    """
     hint = _HTTP_STATUS_HINTS.get(status_code)
     if hint is None:
         hint = "服务端错误" if status_code >= 500 else "请求被拒绝"
     return f"HTTP {status_code} — {hint}"
 
 
+# --------------------------------------------------------------------------- #
+# 单瓦片连通性测试
+# --------------------------------------------------------------------------- #
 def _build_client(
     transport: httpx.BaseTransport | None, timeout: float
 ) -> httpx.Client:
@@ -532,7 +543,7 @@ def test_tile(
         )
 
     if status_code != 200:
-        return _failure(_http_error_message(status_code))
+        return _failure(http_error_message(status_code))
     if content_length == 0:
         return _failure(_ERROR_EMPTY_RESPONSE)
     if content_length > MAX_TILE_RESPONSE_BYTES:
