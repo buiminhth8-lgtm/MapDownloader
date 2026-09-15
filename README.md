@@ -164,7 +164,12 @@ python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 ```bash
 python scripts/capture_ui.py                   # 渲染主窗口为 ui_main_window.png
 python scripts/capture_ui.py --offscreen       # 无显示环境（离屏渲染）
+python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 ```
+
+`--with-tasks` 会预置几条不同状态的任务记录，用于留档 Slice 5 的「下载任务」面板
+（见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
+不会碰到你真实的 `data/tasks.json`。
 
 ## 目录结构
 

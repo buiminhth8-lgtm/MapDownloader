@@ -43,7 +43,67 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="使用 Qt offscreen 平台插件（适合无显示环境；中文字体可能缺失）",
     )
+    parser.add_argument(
+        "--with-tasks",
+        action="store_true",
+        help="预置几条任务记录，用于留档「下载任务」面板（Slice 5）",
+    )
     return parser.parse_args(argv)
+
+
+def _seeded_task_service():
+    """构造一个指向临时文件、并预置了若干条任务记录的 TaskService。
+
+    用它而不是默认的 ``~/MapDownloader/data/tasks.json``，是为了让截图脚本
+    的副作用落在临时目录里——**绝不污染用户真实的任务记录**。
+    """
+    import tempfile
+    from pathlib import Path as _Path
+    from types import SimpleNamespace
+
+    from app.geo import GeoBounds
+    from app.models import DownloadTaskStatus, MapLayerType
+    from app.tasks import TaskService, TaskStore
+
+    store = TaskStore(_Path(tempfile.mkdtemp(prefix="capture-ui-")) / "tasks.json")
+    service = TaskService(store)
+
+    #: (名称, 范围, 缩放区间, 状态, 总数, 已完成, 失败)
+    #: 覆盖面板上要展示的几种状态；「已完成」那条刻意让 completed == total。
+    seeds = [
+        ("beijing", GeoBounds(116.0, 39.0, 117.0, 40.0), (8, 17),
+         DownloadTaskStatus.DOWNLOADING, 19_640, 9_820, 3),
+        ("shanghai", GeoBounds(121.0, 30.9, 121.6, 31.4), (10, 16),
+         DownloadTaskStatus.PAUSED, 12_480, 4_120, 0),
+        ("hangzhou", GeoBounds(119.9, 30.1, 120.4, 30.5), (9, 15),
+         DownloadTaskStatus.COMPLETED, 6_204, 6_204, 0),
+    ]
+    for name, bounds, (lo, hi), status, total, done, failed in seeds:
+        task = service.create_task(
+            name=name,
+            bounds=bounds,
+            min_zoom=lo,
+            max_zoom=hi,
+            map_layer=MapLayerType.VECTOR,
+            output_path=_Path("/maps") / f"{name}.mbtiles",
+            total_tiles=total,
+        )
+        # 必须走 apply_progress()：``task.progress`` 只是 Slice 0 的占位快照，
+        # 面板上显示的是 total_tiles/completed_tiles 那组扁平计数器（``percent``
+        # 就是从 completed_tiles 算的）。直接改 task.progress 不会影响展示。
+        task.apply_progress(
+            SimpleNamespace(
+                total=total,
+                completed=done,
+                succeeded=done - failed,
+                failed=failed,
+                skipped=0,
+            )
+        )
+        # 再落状态：set_status() 会把当前进度一起写盘。若顺序反过来，
+        # 面板重新 list_tasks() 读到的仍是旧值。
+        service.set_status(task, status)
+    return service
 
 
 def pump(app: "QApplication", times: int = 3) -> None:
@@ -71,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
     app = QApplication(sys.argv[:1])
 
-    window = MainWindow()
+    window = MainWindow(
+        task_service=_seeded_task_service() if args.with_tasks else None
+    )
     window.show()
     pump(app)
 
