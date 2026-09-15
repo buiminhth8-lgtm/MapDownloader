@@ -1,6 +1,6 @@
 """Android 设备面板。
 
-只做展示与用户动作转发，不调用 adb（Slice 4 起由 ``app.android`` 提供设备列表，
+只做展示与用户动作转发，不调用 adb（Slice 6 起由 ``app.android`` 提供设备列表，
 本面板通过 ``set_devices`` 被动接收数据）。
 """
 
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config.settings import UI_TEXT_DEVICE_EMPTY
+from app.config.settings import UI_TEXT_DEVICE_EMPTY, UI_TEXT_DEVICE_HINT
 from app.models.device import Device
 
 #: 设备列表最小高度，保证空状态下也有明显区域
@@ -83,7 +83,7 @@ class DevicePanel(QGroupBox):
         self._list.clear()
         placeholder = QListWidgetItem(UI_TEXT_DEVICE_EMPTY, self._list)
         placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-        self._hint_label.setText("Slice 0 不执行 adb 命令，设备列表待 Slice 4 接入")
+        self._hint_label.setText(UI_TEXT_DEVICE_HINT)
 
     def set_busy(self, busy: bool) -> None:
         """下载/导入进行中时禁用操作按钮，避免重复触发。"""

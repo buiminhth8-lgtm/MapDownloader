@@ -248,6 +248,10 @@ HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 
+#: 设备区占位说明。ADB 属于 Slice 6；在此之前界面必须**如实**说明"点了不会执行 adb"，
+#: 不能让人误以为按钮坏了。文案与 ``main_window`` 里的动作提示保持一致（都写 Slice 6）。
+UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理将在 Slice 6 实现"
+
 #: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）
 UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
     "下载结果将写入 MBTiles 单文件（<地图名称>.mbtiles），可直接供 osmdroid 读取"

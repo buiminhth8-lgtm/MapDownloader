@@ -1,6 +1,6 @@
 """Android 设备模型。
 
-字段与 ``adb devices -l`` 的输出维度对齐，便于 Slice 4 直接映射。
+字段与 ``adb devices -l`` 的输出维度对齐，便于 Slice 6 直接映射。
 本模块不执行任何 adb 命令。
 """
 
