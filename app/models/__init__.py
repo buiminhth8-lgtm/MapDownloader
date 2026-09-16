@@ -6,7 +6,7 @@
 依赖方向：``models`` 只依赖 ``config``，UI 与业务层反向依赖本层。
 """
 
-from app.models.device import Device, DeviceState
+from app.models.device import AndroidDevice, Device, DeviceState
 from app.models.download_task import (
     DownloadProgress,
     DownloadTask,
@@ -55,5 +55,7 @@ __all__ = [
     "new_package_id",
     # device
     "Device",
+    # Slice 10：Spec §5 的叫法，与 Device 是同一个类
+    "AndroidDevice",
     "DeviceState",
 ]

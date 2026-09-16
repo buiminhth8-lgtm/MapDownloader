@@ -21,7 +21,7 @@ import httpx
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEvent, Qt, QThread
-from PySide6.QtWidgets import QLabel, QMessageBox
+from PySide6.QtWidgets import QFileDialog, QLabel, QMessageBox
 
 import app.ui.download_worker as download_worker_module
 import app.ui.main_window as main_window_module
@@ -46,7 +46,7 @@ from app.models import (
     describe_map_type,
 )
 from app.providers import PNG_SIGNATURE, TiandituProvider
-from app.services import build_output_path
+from app.services import AndroidTransferService, build_output_path
 from app.tasks import TaskService, TaskStore
 from app.ui.connection_check import ConnectionTestWorker
 from app.ui.device_panel import DevicePanel
@@ -70,6 +70,7 @@ from app.ui.package_dialog import (
     PackageValidateWorker,
 )
 from app.ui.validation import auto_map_name
+from tests.android_fakes import FakeAdbClient
 
 #: 假 Token（禁止替换为真实密钥）
 FAKE_TOKEN = "abcdefghijklmn"
@@ -107,16 +108,61 @@ def window(qapp, tasks_file: Path, preferences) -> MainWindow:
     """
     win = MainWindow(task_service=TaskService(TaskStore(tasks_file)), preferences=preferences)
     yield win
-    # 用例可能留下正在跑的下载。这里把"退出确认"直接跳过（那是有头交互的产物，
-    # 不该由夹具去点按钮），改为取消并等线程回收——QThread 在运行时被销毁
-    # 会让 Qt 直接中止进程。
+    _shutdown_window(win)
+
+
+def _shutdown_window(win: MainWindow) -> None:
+    """收掉一个用例的主窗口。
+
+    用例可能留下正在跑的后台线程（下载 / 设备刷新 / 传输）。这里把"退出确认"
+    直接跳过（那是有头交互的产物，不该由夹具去点按钮），改为等待线程回收——
+    QThread 在运行时被销毁会让 Qt 直接中止进程。
+    """
     win._exit_confirmed = True
-    worker = win._download_worker
-    if worker is not None and worker.isRunning():
-        worker.cancel()
-        worker.wait(10_000)
+    for getter in (
+        lambda: win._download_worker,
+        lambda: win._device_worker,
+        lambda: win._transfer_worker,
+        lambda: win._package_check_worker,
+    ):
+        worker = getter()
+        if worker is not None and worker.isRunning():
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            worker.wait(10_000)
     win.close()
     win.deleteLater()
+
+
+@pytest.fixture()
+def android_window_factory(qapp, tasks_file: Path, preferences):
+    """造一个接了**假 adb** 的主窗口（Slice 10）。
+
+    为什么不用上面那个 ``window``：真实实现会去起 ``adb`` 进程探测设备。
+    测试不该依赖"本机装没装 Android SDK"——一台干净的 CI 机器上也要能跑。
+    注入 ``FakeAdbClient`` 之后，设备区可以被真的点下去（下拉框会填进三台
+    真机格式的设备），而一个进程都不会起。
+
+    Returns:
+        工厂函数；``**client_kwargs`` 透传给 ``FakeAdbClient``
+        （例如 ``adb_available=False`` 造出"没装 adb"）。
+    """
+    windows: list[MainWindow] = []
+
+    def factory(**client_kwargs) -> MainWindow:
+        service = AndroidTransferService(client=FakeAdbClient(**client_kwargs))
+        win = MainWindow(
+            task_service=TaskService(TaskStore(tasks_file)),
+            preferences=preferences,
+            android_service=service,
+        )
+        windows.append(win)
+        return win
+
+    yield factory
+    for win in windows:
+        _shutdown_window(win)
 
 
 @pytest.fixture()
@@ -184,6 +230,15 @@ def _wait_for_worker(window: MainWindow, qapp) -> None:
         qapp.processEvents()
 
 
+def _wait_for_device_worker(window: MainWindow, qapp) -> None:
+    """等待设备刷新线程结束并把结果送回主线程（Slice 10）。"""
+    worker = window._device_worker
+    assert worker is not None, "没有起刷新线程"
+    assert worker.wait(10_000) is True
+    for _ in range(5):
+        qapp.processEvents()
+
+
 # --------------------------------------------------------------------------- #
 # 装配
 # --------------------------------------------------------------------------- #
@@ -236,9 +291,56 @@ def test_status_group_shows_defaults(window: MainWindow) -> None:
 
 
 def test_device_panel_empty_state(window: MainWindow) -> None:
-    lst = window.device_panel.device_list
-    assert lst.count() == 1
-    assert lst.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
+    """Slice 10：设备区从 ``QListWidget`` 占位换成"下拉框 + 详情"。
+
+    空状态仍然要有：没有设备时下拉框里是一句占位文案，且**不是**空的——
+    一个空下拉框会被当成"控件坏了"。
+    """
+    panel = window.device_panel
+    assert panel.device_combo.count() == 1
+    assert panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
+    assert panel.device_combo.isEnabled() is False
+    assert panel.selected_serial == ""
+    assert panel.selected_device() is None
+
+
+def test_transfer_dialog_handles_are_initialised(window: MainWindow) -> None:
+    """两个确认框的按钮引用在装配时就有默认值（``None``）。
+
+    它们只在弹窗被创建时才赋值。读一个**不存在**的属性会 ``AttributeError``，
+    而这个读取动作发生在"用户点完 [选择地图包]、传输还没开始"的时刻——
+    抛在 Qt 槽里就会被静默吞掉。
+    """
+    assert window._transfer_confirm_dialog is None
+    assert window._transfer_exists_dialog is None
+    assert window._transfer_confirm_start is None
+    assert window._transfer_overwrite_button is None
+
+
+def test_device_area_fits_the_panel_at_default_size(window: MainWindow, qapp) -> None:
+    """默认窗口下设备区容得下设备面板（不然用户要滚一下才能看到 [传输到设备]）。
+
+    **必须 ``show()``**：不显示的窗口不会跑布局，``viewport().height()`` 是个
+    没有意义的残值（28px），断言会以"面板太高了"的形式误报。
+
+    注意这是**平台相关**的下界：``offscreen`` 的字体比真机小，所以这条过了不等于
+    真机过了。真实字体 / DPI 下的同义断言在 ``scripts/verify_slice10_android.py``
+    的场景 E 里（那里量到 430px，也正是右列配比取 450 的依据）。
+    """
+    from app.ui.main_window import _RIGHT_COLUMN_SIZES
+
+    window.show()
+    for _ in range(8):
+        qapp.processEvents()
+
+    panel = window.device_panel
+    scroll = window._device_scroll
+
+    assert panel.sizeHint().height() > 0
+    assert scroll.verticalScrollBar().maximum() == 0
+    assert scroll.horizontalScrollBar().maximum() == 0
+    # 右列给设备区的初始高度，要留得下滚动区的边框
+    assert panel.sizeHint().height() + 8 <= _RIGHT_COLUMN_SIZES[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -345,14 +447,106 @@ def test_calculate_logs_form_snapshot(window: MainWindow) -> None:
 
 
 def test_device_buttons_do_not_crash(window: MainWindow) -> None:
-    refresh_button, import_button = window.device_panel.buttons
-    refresh_button.click()
-    import_button.click()
-    text = window.log_panel.to_text()
-    # 设备管理（ADB）不属于本工具的任何 Slice：本 Slice 只要"点了不崩 + 如实说明"。
-    # 文案由 settings 统一给出，UI 不得自己写死（否则改一处漏一处）。
-    assert settings.UI_TEXT_DEVICE_HINT in text
-    assert "adb" in text
+    """没有设备时：[刷新设备] 必须能点，[传输到设备] 必须拦得住（Spec §8）。
+
+    ``[刷新设备]`` 是发现 ADB 的唯一入口，装配时被禁用就等于永远灰着——
+    这个断言守的就是那个"把门锁上再找钥匙"的坑。
+    """
+    panel = window.device_panel
+    assert panel.refresh_button.isEnabled() is True
+    assert panel.transfer_button.isEnabled() is False
+
+    # 第二道：按钮禁用只是界面层的拦，槽本身也要拦（信号可能从别处触发）
+    window._on_transfer_to_android()
+    assert settings.UI_TEXT_TRANSFER_NEED_DEVICE in window.log_panel.to_text()
+    assert window._transfer_worker is None
+    assert panel.progress_bar.value() == 0
+
+
+def test_choose_package_slot_sets_the_directory(android_window_factory, qapp, monkeypatch) -> None:
+    """[选择地图包] 槽真的把选中的目录设上了，而且**不抛**（Spec §12）。
+
+    这条守的是一个实机才现形的 bug：槽里写的是
+    ``self.download_panel.output_dir()``，而 ``DownloadPanel`` **没有**这个方法
+    ——点击时抛 ``AttributeError``，Qt 把槽里的异常吞掉，用户看到的是
+    "按钮点了没反应"（不报错、不弹窗、什么都不发生）。
+    验收脚本靠"点一下看目录有没有设上"抓到它，这里把它固化成常驻守卫。
+    """
+    window = android_window_factory()
+    panel = window.device_panel
+    calls: list[tuple] = []
+
+    def _fake(*args, **kwargs):
+        calls.append(args)
+        return "D:/maps/packages/beijing"
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(_fake))
+    panel.choose_package_button.click()
+
+    assert calls, "[选择地图包] 没有弹出目录选择框"
+    assert panel.package_dir == "D:/maps/packages/beijing"
+    # 起点目录取自下载输出目录（用户的地图包一般就在旁边）
+    assert str(calls[0][2]) == window.download_panel.output_edit.text().strip()
+
+
+def test_choose_package_cancelled_changes_nothing(android_window_factory, monkeypatch) -> None:
+    """用户点了取消 → 什么都不改（尤其不该把已有的包清掉）。"""
+    window = android_window_factory()
+    panel = window.device_panel
+    panel.set_package_dir("D:/maps/packages/keepme")
+
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: "")
+    )
+    panel.choose_package_button.click()
+
+    assert panel.package_dir == "D:/maps/packages/keepme"
+
+
+def test_refresh_devices_fills_the_combo(android_window_factory, qapp) -> None:
+    """[刷新设备] 走完一遍后台探测，把三台设备（含未授权 / 离线）显示出来。"""
+    window = android_window_factory()
+    panel = window.device_panel
+
+    panel.refresh_button.click()
+    _wait_for_device_worker(window, qapp)
+
+    assert panel.device_combo.count() == 3
+    assert panel.device_combo.isEnabled() is True
+    assert panel.selected_serial == "ABC123"
+    assert panel.selected_device() is not None
+    assert "已发现 3 台设备" in window.log_panel.to_text()
+    # ADB 可用时不该出现"未检测到 ADB"的提示
+    assert settings.UI_TEXT_DEVICE_ADB_MISSING not in window.log_panel.to_text()
+
+
+def test_refresh_devices_reports_missing_adb(android_window_factory, qapp) -> None:
+    """没装 adb：如实说明 + 告诉用户怎么办，而不是静默地显示"没有设备"（Spec §10）。"""
+    window = android_window_factory(adb_available=False)
+    panel = window.device_panel
+
+    panel.refresh_button.click()
+    _wait_for_device_worker(window, qapp)
+
+    assert panel.device_combo.count() == 1
+    assert panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
+    assert settings.UI_TEXT_DEVICE_ADB_MISSING in window.log_panel.to_text()
+    # 不可用状态要让用户看得见"不可用"，而不是留一个空的 ADB 行
+    assert settings.UI_TEXT_DEVICE_ADB_UNAVAILABLE in panel.adb_text
+
+
+def test_unauthorized_device_blocks_the_transfer(android_window_factory, qapp) -> None:
+    """未授权的设备**显示**出来，但传输入口拦住（Spec §8）：这是两件事。"""
+    window = android_window_factory()
+    panel = window.device_panel
+
+    panel.refresh_button.click()
+    _wait_for_device_worker(window, qapp)
+
+    assert panel.select_serial("XYZ456") is True
+    assert panel.selected_serial == "XYZ456"
+    assert panel.transfer_button.isEnabled() is False
+    assert settings.UI_TEXT_DEVICE_UNAUTHORIZED in panel.hint_text
 
 
 # --------------------------------------------------------------------------- #
@@ -372,11 +566,15 @@ def test_log_panel_append_and_clear(window: MainWindow) -> None:
 
 
 def test_startup_messages_are_reported(window: MainWindow) -> None:
-    assert STARTUP_MESSAGES == (
-        "Application started",
-        "Slice 7 GUI download manager enabled "
-        "(start/pause/resume/cancel + resume across restarts)",
-    )
+    """启动横幅里的每一行都要进日志。
+
+    刻意**不**把整条元组钉死在测试里：每加一个 Slice 就要改一次这条断言，
+    而它真正要守的是"``STARTUP_MESSAGES`` 里写了什么，日志里就有什么"。
+    """
+    assert STARTUP_MESSAGES[0] == "Application started"
+    assert any("Slice 7" in message for message in STARTUP_MESSAGES)
+    assert any("Slice 10" in message for message in STARTUP_MESSAGES)
+
     _report_startup(window)
     text = window.log_panel.to_text()
     for message in STARTUP_MESSAGES:
@@ -487,11 +685,13 @@ def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
     window.download_panel.action_buttons[ACTION_CALCULATE].click()
 
     assert window.status_group.title() == "下载状态"
-    assert window.device_panel.device_list.count() == 1
-    assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
-    refresh_button, _ = window.device_panel.buttons
-    refresh_button.click()  # 设备区的占位动作仍然可用（真实实现属于 ADB，本工具不做）
-    assert settings.UI_TEXT_DEVICE_HINT in window.log_panel.to_text()
+    assert window.device_panel.device_combo.count() == 1
+    assert (
+        window.device_panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
+    )
+    # 设备区的两个按钮都在，且没有设备时 [传输到设备] 是禁用的（Slice 10）
+    assert window.device_panel.refresh_button.isEnabled() is True
+    assert window.device_panel.transfer_button.isEnabled() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -674,7 +874,9 @@ def test_calculate_still_works_after_connection_test(
 
     assert "预计瓦片：" in window.download_panel.result_label.text()
     assert window.status_group.title() == "下载状态"
-    assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
+    assert (
+        window.device_panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1528,7 +1730,9 @@ def test_slice0_to_2_features_survive_download(
     assert window.download_panel.connection_label.text().startswith("连接成功")
     # Slice 0：其他区域
     assert window.status_group.title() == "下载状态"
-    assert window.device_panel.device_list.item(0).text() == settings.UI_TEXT_DEVICE_EMPTY
+    assert (
+        window.device_panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
+    )
 
 
 # --------------------------------------------------------------------------- #

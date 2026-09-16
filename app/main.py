@@ -34,10 +34,12 @@ from app.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
 
-#: 启动后必须出现在日志区的两条记录
+#: 启动后必须出现在日志区的记录
 STARTUP_MESSAGES: tuple[str, ...] = (
     "Application started",
     "Slice 7 GUI download manager enabled (start/pause/resume/cancel + resume across restarts)",
+    "Slice 10 ADB device manager enabled (device discovery + package transfer to "
+    "/sdcard/Download/TiandituOfflineMap/import)",
 )
 
 

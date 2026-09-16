@@ -34,10 +34,12 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QFileDialog,
     QGroupBox,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSplitter,
     QStyle,
@@ -50,12 +52,19 @@ from app.config.settings import (
     APP_VERSION,
     DEFAULT_DOWNLOAD_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
+    DEFAULT_OUTPUT_DIR,
     DEFAULT_REQUESTS_PER_SECOND,
     DEFAULT_REQUEST_TIMEOUT,
     DEFAULT_TILE_TIMEOUT_SECONDS,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     GUI_LARGE_TASK_CONFIRM_TILES,
+    LOG_DEVICE_SELECTED,
+    LOG_PACKAGE_INVALID,
+    LOG_PACKAGE_VALIDATED,
+    LOG_TRANSFER_STARTED,
+    PACKAGE_MANIFEST_FILENAME,
+    TRANSFER_ERROR_PACKAGE_DIR_MISSING,
     UI_TEXT_BUTTON_CANCEL,
     UI_TEXT_BUTTON_CLOSE,
     UI_TEXT_BUTTON_CONFIRM,
@@ -67,6 +76,7 @@ from app.config.settings import (
     UI_TEXT_COMPLETE_TITLE,
     UI_TEXT_COMPOSITION_MERGED,
     UI_TEXT_COMPOSITION_SINGLE,
+    UI_TEXT_DEVICE_ADB_MISSING,
     UI_TEXT_DEVICE_HINT,
     UI_TEXT_EXIT_CANCEL,
     UI_TEXT_EXIT_CONFIRM,
@@ -97,6 +107,26 @@ from app.config.settings import (
     UI_TEXT_SCANNING_EXISTING,
     UI_TEXT_TASK_DELETE_HINT,
     UI_TEXT_TASK_RECOVERED,
+    UI_TEXT_TRANSFER_BUTTON_OVERWRITE,
+    UI_TEXT_TRANSFER_CANCELLED_BODY,
+    UI_TEXT_TRANSFER_CANCELLED_TITLE,
+    UI_TEXT_TRANSFER_CHOOSE_PACKAGE_TITLE,
+    UI_TEXT_TRANSFER_COMPLETE_BODY,
+    UI_TEXT_TRANSFER_COMPLETE_FILES,
+    UI_TEXT_TRANSFER_COMPLETE_TITLE,
+    UI_TEXT_TRANSFER_CONFIRM_BODY,
+    UI_TEXT_TRANSFER_CONFIRM_CANCEL,
+    UI_TEXT_TRANSFER_CONFIRM_START,
+    UI_TEXT_TRANSFER_CONFIRM_TITLE,
+    UI_TEXT_TRANSFER_EXISTS_BODY,
+    UI_TEXT_TRANSFER_EXISTS_TITLE,
+    UI_TEXT_TRANSFER_FAILED_BODY,
+    UI_TEXT_TRANSFER_FAILED_TITLE,
+    UI_TEXT_TRANSFER_NEED_PACKAGE,
+    UI_TEXT_TRANSFER_NEED_DEVICE,
+    UI_TEXT_TRANSFER_RUNNING,
+    UI_TEXT_TRANSFER_SHA256_UNAVAILABLE,
+    UI_TEXT_TRANSFER_STATUS_WAITING_IMPORT,
     UI_TEXT_VALIDATION_TITLE,
     WINDOW_MIN_HEIGHT,
     WINDOW_MIN_WIDTH,
@@ -115,13 +145,22 @@ from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType, MapType, describe_map_type
 from app.providers import TiandituProvider, TileTestResult, mask_url
 from app.services import (
+    AdbStatus,
+    AndroidTransferService,
     MapDownloadOutcome,
     build_output_path,
 )
 from app.tasks import TaskService, TaskStoreError
 from app.ui.connection_check import ConnectionTestWorker
 from app.ui.desktop import open_directory
-from app.ui.device_panel import DevicePanel
+from app.ui.device_panel import (
+    TRANSFER_STATE_CANCELLED,
+    TRANSFER_STATE_DONE,
+    TRANSFER_STATE_FAILED,
+    TRANSFER_STATE_READY,
+    TRANSFER_STATE_RUNNING,
+    DevicePanel,
+)
 from app.ui.download_panel import (
     ACTION_CALCULATE,
     ACTION_CANCEL,
@@ -141,6 +180,11 @@ from app.ui.task_panel import TaskPanel
 from app.ui.task_progress_panel import TaskProgressPanel
 from app.ui.tile_scan_worker import ExistingTileScan, ExistingTileScanWorker
 from app.ui.validation import validate_form
+from app.workers import (
+    AndroidDeviceWorker,
+    AndroidPackageCheckWorker,
+    AndroidTransferWorker,
+)
 
 #: 左侧配置列的偏好宽度（实际取值为它与"内容最小宽度"的较大者）
 _LEFT_COLUMN_WIDTH = 460
@@ -148,6 +192,21 @@ _LEFT_COLUMN_WIDTH = 460
 #: 右侧设备 / 任务 / 日志列的最小宽度。任务表格有 5 列，360 会让「输出路径」
 #: 只剩几十像素，因此抬到 420（900px 的最小窗口宽度仍能满足 460 + 420）。
 _RIGHT_COLUMN_WIDTH = 420
+
+#: 右列三段（设备 / 任务 / 日志）的初始高度分配（Spec §11 的面板变高了）。
+#:
+#: 450 是**量出来的**，不是估的：设备面板内容的自然高度在真实字体 / DPI 下是
+#: 430px（三个 QGroupBox 168 + 122 + 128，加两条 6px 间隔），而 ``setWidgetResizable``
+#: 会把面板撑到 ``sizeHint``——给 410 时视口只有 406，于是默认窗口下就出现了一条
+#: 24px 的竖直滚动条，用户要滚一下才能看到 [传输到设备]。
+#:
+#: 注意这是**初始**配比：设备区选了设备但没选包时，面板会多出一行提示
+#: （+30px，约 466），那时滚动区接管是**对的**——面板高度是动态的，硬要它
+#: 永远不滚就只能把日志区压没。判断标准是"真正要操作的那一刻不用滚"。
+_RIGHT_COLUMN_SIZES: tuple[int, int, int] = (450, 130, 130)
+
+#: 设备区的滚动区最小高度：小窗口下这块可以滚，但不能把日志区挤没
+_DEVICE_AREA_MIN_HEIGHT = 190
 
 #: 关闭窗口时等待后台线程退出的上限（毫秒）
 _THREAD_SHUTDOWN_WAIT_MS = 3000
@@ -287,6 +346,7 @@ class MainWindow(QMainWindow):
         *,
         task_service: TaskService | None = None,
         preferences: UiPreferences | None = None,
+        android_service: AndroidTransferService | None = None,
     ) -> None:
         """
         Args:
@@ -297,6 +357,9 @@ class MainWindow(QMainWindow):
             preferences: 界面偏好（Slice 7）；``None`` 时用默认的
                 ``QSettings(ORG_NAME, APP_NAME)``——在 Windows 上落到注册表。
                 测试会注入一个 ``IniFormat`` 的临时实例，理由同 ``task_service``。
+            android_service: ADB 与设备传输的编排层（Slice 10）；``None`` 时自建。
+                测试与验收脚本注入假的实现，于是**测试不依赖本机真的装了 adb**
+                ——一台没装 Android SDK 的 CI 机器上也必须能跑全套用例。
         """
         super().__init__(parent)
 
@@ -308,6 +371,8 @@ class MainWindow(QMainWindow):
         self.task_service = task_service or TaskService()
         #: 界面偏好（Slice 7，Spec §22）。**不存 Token。**
         self.preferences = preferences or UiPreferences()
+        #: Android 传输编排层（Slice 10）。界面不直接碰 adb。
+        self.android_service = android_service or AndroidTransferService()
 
         # 四大面板 + 当前任务进度区
         self.download_panel = DownloadPanel(self)
@@ -352,6 +417,27 @@ class MainWindow(QMainWindow):
         #: 关掉之后再打开时复用同一个实例。
         self._package_dialog: PackageDialog | None = None
         self._package_validator_dialog: PackageValidateDialog | None = None
+
+        # --- Slice 10：Android 传输的三个后台线程与三个非模态弹窗 --------
+        #: 设备刷新线程（adb version + devices -l + getprop）
+        self._device_worker: AndroidDeviceWorker | None = None
+        #: 地图包校验线程（会算一次完整的 SHA256）
+        self._package_check_worker: AndroidPackageCheckWorker | None = None
+        #: 传输线程（adb push）
+        self._transfer_worker: AndroidTransferWorker | None = None
+        #: Slice 10 的三个弹窗（都带 WA_DeleteOnClose，由 _forget_dialog_on_destroy
+        #: 在销毁时把属性清成 None，见那个方法的说明）
+        self._transfer_confirm_dialog: QMessageBox | None = None
+        self._transfer_exists_dialog: QMessageBox | None = None
+        self._transfer_done_dialog: QMessageBox | None = None
+        self._transfer_failed_dialog: QMessageBox | None = None
+        #: 确认框里那两个按钮的引用。**必须在装配时就落好默认值**：它们只在
+        #: 对应弹窗被创建时才被赋值，而验收脚本 / 测试会在"还没弹过窗"的时刻读它们
+        #: ——读一个不存在的属性会 ``AttributeError``（Qt 槽里抛异常会被吞掉）。
+        self._transfer_confirm_start: QPushButton | None = None
+        self._transfer_overwrite_button: QPushButton | None = None
+        #: 用户已经在"覆盖设备上的同名包吗"里点过「覆盖」，等新一轮传输
+        self._transfer_overwrite = False
         #: 关窗确认结果（Spec §17：先提示，用户确认后才真正退出）
         self._exit_confirmed = False
         #: 最近一次"计算"的结果，用于输出路径变化时重绘「输出文件」行
@@ -461,14 +547,23 @@ class MainWindow(QMainWindow):
         # 任务列表刻意放右列而不是配置列：配置列在 760px 高的窗口里已经排到折叠线，
         # 再塞一块 180px 高的表就会把「总进度」挤到可视区外（Slice 4 花过力气
         # 保证进度条可见，不能在这里破功）。
+        #
+        # Slice 10：设备区从一块 120px 的占位变成了真面板（ADB 状态 + 设备 +
+        # 地图包 + 传输进度），自然高度约 350px。与左列同样的处理——套一层滚动区，
+        # 于是小窗口下它自己滚，而不会把下面的日志区挤没。
+        self._device_scroll = QScrollArea(self)
+        self._device_scroll.setWidgetResizable(True)
+        self._device_scroll.setWidget(self.device_panel)
+        self._device_scroll.setMinimumHeight(_DEVICE_AREA_MIN_HEIGHT)
+
         right_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        right_splitter.addWidget(self.device_panel)
+        right_splitter.addWidget(self._device_scroll)
         right_splitter.addWidget(self.task_panel)
         right_splitter.addWidget(self.log_panel)
         right_splitter.setStretchFactor(0, 0)
         right_splitter.setStretchFactor(1, 0)
         right_splitter.setStretchFactor(2, 1)
-        right_splitter.setSizes([190, 210, 360])
+        right_splitter.setSizes(list(_RIGHT_COLUMN_SIZES))
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(left_scroll)
@@ -492,7 +587,12 @@ class MainWindow(QMainWindow):
         # 已算出的「预估结果」要跟着重画那一行请求量。
         self.download_panel.layer_plan_changed.connect(self._refresh_output_preview)
         self.device_panel.refresh_requested.connect(self._on_refresh_devices)
-        self.device_panel.import_requested.connect(self._on_import_to_android)
+        # Slice 10：名字沿用 Slice 0 的 import_requested，语义变成"传输到设备"
+        self.device_panel.import_requested.connect(self._on_transfer_to_android)
+        self.device_panel.cancel_requested.connect(self._on_cancel_transfer)
+        self.device_panel.validate_requested.connect(self._on_validate_android_package)
+        self.device_panel.choose_package_requested.connect(self._on_choose_android_package)
+        self.device_panel.device_changed.connect(self._on_device_changed)
         # Slice 5：任务列表
         self.task_panel.resume_requested.connect(self._on_task_resume_requested)
         self.task_panel.delete_requested.connect(self._on_task_delete_requested)
@@ -2149,20 +2249,393 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
-    # 槽：设备动作
+    # 槽：设备与传输（Slice 10，Spec §3 ~ §35）
     # ------------------------------------------------------------------ #
     @Slot()
     def _on_refresh_devices(self) -> None:
-        message = UI_TEXT_DEVICE_HINT
-        self.log_panel.append_log(message)
-        self.device_panel.clear_devices()
-        self.statusBar().showMessage(message, 5000)
+        """[刷新设备]：在后台探测 ADB 并拉设备列表（Spec §6 / §10）。
+
+        **必须离开主线程**：``adb version`` + ``adb devices -l`` + 每台设备四次
+        ``getprop`` 是十几个进程往返，在主线程跑就是肉眼可见的卡顿。
+        """
+        worker = self._device_worker
+        if worker is not None and worker.isRunning():
+            self.log_panel.append_log("上一次设备刷新尚未结束，已忽略本次请求", "WARNING")
+            return
+
+        # 用户可能刚刚装好 Platform Tools / 改了 ADB_PATH，因此这里顺手清掉探测缓存
+        self.device_panel.set_adb_path(self.android_service.client.adb_path)
+        self.device_panel.set_busy(True)
+
+        worker = AndroidDeviceWorker(self.android_service, self)
+        worker.devices_refreshed.connect(self._on_devices_refreshed)
+        worker.log_message.connect(self.log_panel.append_log)
+        worker.finished.connect(lambda: self.device_panel.set_busy(False))
+        self._device_worker = worker
+        self.statusBar().showMessage("正在刷新设备…", 3000)
+        worker.start()
+
+    @Slot(object)
+    def _on_devices_refreshed(self, outcome) -> None:
+        """设备刷新回来了：显示 ADB 状态、设备列表，并在日志里说清结果。"""
+        self.device_panel.set_adb_path(self.android_service.client.adb_path)
+        self.device_panel.apply_outcome(outcome)
+
+        if not outcome.adb_available:
+            # Spec §10：没有 ADB 要说清"怎么办"，而不是只报一句不可用
+            self.log_panel.append_log(UI_TEXT_DEVICE_ADB_MISSING, "WARNING")
+            self.statusBar().showMessage(UI_TEXT_DEVICE_ADB_MISSING, 5000)
+        elif not outcome.devices:
+            self.log_panel.append_log("未发现 Android 设备（请确认已连接并开启 USB 调试）")
+            self.statusBar().showMessage("未发现 Android 设备", 5000)
+        else:
+            names = "、".join(device.short_name for device in outcome.devices)
+            self.log_panel.append_log(f"已发现 {len(outcome.devices)} 台设备：{names}")
+            self.statusBar().showMessage(f"已发现 {len(outcome.devices)} 台设备", 5000)
+
+        for warning in outcome.warnings:
+            self.log_panel.append_log(warning, "WARNING")
+
+    @Slot(str)
+    def _on_device_changed(self, serial: str) -> None:
+        """下拉框换了设备：设备信息已经在面板里了，这里只补一条日志。"""
+        if not serial:
+            return
+        device = self.device_panel.selected_device()
+        name = device.short_name if device is not None else serial
+        self.log_panel.append_log(LOG_DEVICE_SELECTED.format(serial=serial, name=name))
 
     @Slot()
-    def _on_import_to_android(self) -> None:
-        message = UI_TEXT_DEVICE_HINT
-        self.log_panel.append_log(message, "WARNING")
-        self.statusBar().showMessage(message, 5000)
+    def _on_choose_android_package(self) -> None:
+        """[选择地图包]：选一个**包目录**（不是裸 .mbtiles，Spec §12）。"""
+        # 起点目录：上次选的包 → 下载输出目录（用户的地图包一般就在那儿旁边）。
+        # 取的是 ``output_edit`` 的文本：``DownloadPanel`` 没有 ``output_dir()``
+        # 这个方法，写成 ``self.download_panel.output_dir()`` 会在点击时抛
+        # ``AttributeError`` —— 而 Qt 会把槽里的异常吞掉，用户看到的是
+        # "按钮点了没反应"。（这是 Slice 10 实机验收脚本抓到的真 bug。）
+        start_dir = (
+            self.device_panel.package_dir
+            or self.download_panel.output_edit.text().strip()
+            or str(DEFAULT_OUTPUT_DIR)
+        )
+        chosen = QFileDialog.getExistingDirectory(
+            self, UI_TEXT_TRANSFER_CHOOSE_PACKAGE_TITLE, start_dir
+        )
+        if not chosen:
+            return
+        self.device_panel.set_package_dir(chosen)
+        self.device_panel.reset_transfer()
+        # Spec §12：选中之后就要校验；不校验通过不许传。校验会算完整的 SHA256，
+        # 因此同样走后台线程。
+        self._start_android_package_check(chosen)
+
+    @Slot()
+    def _on_validate_android_package(self) -> None:
+        """[验证地图包]（Spec §12）。"""
+        package_dir = self.device_panel.package_dir
+        if not package_dir:
+            self.log_panel.append_log(UI_TEXT_TRANSFER_NEED_PACKAGE, "WARNING")
+            return
+        self._start_android_package_check(package_dir)
+
+    def _start_android_package_check(self, package_dir: str) -> None:
+        """起一个后台校验线程（同一时刻最多一个）。"""
+        worker = self._package_check_worker
+        if worker is not None and worker.isRunning():
+            self.log_panel.append_log("地图包校验正在进行，已忽略本次请求", "WARNING")
+            return
+
+        self.device_panel.set_package_status("正在验证地图包…")
+        self.device_panel.set_busy(True)
+        worker = AndroidPackageCheckWorker(self.android_service, package_dir, self)
+        worker.check_completed.connect(self._on_android_package_checked)
+        worker.log_message.connect(self.log_panel.append_log)
+        worker.finished.connect(lambda: self.device_panel.set_busy(False))
+        self._package_check_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_android_package_checked(self, result) -> None:
+        """包校验结论：PASS 才允许传输；FAIL 把原因写清楚（Spec §12）。"""
+        if result.valid:
+            self.device_panel.set_package_status("PASS", "PASS")
+            self.log_panel.append_log(
+                LOG_PACKAGE_VALIDATED.format(path=result.package_dir)
+            )
+            self._refresh_remote_dir_preview()
+            return
+
+        reasons = "；".join(result.errors) or "校验未通过"
+        self.device_panel.set_package_status(f"FAIL：{reasons}", "FAIL")
+        self.log_panel.append_log(
+            LOG_PACKAGE_INVALID.format(reasons=reasons), "ERROR"
+        )
+
+    def _refresh_remote_dir_preview(self) -> None:
+        """用 manifest 里的 ``id`` 算出远端目录并显示（Spec §11 / §14 / §15）。
+
+        读 manifest 是纯本地小文件操作（几十字节），不需要再开线程。
+        """
+        package_dir = self.device_panel.package_dir
+        if not package_dir:
+            return
+        try:
+            manifest = self.android_service.transfer.reader.read_manifest(package_dir)
+        except Exception as exc:  # noqa: BLE001 - 读不出来就让用户去点"验证地图包"
+            self.log_panel.append_log(f"读取 manifest 失败：{exc}", "WARNING")
+            self.device_panel.set_remote_dir("")
+            return
+        self.device_panel.set_remote_dir(
+            self.android_service.remote_package_dir(manifest.id)
+        )
+
+    @Slot()
+    def _on_transfer_to_android(self) -> None:
+        """[传输到设备]：先算计划 → 让用户确认 → 再起后台线程（Spec §31）。"""
+        serial = self.device_panel.selected_serial
+        package_dir = self.device_panel.package_dir
+
+        if not serial:
+            self.log_panel.append_log(UI_TEXT_TRANSFER_NEED_DEVICE, "WARNING")
+            return
+        if not package_dir:
+            self.log_panel.append_log(UI_TEXT_TRANSFER_NEED_PACKAGE, "WARNING")
+            return
+        running = self._transfer_worker
+        if running is not None and running.isRunning():
+            self.log_panel.append_log(UI_TEXT_TRANSFER_RUNNING, "WARNING")
+            return
+
+        plan = self.android_service.plan(serial, package_dir)
+        if not plan.is_valid:
+            self.device_panel.set_transfer_result(TRANSFER_STATE_FAILED, plan.error or "")
+            self.log_panel.append_log(plan.error or "无法开始传输", "ERROR")
+            self._show_error_dialog(UI_TEXT_TRANSFER_FAILED_TITLE, plan.error or "")
+            return
+
+        self.device_panel.apply_plan(plan)
+        self._ask_transfer_confirmation(plan)
+
+    def _ask_transfer_confirmation(self, plan) -> None:
+        """传输前的确认框（Spec §31）：设备 / 地图 / 大小 / 远端，四样都要写清。"""
+        self._close_dialog("_transfer_confirm_dialog")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(UI_TEXT_TRANSFER_CONFIRM_TITLE)
+        box.setText(UI_TEXT_TRANSFER_CONFIRM_BODY.format(
+            serial=plan.serial,
+            device=plan.device_name,
+            package=plan.package_name or plan.package_id,
+            size=plan.size_text,
+            remote=plan.remote_dir,
+        ))
+        start = box.addButton(UI_TEXT_TRANSFER_CONFIRM_START, QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(UI_TEXT_TRANSFER_CONFIRM_CANCEL, QMessageBox.ButtonRole.RejectRole)
+        box.setModal(False)
+        # 保存按钮引用而不是把 lambda 连上去：``_close_dialogs`` 需要在关窗时
+        # ``disconnect(finished)``，而 lambda 没有可引用的对象。不这么做的话，
+        # 关主窗口会顺手触发一次"已取消传输"的假日志。
+        self._transfer_confirm_start = start
+        box.finished.connect(self._on_transfer_confirmed)
+        # 弹窗带 WA_DeleteOnClose：用户关掉它时 C++ 对象就没了，Python 这边必须
+        # 同步把属性清掉，否则关主窗口时会对一个空壳调 close()（Slice 7 的教训）。
+        self._forget_dialog_on_destroy("_transfer_confirm_dialog", box)
+        self._transfer_confirm_dialog = box
+        box.show()
+
+    @Slot()
+    def _on_transfer_confirmed(self) -> None:
+        """用户点了「开始」才真的开始传（Spec §31）。"""
+        box = self._transfer_confirm_dialog
+        clicked = box is not None and box.clickedButton() is self._transfer_confirm_start
+        self._close_dialog("_transfer_confirm_dialog")
+        if not clicked:
+            self.log_panel.append_log("已取消传输", "INFO")
+            return
+        self._start_transfer(overwrite=False)
+
+    def _start_transfer(self, *, overwrite: bool) -> None:
+        """起传输线程（Spec §29：``adb push`` 绝不跑在 Qt 主线程）。"""
+        serial = self.device_panel.selected_serial
+        package_dir = self.device_panel.package_dir
+        self._transfer_overwrite = overwrite
+
+        worker = AndroidTransferWorker(
+            self.android_service,
+            serial,
+            package_dir,
+            self.android_service.remote_root,
+            overwrite=overwrite,
+            parent=self,
+        )
+        worker.progress_changed.connect(self._on_transfer_progress)
+        worker.status_changed.connect(self._on_transfer_status)
+        worker.log_message.connect(self.log_panel.append_log)
+        worker.transfer_completed.connect(self._on_transfer_completed)
+        worker.transfer_failed.connect(self._on_transfer_failed)
+        worker.transfer_cancelled.connect(self._on_transfer_cancelled)
+        worker.confirmation_required.connect(self._on_transfer_needs_confirmation)
+        worker.finished.connect(self._on_transfer_thread_finished)
+        self._transfer_worker = worker
+
+        self.device_panel.reset_transfer(TRANSFER_STATE_RUNNING)
+        self.device_panel.set_busy(True)
+        self.device_panel.set_cancellable(True)
+        self.log_panel.append_log(
+            LOG_TRANSFER_STARTED.format(
+                package_id=Path(package_dir).name,
+                remote=self.device_panel.remote_dir or self.android_service.remote_root,
+            )
+        )
+        self.statusBar().showMessage(UI_TEXT_TRANSFER_RUNNING, 0)
+        worker.start()
+
+    @Slot(object)
+    def _on_transfer_progress(self, progress) -> None:
+        """一帧进度：交给面板显示（Spec §30）。"""
+        self.device_panel.set_transfer_progress(progress)
+
+    @Slot(str)
+    def _on_transfer_status(self, text: str) -> None:
+        """阶段文案（"正在传输 map.mbtiles…"），写在状态栏而不是覆盖状态行。
+
+        状态行显示的是 READY / TRANSFERRING / COMPLETED 这类**状态机取值**
+        （Spec §30 明确列出），阶段文案则是"正在做什么"。两者混在一行会让
+        "状态"变成一句会变来变去的句子，反而看不出进行到哪一步了。
+        """
+        self.statusBar().showMessage(text, 0)
+
+    @Slot()
+    def _on_cancel_transfer(self) -> None:
+        """[取消传输]（Spec §23）：协作式取消，不 terminate 线程。"""
+        worker = self._transfer_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.cancel()
+        self.log_panel.append_log("已请求取消传输…", "WARNING")
+        self.device_panel.set_cancellable(False)
+
+    @Slot(object)
+    def _on_transfer_completed(self, result) -> None:
+        """传输完成（Spec §32 / §33）。"""
+        self.device_panel.set_transfer_result(TRANSFER_STATE_DONE)
+        note = "" if result.checksum_verified else UI_TEXT_TRANSFER_SHA256_UNAVAILABLE
+        if note:
+            self.device_panel.set_transfer_result(TRANSFER_STATE_DONE, note)
+        self._show_transfer_done_dialog(result)
+        self.statusBar().showMessage("地图包传输完成", 5000)
+
+    @Slot(object)
+    def _on_transfer_cancelled(self, result) -> None:
+        """用户取消（Spec §23）：如实说明设备上可能残留 ``.part``。"""
+        self.device_panel.set_transfer_result(TRANSFER_STATE_CANCELLED)
+        self.statusBar().showMessage("传输已取消", 5000)
+        self._close_dialog("_transfer_confirm_dialog")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(UI_TEXT_TRANSFER_CANCELLED_TITLE)
+        box.setText(UI_TEXT_TRANSFER_CANCELLED_BODY)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._forget_dialog_on_destroy("_transfer_done_dialog", box)
+        self._transfer_done_dialog = box
+        box.show()
+
+    @Slot(str)
+    def _on_transfer_failed(self, reason: str) -> None:
+        """传输失败（Spec §35 / §41）。"""
+        self.device_panel.set_transfer_result(TRANSFER_STATE_FAILED, reason)
+        self.log_panel.append_log(f"传输失败：{reason}", "ERROR")
+        self.statusBar().showMessage("地图包传输失败", 5000)
+        self._show_error_dialog(
+            UI_TEXT_TRANSFER_FAILED_TITLE,
+            UI_TEXT_TRANSFER_FAILED_BODY.format(reason=reason),
+        )
+
+    @Slot(object)
+    def _on_transfer_needs_confirmation(self, result) -> None:
+        """设备上已有同名包 → 先问用户（Spec §24）。**绝不静默覆盖。**"""
+        self.device_panel.set_transfer_result(TRANSFER_STATE_READY)
+        self._close_dialog("_transfer_exists_dialog")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(UI_TEXT_TRANSFER_EXISTS_TITLE)
+        box.setText(UI_TEXT_TRANSFER_EXISTS_BODY.format(
+            package_id=Path(result.remote_package_dir or "").name,
+            remote=result.remote_package_dir or "",
+        ))
+        overwrite = box.addButton(UI_TEXT_TRANSFER_BUTTON_OVERWRITE, QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(UI_TEXT_BUTTON_CANCEL, QMessageBox.ButtonRole.RejectRole)
+        box.setModal(False)
+        # 理由同上：具名槽 + 保存按钮引用，关窗时才能干净地断开
+        self._transfer_overwrite_button = overwrite
+        box.finished.connect(self._on_transfer_overwrite_answered)
+        self._forget_dialog_on_destroy("_transfer_exists_dialog", box)
+        self._transfer_exists_dialog = box
+        box.show()
+
+    @Slot()
+    def _on_transfer_overwrite_answered(self) -> None:
+        """用户选了「覆盖」→ 删掉设备上的旧包重新传（Spec §24）。"""
+        box = self._transfer_exists_dialog
+        clicked = box is not None and box.clickedButton() is self._transfer_overwrite_button
+        self._close_dialog("_transfer_exists_dialog")
+        if not clicked:
+            self.log_panel.append_log("设备中已有同名地图包，已取消传输", "INFO")
+            self.device_panel.set_transfer_result(TRANSFER_STATE_READY)
+            return
+        self._start_transfer(overwrite=True)
+
+    @Slot()
+    def _on_transfer_thread_finished(self) -> None:
+        """传输线程结束：把面板从"忙"里放出来。
+
+        刻意**不**在这里把 ``_transfer_worker`` 置 ``None``：主窗口持有引用是
+        防止 QThread 在还没被 Qt 回收完时被 Python GC 掉（Slice 3 的坑）。
+        """
+        self.device_panel.set_busy(False)
+        self.device_panel.set_cancellable(False)
+
+    def _show_transfer_done_dialog(self, result) -> None:
+        """完成框（Spec §32 / §33）：文件大小 / SHA256 / 状态三行必须分开写。"""
+        self._close_dialog("_transfer_done_dialog")
+        box = QMessageBox(self)
+        # SHA256 不可用时是**警告**不是失败——图标也跟着变（Spec §33）
+        box.setIcon(
+            QMessageBox.Icon.Information
+            if result.checksum_verified
+            else QMessageBox.Icon.Warning
+        )
+        box.setWindowTitle(UI_TEXT_TRANSFER_COMPLETE_TITLE)
+        device = self.device_panel.selected_device()
+        box.setText(UI_TEXT_TRANSFER_COMPLETE_BODY.format(
+            device=device.short_name if device is not None else result.serial,
+            remote=result.remote_package_dir or "",
+            files=UI_TEXT_TRANSFER_COMPLETE_FILES,
+            size_status=result.size_status_text,
+            checksum_status=(
+                "PASS" if result.checksum_verified else UI_TEXT_TRANSFER_SHA256_UNAVAILABLE
+            ),
+            status=UI_TEXT_TRANSFER_STATUS_WAITING_IMPORT,
+        ))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._forget_dialog_on_destroy("_transfer_done_dialog", box)
+        self._transfer_done_dialog = box
+        box.show()
+
+    def _close_dialog(self, attribute: str) -> None:
+        """关掉并清空一个非模态弹窗（``None`` 或已被 Qt 销毁都要能安全处理）。"""
+        box = getattr(self, attribute, None)
+        if box is None:
+            return
+        setattr(self, attribute, None)
+        try:
+            box.close()
+        except RuntimeError:  # pragma: no cover - C++ 对象已被销毁
+            pass
 
     # ------------------------------------------------------------------ #
     # 槽：帮助
@@ -2173,8 +2646,9 @@ class MainWindow(QMainWindow):
             self,
             f"关于 {APP_NAME}",
             f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
-            "Windows 端生成天地图离线地图包，后续导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 7（Windows GUI 下载管理与交互完善）。",
+            "Windows 端生成天地图离线地图包，导入 Android 供 osmdroid 使用。<br>"
+            "当前进度：Slice 10（ADB 设备管理与离线地图包传输）。<br>"
+            "Android 端的地图包安装（Slice 11）尚未实现。",
         )
 
     # ------------------------------------------------------------------ #
@@ -2273,6 +2747,23 @@ class MainWindow(QMainWindow):
             validator.shutdown()
             validator.close()
 
+        # Slice 10：传输线程可能在 push 一个几 GB 的文件。先请求取消（它会 kill
+        # 掉 adb push 子进程并清理远端 .part），再有界等待——让一个 running 的
+        # QThread 随着父窗口一起销毁，Qt 会中止整个进程。
+        transfer = self._transfer_worker
+        if transfer is not None and transfer.isRunning():
+            self.log_panel.append_log("正在取消地图包传输…")
+            transfer.cancel()
+            transfer.wait(_DOWNLOAD_CANCEL_WAIT_MS)
+
+        # 设备刷新 / 地图包校验都是只读的短任务，等它们自己结束就行
+        for attribute in ("_device_worker", "_package_check_worker"):
+            worker = getattr(self, attribute)
+            if worker is not None and worker.isRunning():
+                if attribute == "_package_check_worker":
+                    worker.request_stop()
+                worker.wait(_THREAD_SHUTDOWN_WAIT_MS)
+
         download = self._download_worker
         running = download is not None and download.isRunning()
         if running and not self._exit_confirmed:
@@ -2345,6 +2836,13 @@ class MainWindow(QMainWindow):
             # 但仍要把引用清掉，否则父窗口析构后会留着悬空的 QWidget 指针。
             ("_complete_dialog", None),
             ("_failed_dialog", None),
+            # Slice 10：传输的四个弹窗。前两个连着具名槽，必须断开——
+            # 否则关主窗口时会顺手触发一次"已取消传输"的假日志。
+            ("_transfer_confirm_dialog", self._on_transfer_confirmed),
+            ("_transfer_exists_dialog", self._on_transfer_overwrite_answered),
+            # 完成 / 取消提示只把引用清掉（它们不改变任何状态）
+            ("_transfer_done_dialog", None),
+            ("_transfer_failed_dialog", None),
         ):
             dialog = getattr(self, attr)
             if dialog is None:

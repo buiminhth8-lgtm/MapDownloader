@@ -6,9 +6,9 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 9：离线地图包构建与校验（`.mbtiles` → `map.mbtiles` + `manifest.json` 的
-标准离线包；流式 SHA256、临时目录 + 原子发布、manifest 与文件的事实一致性校验，
-以及"改一个字节就 FAIL"的篡改检测）
+Slice 10：ADB 设备管理与离线地图包传输（Windows → Android：发现设备 → 看设备信息 →
+选设备 → 校验本地包 → 建远端目录 → push `map.mbtiles` + `manifest.json` → 进度 →
+远端校验，为 Slice 11 的端侧导入铺路）
 
 完整链路：
 
@@ -57,6 +57,21 @@ MapPackageBuilder      (Slice 9：copy 源文件 → 流式 SHA256 → 写 manif
     ↓
 MapPackageValidator    (Slice 9：manifest 解析 / 文件存在 / 大小一致 / SHA256 对得上，
                        四道关 → 三行结论 + 人话失败原因)
+    ↓
+AndroidTransferService (Slice 10：设备发现 + 包校验 + 传输的编排入口；顺带记住
+    ↓                   "这个目录刚校验过"，传输时不再重复哈希 GB 级文件)
+AndroidDeviceWorker / AndroidTransferWorker
+    ↓                   （Slice 10：后台线程；adb 命令与 push 绝不上 Qt 主线程）
+AdbClient              (Slice 10：subprocess **列表参数**、禁用 shell、push 流式读
+    ↓                   stdout+stderr、跨 chunk 解析百分比、取消即杀进程)
+DeviceManager          (Slice 10：`adb devices -l` 解析 + getprop 补全；单台设备出错
+    ↓                   不影响整表，只导 state=device 的设备)
+MapPackageTransfer     (Slice 10：mkdir → push map.mbtiles.part → mv → push manifest.json
+    ↓                   → 远端大小 + SHA256 校验；取消只删自己的 .part)
+<设备>/sdcard/Download/TiandituOfflineMap/import/<manifest.id>/
+                       { manifest.json, map.mbtiles }
+    ↓
+Android App 导入        (Slice 11，未开始)
 ```
 
 **离线包的形状**（`formatVersion = 1`，这是给 Android 那侧看的契约）：
@@ -81,6 +96,97 @@ MapPackageValidator    (Slice 9：manifest 解析 / 文件存在 / 大小一致 
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 10：ADB 设备管理与离线地图包传输
+
+**Slice 9 把包做好了，但它还在 Windows 上。** Slice 10 干的事只有一件：把这个目录搬到
+Android 设备的公共导入区，并且在设备侧**证明**搬对了。
+
+```
+本地 <包目录>/                          远端 <导入区>/<manifest.id>/
+├── map.mbtiles        ──push──→        ├── map.mbtiles
+└── manifest.json                        └── manifest.json
+```
+
+导入区默认是 `/sdcard/Download/TiandituOfflineMap/import`（配置在
+`settings.DEFAULT_ANDROID_IMPORT_DIR`）。**不碰 `/data/data`、不用 root、不用
+`run-as`、不 `adb install`、不 `adb remount`**——这是 Spec 点名的禁止项，也是本层
+与 Slice 11 的分界线：这里只搬文件，端侧怎么导入是 Slice 11 的事。
+
+分层与前面几个 Slice 一样，每层只回答一个问题：
+
+| 模块 | 只回答 |
+|---|---|
+| `app/android/adb_client.py` | 怎么把 adb 命令**安全地**跑起来（列表参数、不 shell、流式输出） |
+| `app/android/device_manager.py` | 怎么把 `adb devices -l` 与 `getprop` 的输出变成设备 |
+| `app/android/transfer_models.py` | 传输计划 / 进度 / 结果长什么样；远端路径怎么算才安全 |
+| `app/android/map_package_transfer.py` | 传输的**顺序**与失败分支（mkdir → push → mv → 校验） |
+| `app/services/android_transfer_service.py` | 编排：设备 + 包校验 + 传输三件事收成一组界面能调的动作 |
+| `app/workers/android_transfer_worker.py` | 线程胶水：QThread + 信号，主线程只收结果 |
+| `app/ui/device_panel.py` | 显示 + 发请求（一个 adb 调用都没有） |
+
+### 顺序是设计的一部分（Spec §19 / §20）
+
+```text
+mkdir 远端目录
+push  map.mbtiles  →  map.mbtiles.part      ← 先传大文件，且不叫正式名字
+mv    map.mbtiles.part  →  map.mbtiles      ← 原子改名：这一刻才算"传好了"
+push  manifest.json                         ← 最后传，它是"包齐了"的信号
+校验  远端大小 + 远端 SHA256（best-effort）
+```
+
+为什么不直接 `push map.mbtiles`：`adb push` **没有原子性**。如果直接写正式名字，Android
+端（Slice 11）可能在文件只写了一半时就看到一个"文件名齐全"的包——它会认为传输完成了，
+然后拿着一个截断的 MBTiles 去解析。`.part` + `mv` 让"文件是否存在"变成一个**可信的信号**。
+`manifest.json` 同理放在最后：大文件还没传完时它不该出现。
+
+### `-s` 绝不省略（Spec §21）
+
+板子、手机、模拟器同时插着是常态。`AdbClient` 的 `shell()` / `push()` 在 serial 为空时
+**直接抛 `ValueError`**，而不是退化成"adb 自己挑一台"——那会让包传到一个用户没看着的设备上。
+验收脚本会从假 adb 记下的每一次真实调用里把 `-s` 后面的序列号抠出来，断言它们全是同一台。
+
+### 删除只发生在两个**明确**的场景（Spec §23 / §24）
+
+- **取消**：只删我们自己的 `<文件>.part`，**绝不碰**用户已有的完整包；
+- **覆盖**：设备上已有同名包时先停下来问（`needs_confirmation`），用户点了「覆盖」
+  才 `rm -rf <导入区>/<id>` 再重传。
+
+设备掉线时**故意不清理** `.part`：那个残骸是排查"线是不是松了"的唯一实物证据（Spec §35）。
+取消才清（那是用户自己要的干净）。
+
+### 远端路径是攻击面（Spec §15 / §43）
+
+`manifest.id` 是**文件里的内容**，它会被拼进设备端命令。所以它要过两道：白名单
+（只留 `A-Z a-z 0-9 _ - .`，其余换 `_`）+ 纯点组合（`..`）单独挡掉，并且有长度上限与
+兜底名；远端根目录也过 `is_safe_remote_root()`（`/`、空串、不含 `/` 的一律拒绝）。
+验收脚本对一组危险输入（`../../etc`、`-rf /`、`a/../../b`、`..\..\win`、空串……）
+逐个断言"拼出来的路径一定在导入区之内"。
+
+### 这一 Slice 的三条"不做什么"
+
+- **不实现 Android 端导入**（那是 Slice 11）、不碰 App 私有目录、不解析设备上的 MBTiles；
+- **不做 sdcard 之外的事**：不 `install`、不 `root`、不 `remount`、不压缩、不改包内容；
+- **不让 `adb` 跑到 Qt 主线程上**：`version` + `devices -l` + 每台设备四次 `getprop`
+  是十几个进程往返，在事件循环里跑就是肉眼可见的卡顿。
+
+### 这一 Slice 抓出来的四个缺陷
+
+`pytest` 1299 条全绿的时候，下面这些还都活着——它们要么只在**真实子进程**下现形，
+要么只在**真实窗口**下现形：
+
+1. **取消路径的 `if` 顺序写反了。** `_run()` 里先判 `pushed is None` 再判
+   `result.cancelled`，而取消时 `_push()` 返回的**也是** `None`——于是清理 `.part`
+   的代码成了死代码。设备上会留下一个几 GB 的 `map.mbtiles.part`，而用户以为自己取消了。
+   抓到它的是 `test_cancel_removes_part_and_keeps_complete_packages`（单元测试）。
+2. **进度条在成功那一刻倒退回 0。** `TRANSFER_STAGE_RANGES` 里漏了 `done`，于是收尾帧
+   落到默认区间 `(0, 100)` 的起点 —— 传输成功、进度条空。补上 `"done": (100, 100)`。
+3. **[选择地图包] 点了没反应。** 槽里写的是 `self.download_panel.output_dir()`，而
+   `DownloadPanel` **没有**这个方法 → `AttributeError`，Qt 把槽里的异常吞掉，
+   表现就是"按钮点了什么都不发生"。**只有真的点一下才发现**——验收脚本抓到的。
+4. **默认窗口下设备区要滚一下。** 真实字体 / DPI 下面板自然高度是 430px，而右列只给了
+   410（视口 406）→ 默认尺寸就冒出 24px 的竖直滚动条，用户要滚才能看到 [传输到设备]。
+   照着量出来的数字把配比改成 450。`offscreen` 字体偏小，这条**在 pytest 里看不见**。
 
 ## Slice 9：离线地图包构建与校验
 
@@ -398,12 +504,14 @@ Slice 0 基础（仍有效）：
 当时暂未实现（**尚未排期**，不对应任何具体 Slice 号）：
 
 - ~~地图包 manifest、离线包级 Sha256 校验~~ —— **Slice 9 已交付**（见上）
-- ADB / Android 导入（设备发现、push、设备侧校验）
+- ~~ADB / Android 导入（设备发现、push）~~ —— **Slice 10 已交付**（见上）；
+  剩下"设备侧怎么导入"（端侧读 manifest、交给 osmdroid 加载）留给 Slice 11
 - 失败瓦片清单与单点重试、速度曲线
 
 > 这几项曾经被写进"Slice 7"的计划里，但 Slice 7 实际排给了 Windows GUI 下载管理，
-> 因此不再用 Slice 号承诺它们。界面上的设备区会如实说明"本版本不执行 adb 命令"
-> （`app/config/settings.py` 的 `UI_TEXT_DEVICE_HINT`），而不是假装在工作。
+> 因此不再用 Slice 号承诺它们。设备区曾经用一句 `UI_TEXT_DEVICE_HINT`
+> （"本版本不执行 adb 命令…"）如实说明"点了不会执行 adb"——那个占位文案在 Slice 10
+> 已经删掉，因为现在**真的会执行**了。
 
 ## 环境
 
@@ -424,13 +532,16 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 1141 passed
+python -m pytest                # 1299 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
 python -m pytest tests/test_checksum.py tests/test_package_builder.py \
                  tests/test_package_reader.py tests/test_package_validator.py -q
                     # 只跑 Slice 9 打包链路（原子构建 / 篡改检测 / 只读保证）
+python -m pytest tests/test_adb_client.py tests/test_device_manager.py \
+                 tests/test_map_package_transfer.py tests/test_android_transfer_service.py -q
+                    # 只跑 Slice 10 传输链路（顺序 / 取消 / 覆盖 / 路径安全 / 不重复哈希）
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -455,6 +566,10 @@ python -m pytest tests/test_checksum.py tests/test_package_builder.py \
 | `tests/test_package_builder.py` | **Slice 9** 原子构建：四条失败路径都不留半成品、copy 不是 move、覆盖 = 改名备份、警告与 FAIL 两种"先问用户"、进度单调收在 100% |
 | `tests/test_package_reader.py` | **Slice 9** manifest 解析与路径安全：`../` 穿越被拒、未来 `formatVersion` 被拒、损坏 JSON 只说人话 |
 | `tests/test_package_validator.py` | **Slice 9** 四道关逐条断言、改一个字节 → FAIL、处理不了的异常一律不冒泡、结论与构建器一致 |
+| `tests/test_adb_client.py` | **Slice 10** 参数永远是列表、源码里没有 `shell=True`（AST 守卫）、超时 / 命令起不来 / adb 不存在都变成结果、push 跨 chunk 解析百分比、stderr 必须被抽干 |
+| `tests/test_device_manager.py` | **Slice 10** 真实 `adb devices -l` 输出解析、未授权 / 离线都显示、单个 `getprop` 失败不影响整台设备、没 adb 时不炸 |
+| `tests/test_map_package_transfer.py` | **Slice 10** 顺序（mkdir < push(.part) < mv < push(manifest)）、`.part` 一定被清掉、取消只删自己的文件、覆盖前先问、远端大小 / SHA256 不一致要 FAIL、设备不支持 sha256 只是 WARNING、危险 id 拼不进路径 |
+| `tests/test_android_transfer_service.py` | **Slice 10** 编排层：刚校验过就不再重复哈希、目录一变缓存立刻作废、所有方法都不抛异常、adb 不存在 / 设备未授权都给出人话 |
 
 `tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
 （`test_dismissing_complete_dialog_then_closing_window_is_safe` /
@@ -487,6 +602,25 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 `--with-tasks` 会预置几条不同状态的任务记录，用于留档 Slice 5 的「下载任务」面板
 （见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
+
+Slice 10 的设备区与三个弹窗同样有可重复的实机留档：
+
+```bash
+python scripts/verify_slice10_android.py              # 真 adb 替身 + 真窗口 + 118 项检查 + 截图
+python scripts/verify_slice10_android.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice10_android.py --no-shots   # 只跑检查，不截图
+```
+
+截图落在 `docs/slice10_device_panel.png`（刷新之后的三台设备 + 详情）、
+`docs/slice10_transfer_confirm.png`（传输确认框）、
+`docs/slice10_transfer_progress.png`（传输中，进度条真的在走）、
+`docs/slice10_transfer_done.png`（完成）、
+`docs/slice10_overwrite_confirm.png`（设备上已有同名包 → 覆盖确认）。
+
+> "量出来，不要看" 这条经验在 Slice 10 又用了一次：设备区的滚动条**只能靠量**。
+> `offscreen` 字体偏小，pytest 里 `verticalScrollBar().maximum()` 是 0；切到真实
+> windows 平台插件就变成 24——默认窗口下用户要滚一下才能看到 [传输到设备]。修法不是
+> "看图觉得还行"，而是量出面板自然高度 430px，把右列配比从 410 改成 450。
 
 Slice 9 的打包与校验同样是**可重复的实机验收**：
 
@@ -534,7 +668,25 @@ python scripts/verify_slice7_ui.py                 # 真窗口 + 真按钮 + 49 
 python scripts/verify_slice7_ui.py --offscreen     # 无显示环境（CI）
 python scripts/verify_slice7_ui.py --scenes acd    # 只跑指定场次
 python scripts/verify_slice7_ui.py --no-shots      # 不生成截图
+
+python scripts/verify_slice8_inspector.py          # Slice 8：真窗口 + 52 项检查
+python scripts/verify_slice9_package.py           # Slice 9：真窗口 + 75 项检查
+python scripts/verify_slice10_android.py          # Slice 10：真 adb 替身 + 118 项检查
 ```
+
+**Slice 10 的脚本为什么不满足于 `FakeAdbClient`**：pytest 里的假 adb 是个 Python 对象，
+**根本没有子进程**。于是"参数到底是列表还是字符串"、"`[ NN%]` 被 `read()` 边界切开时还
+解析得对不对"、"stderr 管道写满导致子进程永久阻塞（表现为 adb push 卡死）"、
+"取消时子进程真的被杀掉、半个 `.part` 留下又被删掉"——这四件事全在测试的盲区里。
+所以这个脚本造一个**真的能执行**的 adb 替身（Windows 下是 `adb.cmd` → Python，
+POSIX 下是带 shebang 的 `adb`），把设备端文件系统映射成宿主目录，让**生产的**
+`AdbClient` 用真实子进程去跑它。于是传过去的字节真的落在磁盘上，脚本可以直接
+比对 SHA256；`mkdir` / `mv` / `rm` / `stat` / `sha256sum` 真的改宿主目录；
+`calls.jsonl` 记下每一次真实调用的 argv，顺序与 `-s` 可以被直接断言。
+
+五个场次：A 探测与发现 / B 完整传输（逐字节比对 + 顺序 + 进度曲线）/ C 取消·覆盖·
+空间不足·掉线·危险路径 / D 静态守卫（AST 查 `shell=True`、命令字符串、UI 不碰
+`subprocess`）/ E 真窗口从 [刷新设备] 点到 [传输到设备]。
 
 **为什么不能只跑 pytest**：pytest 跑在 Qt `offscreen` 平台上——那里没有真实字体、没有
 DPI 缩放、没有系统深浅色主题，`QMessageBox` 也不是真的窗口，而这三样东西恰恰能藏住真实
@@ -567,7 +719,8 @@ tianditu-offline-tool/
 │   │                      （download_worker 跑编排 / connection_check 发 HTTP /
 │   │                       tile_scan_worker 查 SQLite / mbtiles_inspector_dialog
 │   │                       里的 MBTilesInspectionWorker 跑诊断 / package_dialog
-│   │                       里的 PackageBuildWorker 与 PackageValidateWorker）
+│   │                       里的 PackageBuildWorker 与 PackageValidateWorker；
+│   │                       Slice 10 的三个线程在 app/workers/ 下）
 │   │                      外加纯逻辑模块：task_actions（按钮矩阵）/ validation（校验）/
 │   │                       preferences（QSettings 偏好）/ widgets（折行标签 + 主题色）/ desktop（打开目录）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
@@ -576,13 +729,15 @@ tianditu-offline-tool/
 │   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）+ diagnostics（Slice 8 ✅：全部判定规则与结论模型）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
 │   ├── composer/          瓦片合成：tile_composer.py（Pillow alpha 合成，无状态可复用）（Slice 6 ✅）
-│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）+ mbtiles_inspection_service.py（Slice 8 ✅：检查编排 / 进度 / 报告落盘）+ map_package_service.py（Slice 9 ✅：打包编排 / 输出目录命名 / 校验入口）
+│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）+ mbtiles_inspection_service.py（Slice 8 ✅：检查编排 / 进度 / 报告落盘）+ map_package_service.py（Slice 9 ✅：打包编排 / 输出目录命名 / 校验入口）+ android_transfer_service.py（Slice 10 ✅：设备 + 包校验 + 传输的入口；缓存"刚校验过"以免重复哈希）
 │   ├── package/           离线包打包与校验：models / checksum / package_builder / package_reader / package_validator（Slice 9 ✅）
-│   └── android/           ADB 设备管理与导入（尚未排期；目前只有包文档，无实现）
-├── tests/                  pytest 用例（1141 条）
+│   ├── android/           ADB 设备管理与包传输（Slice 10 ✅）：adb_client（子进程封装）/ device_manager（设备发现 + getprop 补全）/ transfer_models（计划 / 进度 / 结果 / 远端路径安全）/ map_package_transfer（顺序 + 失败分支）
+│   └── workers/           后台线程桥（Slice 10 ✅）：android_transfer_worker（设备刷新 / 包校验 / 传输三个 QThread）
+├── tests/                  pytest 用例（1299 条；android_fakes.py 是 Slice 10 的假 adb 设备，不是测试文件）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
-├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png）
+├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png / slice10_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
+├── scripts/verify_slice10_android.py Slice 10 实机验收（真 adb 替身 + 真窗口 + 118 项检查 + 截图）
 ├── scripts/verify_slice9_package.py Slice 9 离线地图包实机验收（真窗口 + 75 项检查 + 截图）
 ├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 52 项检查 + 截图）
 ├── scripts/verify_slice7_ui.py Slice 7 实机验收脚本（真窗口 + 49 项检查 + 截图）
@@ -595,6 +750,10 @@ tianditu-offline-tool/
 业务包之间通过 `models` / `geo` 传递数据，不在 UI 层写业务逻辑。
 UI 需要瓦片数据时必须调用 `app.geo`，需要落盘时必须调用 `app.services`，
 **SQLite 只出现在 `app/mbtiles` 里**（`DownloadManager` 与 `app.tasks` 都不依赖数据库）。
+Slice 10 的 `app/android` 是同一套思路的延续：**设备面板不 import `AdbClient`**
+（只 import `TransferPlan` / `TransferProgress` / `DeviceRefreshOutcome` 三个数据类），
+**`app/ui` 里没有任何 `subprocess`**（例外是 `desktop.py`：它用 `open` / `xdg-open`
+打开"输出目录"，与 ADB 无关）。这两条都有静态守卫。
 `app.downloader.resume` 通过**结构化 Protocol**（`TileProbe`）判断"库里有没有这张瓦片"，
 所以它能接收 `MBTilesWriter` / `MBTilesReader` 而**不必 import `app.mbtiles`**——依赖保持无环，
 这条约束有专门的测试守着。
@@ -845,18 +1004,71 @@ MBTiles SHA256 mismatch：manifest 记 1054d100…bcf5，实际 b217e710…372a
 但 `SHA256` 必须变成 `FAIL`。这正是"大小检查挡不住、SHA256 才挡得住"的那类损坏：
 磁盘静默损坏、传输截断、被人手改过，都长这样。
 
+## 用法：传输到 Android 设备
+
+入口是主窗口右上「Android设备」区的 **[刷新设备]** / **[选择地图包]** / **[传输到设备]** 三个按钮
+（**没有菜单项**：这一步有前置依赖——得先插上设备、先有一个包，放进菜单只会变成
+"点了以后报一句错误"）。流程七步，前两步是环境，后面五步才是传输：
+
+```text
+1. ADB        adb 路径 / 版本 / 可用性      ← 未检测到时告诉你去装 Platform Tools
+2. 刷新设备    list[设备]（含未授权 / 离线）
+3. 选设备     只能选 state=device 的那台
+4. 选地图包   选的是**包目录**（不是裸 .mbtiles），选中后立刻后台校验一次
+5. 传         确认框（设备 / 地图 / 大小 / 远端落点）→ 开始 → 进度
+6. 结果       文件大小 / SHA256 / 状态三行分开写
+7. 远端落点   <导入区>/<manifest.id>/
+```
+
+### 配 ADB 路径
+
+优先级：**界面偏好 > 环境变量 `ADB_PATH` > `PATH` 里的 `adb`**。
+没装 Android SDK 也能用——只要 `adb` 在 `PATH` 里，或者设一个 `ADB_PATH`：
+
+```bash
+ADB_PATH=D:/platform-tools/adb.exe python -m app.main
+```
+
+设备列表里 `unauthorized` / `offline` 的**照常显示**：拔插了一半的线、或者还没在手机上
+点"允许 USB 调试"，看到"没有设备"只会更困惑。如实显示，然后在 [传输到设备] 上拦住
+（按钮是灰的，鼠标悬停有原因）。
+
+### 远端落点
+
+```text
+<导入区>/<manifest.id>/
+```
+
+`manifest.id` 是**文件里的内容**，会被拼进设备端命令，因此过白名单
+（`A-Z a-z 0-9 _ - .`，其余换 `_`，`..` 单独挡掉）。默认导入区是
+`/sdcard/Download/TiandituOfflineMap/import`——**公共目录**，不需要 root，
+也不是 `/data/data`。
+
+### 常见情形
+
+| 现象 | 程序怎么做 |
+|---|---|
+| 设备上已有同名包 | **先停下来问**，绝不静默覆盖；点了「覆盖」才删旧包重传 |
+| 传输中想停止 | [取消传输] 杀掉 `adb push`，删掉自己的 `.part`，**不动**设备上已有的完整包 |
+| 传输中拔线 | 报"设备断开"，并且**故意保留** `.part`——那是排查"线是不是松了"的实物证据 |
+| 设备没有 `sha256sum` | 大小对得上就算成功，只给一条 WARNING（Android 版本差异，不是错误） |
+| 空间不够 | 拦下，并写出"需要多少 / 可用多少" |
+| `df` 输出解析不了 | 给一条 WARNING 然后**继续**——为解析失败拦住用户是本末倒置 |
+
 ## 后续计划
 
-- **ADB 导入** —— 设备发现、push `map.mbtiles`、设备侧校验（`app/android/` 目前只有
-  包文档，无实现）
+- **Slice 11：Android 端导入** —— 端侧读 `<导入区>/<id>/manifest.json`、校验 SHA256、
+  把 `map.mbtiles` 交给 osmdroid 加载。Slice 10 只负责把文件**搬到设备上并证明搬对了**，
+  端侧怎么导入是下一 Slice 的事（`manifest.json` 最后传就是给它当"包齐了"的信号用的）
 - 失败瓦片清单与单点重试、速度曲线
-- Android / osmdroid（端侧读取离线包）
+- 传输历史的可视化留档
 
 > 以上**尚未排期**，不再用 Slice 号承诺时间。已经交付的是：Slice 8 = MBTiles 检查与
-> 诊断工具，Slice 9 = 离线地图包构建与校验（manifest + 流式 SHA256 + 篡改检测）。
-> 每个 Slice 的 Spec 都会明确禁止"顺手做下一个"——Slice 9 的 Spec 就点名不许在这一
-> 个里实现 ADB、不许做 zip 压缩、不许加密、不许在打包时"顺手修一下" MBTiles。所以
-> ADB 导入是**下一个** Slice 的事，不是这一个的。包校验器**只读**：它报告问题，不改东西。
+> 诊断工具，Slice 9 = 离线地图包构建与校验（manifest + 流式 SHA256 + 篡改检测），
+> Slice 10 = ADB 设备管理与离线地图包传输（Windows → Android）。
+> 每个 Slice 的 Spec 都会明确禁止"顺手做下一个"——Slice 10 的 Spec 就点名不许在这一
+> 个里实现 Android 端导入、不许碰 App 私有目录、不许 `adb install` / `root` / `remount`、
+> 不许压缩、不许改 MBTiles。所以端侧导入是**下一个** Slice 的事，不是这一个的。
 
 ## 说明与注意事项
 

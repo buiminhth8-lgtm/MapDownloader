@@ -270,12 +270,9 @@ HTTP_LIBRARY_LOG_LEVEL: int = 30  # logging.WARNING
 UI_TEXT_APP_TITLE: str = APP_NAME
 UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 
-#: 设备区占位说明。ADB / Android 导入**不在 Slice 7 的范围内**
-#: （Slice 7 排给了"Windows GUI 下载管理"，Spec §29 明确禁止实现 ADB），
-#: 因此这里不再承诺某个具体 Slice 编号，只如实说明"点了不会执行 adb"，
-#: 不能让人误以为按钮坏了。
-#: 文案与 ``main_window`` 里的动作提示保持一致。
-UI_TEXT_DEVICE_HINT: str = "本版本不执行 adb 命令，设备管理（ADB）尚未实现"
+#: 设备区提示语。Slice 0 的占位文案（"本版本不执行 adb 命令…"）在 Slice 10
+#: 已经作废，定义挪到下面 Slice 10 的文案区，**只此一处**——
+#: 同名常量定义两次时后一个静默生效，改前一个等于改注释。
 
 #: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）
 UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
@@ -848,4 +845,331 @@ PACKAGE_LINE_MANIFEST: str = "manifest：{path}"
 PACKAGE_LINE_MBTILES: str = "map.mbtiles：{path}"
 PACKAGE_LINE_SHA256: str = "SHA256：{sha256}"
 PACKAGE_LINE_VALIDATION: str = "验证结论：{result}"
+
+
+# --------------------------------------------------------------------------- #
+# Slice 10：ADB 设备管理与离线地图包传输（Spec §2 ~ §47）
+# --------------------------------------------------------------------------- #
+#: 用户配置 ADB 路径用的**环境变量**名（Spec §2）。
+#: 解析优先级：用户配置 > 这个环境变量 > :data:`DEFAULT_ADB_EXECUTABLE`。
+#: 解析函数是 :func:`app.android.adb_client.resolve_adb_path`（配置项留在这里，
+#: 但"怎么选"是行为，不该塞进一个纯常量模块）。
+ADB_PATH_ENV_VAR: str = "ADB_PATH"
+
+#: 什么都没配置时的默认值：交给系统 ``PATH`` 去找 ``adb``。
+#:
+#: **绝不**写死开发机上的 ``C:\Users\<某人>\AppData\Local\Android\Sdk\platform-tools\adb.exe``：
+#: 那种路径在别人机器上必然不存在，还会把开发者的目录结构泄露进仓库。
+DEFAULT_ADB_EXECUTABLE: str = "adb"
+
+#: 设备端的公共临时导入区（Spec §2 / §14）。
+#:
+#: 刻意选 ``/sdcard`` 下的公共目录：不碰 ``/data/data``、``/data/user``、
+#: ``/system``、``/vendor``，因此**不需要 root、不需要 adb remount**。
+#: 最终"从导入区搬进 App 私有目录"是 Android 端（Slice 11）的事。
+DEFAULT_ANDROID_IMPORT_DIR: str = "/sdcard/Download/TiandituOfflineMap/import"
+
+#: 传输中的临时后缀（Spec §20）。大文件先落 ``map.mbtiles.part``，传完再
+#: ``adb shell mv`` 改成正式名字——这样 Android 端永远不会看到一个"名字齐了、
+#: 内容却只写了一半"的包。
+TRANSFER_PART_SUFFIX: str = ".part"
+
+# --- 各种 adb 调用的超时（秒）------------------------------------------------
+# 分开定义是因为合理量级差得远：``version`` / ``getprop`` 是毫秒级，
+# 而 ``push`` 一个 GB 级文件是分钟级。用一个大一统的超时只能二选一：
+# 要么把慢操作误杀，要么让快操作卡住界面。
+ADB_VERSION_TIMEOUT_SECONDS: float = 10.0
+ADB_DEVICES_TIMEOUT_SECONDS: float = 15.0
+ADB_SHELL_TIMEOUT_SECONDS: float = 20.0
+ADB_FILE_SIZE_TIMEOUT_SECONDS: float = 20.0
+ADB_REMOTE_DELETE_TIMEOUT_SECONDS: float = 30.0
+#: 远端算 SHA256 要读完整个文件，给得宽一些（大文件 + 慢闪存）
+ADB_SHA256_TIMEOUT_SECONDS: float = 300.0
+#: 空间检查（``df``）偶尔会因为挂载点被占住而卡住，不值得等太久
+ADB_DF_TIMEOUT_SECONDS: float = 20.0
+
+#: 读 ``adb push`` 输出时的轮询间隔（秒）。0.15 约等于 Slice 3 的进度节流，
+#: 再密也只是刷更多无意义的百分比。
+ADB_PUSH_POLL_INTERVAL_SECONDS: float = 0.15
+
+#: 传输阶段的进度区间（Spec §30）。与 Slice 9 的 ``PACKAGE_BUILD_STAGE_RANGES``
+#: 同一个思路：区间在配置里定死，界面与传输层不会各算一套。
+#: 大头给 ``mbtiles``（字节全在那儿），其余各占几个点。
+TRANSFER_STAGE_RANGES: dict[str, tuple[int, int]] = {
+    "check": (0, 6),
+    "device": (6, 10),
+    "space": (10, 14),
+    "mkdir": (14, 18),
+    "mbtiles": (18, 88),
+    "rename": (88, 92),
+    "manifest": (92, 97),
+    "verify": (97, 100),
+    # ``done`` 是收尾帧：区间收成一点，进度条才会**停在 100** 而不是
+    # 停在 ``verify`` 的起点。缺了它 ``_ProgressReporter`` 会退回默认区间
+    # ``(0, 100)``，于是最后一帧变成 0% —— 进度条在成功那一刻倒退到底。
+    "done": (100, 100),
+}
+
+#: 传输阶段的中文文案（Spec §30 / §34 的日志与状态行都用这一套）
+TRANSFER_STAGE_TEXT: dict[str, str] = {
+    "check": "正在验证本地地图包…",
+    "device": "正在检查设备状态…",
+    "space": "正在检查设备存储空间…",
+    "mkdir": "正在创建远端目录…",
+    "mbtiles": "正在传输 map.mbtiles…",
+    "rename": "正在整理远端文件…",
+    "manifest": "正在传输 manifest.json…",
+    "verify": "正在校验远端文件…",
+    "done": "传输完成",
+}
+
+#: 取消时写进日志的一句（单独一条，因为它是**结果**而不是阶段）
+TRANSFER_STAGE_CANCELLED_TEXT: str = "传输已取消"
+
+#: 远端目录名的字符白名单（Spec §15）。``manifest.id`` 要经过它才能拼进
+#: Android 路径 —— 只留 ``A-Z a-z 0-9 _ - .``，其余一律换成 ``_``。
+#:
+#: 注意 ``.`` 是**允许**的（``beijing_20260916`` 里没有，但 ``v1.2`` 里可能有），
+#: 而 ``..`` 这种纯点组合会被单独的规则挡掉（见 ``sanitize_remote_id``）。
+ANDROID_REMOTE_ID_PATTERN: str = r"[^A-Za-z0-9_.-]"
+
+#: 远端目录名的长度上限（文件系统与 adb 命令行的双重考虑）
+ANDROID_REMOTE_ID_MAX_LENGTH: int = 64
+
+#: 规整之后什么都不剩时的兜底名字（不能是空串：空串拼出来是父目录本身）
+ANDROID_REMOTE_ID_FALLBACK: str = "package"
+
+#: 远端 SHA256 的命令候选（Spec §26）。按顺序试，第一个能跑出 64 位十六进制
+#: 的就是它。Android 上的 ``sha256sum`` 可能是 toybox 提供的，也可能完全没有
+#: —— 那是**正常情况**，不是错误。
+ADB_SHA256_COMMAND_CANDIDATES: tuple[tuple[str, ...], ...] = (
+    ("sha256sum",),
+    ("toybox", "sha256sum"),
+    ("busybox", "sha256sum"),
+)
+
+#: 远端文件大小的命令候选（Spec §25）。``stat -c %s`` 在 toybox 上不一定支持
+#: （常见输出是 ``stat: Unknown option``），退到 ``wc -c`` 几乎总能work。
+ADB_SIZE_COMMAND_CANDIDATES: tuple[tuple[str, ...], ...] = (
+    ("stat", "-c", "%s"),
+    ("wc", "-c"),
+)
+
+#: ``sha256sum`` 输出里的摘要长度（64 位十六进制）
+ADB_SHA256_HEX_LENGTH: int = 64
+
+#: 设备断开判定：``adb push`` 的 stderr 里出现这些片段就认为是设备掉了。
+#: 大小写不敏感。宁可多认几种——"传了一半设备没了"必须和"文件写坏了"分开报。
+ADB_DISCONNECT_HINTS: tuple[str, ...] = (
+    "device offline",
+    "device not found",
+    "no devices/emulators found",
+    "device unauthorized",
+    "connection reset by peer",
+    "closed",
+)
+
+#: 补充设备信息用的 ``getprop`` 属性名（Spec §7）。
+#:
+#: 只取这四个：厂商 / 型号 / Android 版本 / SDK。其余上百个属性对本工具没有
+#: 用途，多问一个就多一次 adb 往返。
+ANDROID_PROP_MANUFACTURER: str = "ro.product.manufacturer"
+ANDROID_PROP_MODEL: str = "ro.product.model"
+ANDROID_PROP_ANDROID_VERSION: str = "ro.build.version.release"
+ANDROID_PROP_SDK_VERSION: str = "ro.build.version.sdk"
+
+#: ``adb devices -l`` 的输出解析（Spec §6）。
+#: 表头这一行**不是设备**，必须跳过；否则界面上会多出一台叫 "List" 的设备。
+ADB_DEVICES_HEADER: str = "List of devices attached"
+
+# --- GUI 文案（Spec §9 ~ §11 / §30 ~ §34）------------------------------------
+#: 设备列表的空状态（沿用 Slice 0 起的文案与控件形状，测试也认它）
+# UI_TEXT_DEVICE_EMPTY 已在上面定义，此处不重复。
+
+#: 面板上的常规提示：ADB 可用、还没选设备时显示
+UI_TEXT_DEVICE_HINT: str = "选择一台已授权的设备，再选一个标准离线地图包后传输。"
+
+#: ADB 不存在（Spec §10）。两句话：为什么、以及怎么办。
+UI_TEXT_DEVICE_ADB_MISSING: str = (
+    "未检测到 ADB。\n"
+    "请安装 Android Platform Tools，或配置 ADB_PATH。"
+)
+
+#: 设备未授权（Spec §9）。**不提供**任何"自动绕过"的入口——那是用户必须在
+#: 手机上点一下的事，程序替他绕过等于绕过了 Android 的安全模型。
+UI_TEXT_DEVICE_UNAUTHORIZED: str = (
+    "设备未授权。\n"
+    "请检查 Android 设备，并确认「允许 USB 调试」，然后点击 [刷新设备]。"
+)
+
+#: 设备离线（Spec §35）
+UI_TEXT_DEVICE_OFFLINE: str = "设备已离线。请重新插拔 USB 或重启 adb，然后点击 [刷新设备]。"
+
+#: 设备列表里的一行（Spec §6 解析出来的字段）
+UI_TEXT_DEVICE_LINE: str = "{name} — {state}"
+UI_TEXT_DEVICE_LINE_UNKNOWN: str = "未知设备"
+
+#: 设备详情区的字段名（Spec §11 的"状态 / 厂商 / 型号 / Android / SDK"）
+UI_TEXT_DEVICE_FIELD_ADB: str = "ADB"
+UI_TEXT_DEVICE_FIELD_ADB_STATUS: str = "状态"
+UI_TEXT_DEVICE_FIELD_STATE: str = "状态"
+UI_TEXT_DEVICE_FIELD_MANUFACTURER: str = "厂商"
+UI_TEXT_DEVICE_FIELD_MODEL: str = "型号"
+UI_TEXT_DEVICE_FIELD_ANDROID: str = "Android"
+UI_TEXT_DEVICE_FIELD_SDK: str = "SDK"
+UI_TEXT_DEVICE_FIELD_SERIAL: str = "序列号"
+
+#: 面板分组标题（Spec §11）
+UI_TEXT_DEVICE_GROUP: str = "Android设备"
+UI_TEXT_DEVICE_GROUP_PACKAGE: str = "地图包"
+UI_TEXT_DEVICE_GROUP_TRANSFER: str = "传输"
+
+#: 按钮（Spec §11 / §30）
+UI_TEXT_DEVICE_BUTTON_REFRESH: str = "刷新设备"
+UI_TEXT_DEVICE_BUTTON_IMPORT: str = "传输到设备"
+UI_TEXT_DEVICE_BUTTON_CHOOSE_PACKAGE: str = "选择地图包"
+UI_TEXT_DEVICE_BUTTON_VALIDATE: str = "验证地图包"
+UI_TEXT_DEVICE_BUTTON_CANCEL: str = "取消传输"
+
+#: ADB 状态行的文案
+UI_TEXT_DEVICE_ADB_AVAILABLE: str = "可用"
+UI_TEXT_DEVICE_ADB_UNAVAILABLE: str = "不可用"
+UI_TEXT_DEVICE_ADB_VERSION: str = "ADB：{path}\n版本：{version}\n状态：{status}"
+
+#: 远端目录标签（Spec §11）
+UI_TEXT_DEVICE_REMOTE_LABEL: str = "远端目录"
+UI_TEXT_DEVICE_PACKAGE_LABEL: str = "地图包"
+
+#: 传输状态（Spec §30）
+UI_TEXT_TRANSFER_STATUS_READY: str = "READY"
+UI_TEXT_TRANSFER_STATUS_RUNNING: str = "TRANSFERRING"
+UI_TEXT_TRANSFER_STATUS_DONE: str = "COMPLETED"
+UI_TEXT_TRANSFER_STATUS_FAILED: str = "FAILED"
+UI_TEXT_TRANSFER_STATUS_CANCELLED: str = "CANCELLED"
+
+#: 传输进度区的字段名（Spec §30 的"当前文件 / 速度 / 已传输"）
+UI_TEXT_TRANSFER_FIELD_STATUS: str = "传输状态"
+UI_TEXT_TRANSFER_FIELD_FILE: str = "当前文件"
+UI_TEXT_TRANSFER_FIELD_SPEED: str = "速度"
+UI_TEXT_TRANSFER_FIELD_BYTES: str = "已传输"
+#: 进度条上的文字。``%p%`` 是 **Qt 自己的**占位符（换成 ``{percent}%`` 会原样
+#: 显示成 "{percent}%"——实体验收截图里抓到的），所以这一条是全项目唯一不用
+#: ``str.format`` 占位符的文案。
+UI_TEXT_TRANSFER_PROGRESS_BAR: str = "%p%"
+UI_TEXT_TRANSFER_BYTES: str = "{done} / {total}"
+UI_TEXT_TRANSFER_SPEED: str = "{speed}/s"
+UI_TEXT_TRANSFER_SPEED_UNKNOWN: str = "—"
+UI_TEXT_TRANSFER_CURRENT_FILE: str = "map.mbtiles.part"
+UI_TEXT_TRANSFER_PLACEHOLDER: str = "—"
+
+#: 传输前确认框（Spec §31）
+UI_TEXT_TRANSFER_CONFIRM_TITLE: str = "开始传输"
+UI_TEXT_TRANSFER_CONFIRM_BODY: str = (
+    "设备：\n{serial}\n{device}\n\n"
+    "地图：\n{package}\n\n"
+    "大小：\n{size}\n\n"
+    "远端：\n{remote}\n\n"
+    "是否开始？"
+)
+UI_TEXT_TRANSFER_CONFIRM_START: str = "开始"
+UI_TEXT_TRANSFER_CONFIRM_CANCEL: str = "取消"
+
+#: 远端已存在同名包（Spec §24）。**不允许**静默覆盖。
+UI_TEXT_TRANSFER_EXISTS_TITLE: str = "设备中已存在同名地图包"
+UI_TEXT_TRANSFER_EXISTS_BODY: str = (
+    "设备中已存在同名地图包：\n{package_id}\n\n"
+    "远端路径：\n{remote}\n\n"
+    "选择「覆盖」会先删除设备上的旧地图包，再重新传输。"
+)
+UI_TEXT_TRANSFER_BUTTON_OVERWRITE: str = "覆盖"
+
+#: 传输完成（Spec §32 / §33）。SHA256 不可用时状态是 WARNING，不是 FAIL。
+UI_TEXT_TRANSFER_COMPLETE_TITLE: str = "地图包传输完成"
+UI_TEXT_TRANSFER_COMPLETE_BODY: str = (
+    "设备：\n{device}\n\n"
+    "远端目录：\n{remote}\n\n"
+    "文件：\n{files}\n\n"
+    "文件大小：\n{size_status}\n\n"
+    "SHA256：\n{checksum_status}\n\n"
+    "状态：\n{status}"
+)
+UI_TEXT_TRANSFER_COMPLETE_FILES: str = "map.mbtiles\nmanifest.json"
+UI_TEXT_TRANSFER_STATUS_WAITING_IMPORT: str = "等待 Android App 导入"
+#: SHA256 不可用时的措辞（Spec §33）：说清楚"没验证"，但**不**说"失败"
+UI_TEXT_TRANSFER_SHA256_UNAVAILABLE: str = "设备不支持远端 SHA256，未验证"
+
+#: 传输失败（Spec §35 / §41）
+UI_TEXT_TRANSFER_FAILED_TITLE: str = "地图包传输失败"
+UI_TEXT_TRANSFER_FAILED_BODY: str = "原因：\n{reason}"
+UI_TEXT_TRANSFER_CANCELLED_TITLE: str = "传输已取消"
+UI_TEXT_TRANSFER_CANCELLED_BODY: str = (
+    "传输已取消。\n\n"
+    "设备上可能残留 map.mbtiles.part，下次传输会自动清理；\n"
+    "已经存在的完整地图包不会被删除。"
+)
+
+#: 设备面板的状态行与错误（Spec §10 / §11 / §12 / §14）
+UI_TEXT_TRANSFER_NEED_DEVICE: str = "请先选择一台状态为「已连接」的设备"
+UI_TEXT_TRANSFER_NEED_PACKAGE: str = "请先选择一个地图包目录（内含 map.mbtiles 与 manifest.json）"
+UI_TEXT_TRANSFER_PACKAGE_INVALID: str = "地图包校验未通过，已停止传输：{reasons}"
+UI_TEXT_TRANSFER_RUNNING: str = "正在传输…"
+UI_TEXT_TRANSFER_BUSY: str = "上一次传输尚未结束，已忽略本次请求"
+UI_TEXT_TRANSFER_CHOOSE_PACKAGE_TITLE: str = "选择离线地图包目录"
+UI_TEXT_TRANSFER_CANCELLING: str = "正在取消传输…"
+
+#: 日志（Spec §34）。逐条对照：ADB detected / Devices refreshed / Selected device /
+#: Package validation PASS / Transfer started / Remote directory created /
+#: Pushing ... / Remote size verified / Remote SHA256 verified / Transfer completed
+LOG_ADB_DETECTED: str = "ADB detected: {path}（{version}）"
+LOG_ADB_MISSING: str = "ADB not found（{path}）：{error}"
+LOG_DEVICES_REFRESHED: str = "Devices refreshed: {count} 台"
+LOG_DEVICE_SELECTED: str = "Selected device {serial}（{name}）"
+LOG_PACKAGE_VALIDATED: str = "Package validation PASS: {path}"
+LOG_PACKAGE_INVALID: str = "Package validation FAIL: {reasons}"
+LOG_TRANSFER_STARTED: str = "Transfer started: {package_id} → {remote}"
+LOG_TRANSFER_REMOTE_MKDIR: str = "Remote directory created: {remote}"
+LOG_TRANSFER_PUSH: str = "Pushing {file} …"
+LOG_TRANSFER_SIZE_OK: str = "Remote size verified: {file}（{size} 字节）"
+LOG_TRANSFER_SHA256_OK: str = "Remote SHA256 verified: {file}"
+LOG_TRANSFER_SHA256_SKIPPED: str = "Remote SHA256 unavailable; file size verified only."
+LOG_TRANSFER_COMPLETED: str = "Transfer completed: {remote}"
+LOG_TRANSFER_CANCELLED: str = "Transfer cancelled by user"
+LOG_TRANSFER_FAILED: str = "Transfer failed: {reason}"
+LOG_TRANSFER_PART_CLEANED: str = "Residual .part removed: {path}"
+
+#: 失败原因文案（Spec §16 ~ §35）
+TRANSFER_ERROR_DEVICE_UNKNOWN: str = "设备不存在：{serial}"
+TRANSFER_ERROR_DEVICE_NOT_READY: str = "设备当前不可传输（{state}）：{serial}"
+TRANSFER_ERROR_DEVICE_UNAUTHORIZED: str = "设备未授权，无法传输：{serial}。请在手机上允许 USB 调试后重试。"
+TRANSFER_ERROR_DEVICE_OFFLINE: str = "设备已离线：{serial}"
+TRANSFER_ERROR_NO_SPACE: str = "Android设备存储空间不足：需要 {needed}，可用 {available}"
+TRANSFER_ERROR_MKDIR: str = "创建远端目录失败：{remote}（{error}）"
+TRANSFER_ERROR_PUSH_MBTILES: str = "传输 map.mbtiles 失败：{error}"
+TRANSFER_ERROR_PUSH_MANIFEST: str = "传输 manifest.json 失败：{error}"
+TRANSFER_ERROR_RENAME: str = "整理远端文件失败：{error}"
+TRANSFER_ERROR_SIZE_MISMATCH: str = "远端文件大小不一致：{file} 本地 {expected} 字节，远端 {actual} 字节"
+TRANSFER_ERROR_SIZE_UNKNOWN: str = "无法读取远端文件大小：{file}"
+TRANSFER_ERROR_SHA256_MISMATCH: str = "远端 SHA256 mismatch：{file} manifest 记录 {expected}，远端 {actual}"
+TRANSFER_ERROR_DISCONNECTED: str = "Device disconnected during transfer"
+TRANSFER_ERROR_CANCELLED: str = "Transfer cancelled"
+TRANSFER_ERROR_REMOTE_DELETE: str = "删除远端旧地图包失败：{remote}（{error}）"
+TRANSFER_ERROR_PACKAGE_DIR_MISSING: str = "地图包目录不存在：{path}"
+TRANSFER_ERROR_LOCAL_FILE_MISSING: str = "地图包里缺少文件：{path}"
+TRANSFER_ERROR_NOT_DIR: str = "地图包路径不是目录：{path}"
+TRANSFER_ERROR_REMOTE_ROOT: str = "远端目录不安全，已停止传输：{root}"
+TRANSFER_ERROR_LOCAL_SIZE_MISMATCH: str = (
+    "本地地图包不完整：{file} manifest 记录 {expected} 字节，实际 {actual} 字节"
+)
+
+#: 软警告（Spec §17 / §26）。WARNING 与 FAIL 的区别必须能被用户一眼看出来。
+TRANSFER_WARNING_DF_UNPARSABLE: str = "无法确认设备剩余空间，已继续传输"
+TRANSFER_WARNING_SHA256_UNAVAILABLE: str = "Remote SHA256 unavailable; file size verified only."
+TRANSFER_WARNING_PART_LEFT: str = "设备上残留未完成的临时文件：{path}"
+TRANSFER_WARNING_OLD_PART_CLEANED: str = "已清理上次残留的临时文件：{path}"
+TRANSFER_WARNING_STORAGE_LOW: str = "设备剩余空间偏紧（可用 {available}，需要 {needed}）"
+
+#: 结果行模板（Spec §32 的完成框与结果对象共用）
+TRANSFER_LINE_REMOTE_DIR: str = "远端目录：{path}"
+TRANSFER_LINE_MBTILES_SIZE: str = "map.mbtiles：{size}"
+TRANSFER_LINE_MANIFEST_SIZE: str = "manifest.json：{size}"
 
