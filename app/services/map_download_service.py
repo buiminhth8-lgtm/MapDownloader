@@ -62,6 +62,7 @@ from app.config.settings import (
     MBTILES_BOUNDS_TOLERANCE,
     MBTILES_FILE_SUFFIX,
     MBTILES_PROVIDER_TIANDITU,
+    MBTILES_VALIDATE_SAMPLE_LIMIT,
     PROGRESS_EMIT_INTERVAL_SECONDS,
     UI_TEXT_COMPOSITION_MERGED,
     UI_TEXT_COMPOSITION_SINGLE,
@@ -84,14 +85,15 @@ from app.downloader import (
 )
 from app.geo import GeoBounds, estimate_tile_count, format_size
 from app.mbtiles import (
+    MBTilesDiagnosticsResult,
     MBTilesMetadata,
     MBTilesReader,
     MBTilesTileSink,
     MBTilesValidationResult,
     MBTilesWriteError,
     MBTilesWriter,
-    validate_mbtiles,
 )
+from app.services.mbtiles_inspection_service import MBTilesInspectionService
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import (
     COMPOSITION_SINGLE,
@@ -547,6 +549,10 @@ class MapDownloadOutcome:
     skip_mode: SkipMode | None = None
     #: 不能标成"已完成"的原因（``None`` 表示没有阻碍）
     stop_reason: str | None = None
+    #: Slice 8（Spec §22）：完成后的**快速诊断**结论。``validation`` 是它的
+    #: 窄视图（老接口），这里保留完整结论是为了让完成小结能显示
+    #: "缺失瓦片 / 抽样损坏"这类 ``MBTilesValidationResult`` 装不下的信息。
+    diagnostics: MBTilesDiagnosticsResult | None = None
 
     @property
     def composition_text(self) -> str:
@@ -765,6 +771,9 @@ class MapDownloadService:
         self._progress_interval = progress_interval_seconds
         self._transport = transport
         self._composer = composer
+        #: Slice 8（Spec §22）：下载结束后的校验升级为"快速诊断"。
+        #: 一个无状态的纯函数式对象，可以安全地常驻复用。
+        self._inspection = MBTilesInspectionService()
 
         self._manager: DownloadManager | None = None
         self._sink: MBTilesTileSink | None = None
@@ -1206,7 +1215,17 @@ class MapDownloadService:
             raise MBTilesWriteError(message) from write_error
 
         tile_count, file_size = self._inspect(path)
-        validation = validate_mbtiles(path)
+        # Spec §22：完成后的校验从"基础校验"升级为"快速诊断"——
+        # 结构与统计、metadata、坐标、覆盖完整性、图片抽样全跑一遍，
+        # 但 **deep_scan 保持 False**：每次下载结束都全量解码几十万张图片
+        # 是不可接受的（那是 GUI 上"深度检查"按钮的活儿）。
+        # 抽样张数沿用 Slice 4 的 20 张，落在 Spec 要求的 20~50 区间内。
+        diagnostics = self._inspection.inspect(
+            path,
+            sample_size=MBTILES_VALIDATE_SAMPLE_LIMIT,
+            check_coverage=True,
+        )
+        validation = diagnostics.to_validation()
         _logger.info(
             "Map saved path=%s tiles=%d size=%s zoom=%s valid=%s",
             path.name,
@@ -1245,6 +1264,7 @@ class MapDownloadService:
             existing_tiles=existing_tiles,
             target_tiles=total,
             skip_mode=index.mode if policy.enabled else None,
+            diagnostics=diagnostics,
         )
         # 终态在**数据流出这一层**落地：GUI / 脚本 / 测试任何调用方都自动获得
         # 正确的任务状态，不必各自记得"跑完之后别忘了写状态"。

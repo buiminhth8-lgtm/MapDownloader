@@ -45,6 +45,9 @@ from app.providers import detect_image_format
 
 __all__ = [
     "validate_mbtiles",
+    "parse_bounds",
+    "parse_zoom",
+    "parse_bool",
     "REQUIRED_METADATA_KEYS",
     "OPTIONAL_METADATA_KEYS",
     "COMPOSITION_METADATA_KEYS",
@@ -81,9 +84,14 @@ COMPOSITION_METADATA_KEYS: tuple[str, ...] = (
 _MAX_REPORTED_BAD_SAMPLES = 3
 
 
-def _parse_bounds(value: str) -> tuple[float, float, float, float] | None:
-    """解析 ``west,south,east,north``；失败返回 ``None``。"""
-    parts = [piece.strip() for piece in value.split(",")]
+def parse_bounds(value: str) -> tuple[float, float, float, float] | None:
+    """解析 ``west,south,east,north``；失败返回 ``None``。
+
+    Slice 8 起从私有改成公开：诊断模块也要解析同一份 ``bounds`` 文本，
+    而"怎么把一个字符串读成四个数"这件事必须只有一处实现 ——
+    两处各写一份的结果是"校验说能解析、诊断说不能"这种自相矛盾。
+    """
+    parts = [piece.strip() for piece in str(value).split(",")]
     if len(parts) != 4:
         return None
     try:
@@ -92,10 +100,10 @@ def _parse_bounds(value: str) -> tuple[float, float, float, float] | None:
         return None
 
 
-def _parse_zoom(value: str) -> int | None:
+def parse_zoom(value: str) -> int | None:
     """解析 zoom 字段；失败返回 ``None``。"""
     try:
-        return int(value.strip())
+        return int(str(value).strip())
     except (TypeError, ValueError):
         return None
 
@@ -190,7 +198,7 @@ def _check_metadata(reader: MBTilesReader, result: MBTilesValidationResult) -> N
 
     bounds = metadata.get("bounds")
     if bounds is not None:
-        parsed = _parse_bounds(bounds)
+        parsed = parse_bounds(bounds)
         if parsed is None:
             result.errors.append(f"metadata.bounds 无法解析为 west,south,east,north：{bounds!r}")
         else:
@@ -205,7 +213,7 @@ def _check_metadata(reader: MBTilesReader, result: MBTilesValidationResult) -> N
         raw = metadata.get(key)
         if raw is None:
             continue
-        value = _parse_zoom(raw)
+        value = parse_zoom(raw)
         if value is None:
             result.errors.append(f"metadata.{key} 不是整数：{raw!r}")
         elif not TILE_MATH_MIN_ZOOM <= value <= TILE_MATH_MAX_ZOOM:
@@ -222,7 +230,7 @@ def _check_metadata(reader: MBTilesReader, result: MBTilesValidationResult) -> N
     _check_composition(metadata, result)
 
 
-def _parse_bool(value: str) -> bool | None:
+def parse_bool(value: str) -> bool | None:
     """解析 ``true`` / ``false``（大小写不敏感）；不认识返回 ``None``。"""
     text = str(value).strip().lower()
     if text == "true":
@@ -263,7 +271,7 @@ def _check_composition(
 
     raw_labels = metadata.get("labels")
     if raw_labels is not None and str(raw_labels).strip():
-        parsed = _parse_bool(raw_labels)
+        parsed = parse_bool(raw_labels)
         if parsed is None:
             result.errors.append(
                 f"metadata.labels 必须是 true / false：{raw_labels!r}"

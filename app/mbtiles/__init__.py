@@ -13,12 +13,17 @@
 模块划分
 --------
 
-============= ===============================================================
-``models``    ``MBTilesMetadata`` / ``MBTilesValidationResult``（纯数据 + 校验）
-``writer``    ``MBTilesWriter``（SQLite 写入）+ ``MBTilesTileSink``（单消费者异步管线）
-``reader``    ``MBTilesReader``（只读；对外 XYZ，内部 TMS）
-``validator`` ``validate_mbtiles()``（结构与抽样数据校验）
-============= ===============================================================
+============== ==============================================================
+``models``     ``MBTilesMetadata`` / ``MBTilesValidationResult``（纯数据 + 校验）
+``writer``     ``MBTilesWriter``（SQLite 写入）+ ``MBTilesTileSink``（单消费者异步管线）
+``reader``     ``MBTilesReader``（只读；对外 XYZ，内部 TMS）
+``validator``  ``validate_mbtiles()``（结构与抽样数据校验）
+``diagnostics``Slice 8：``MBTilesDiagnosticsResult`` + 各项诊断规则（只读）
+============== ==============================================================
+
+``diagnostics`` 是"检查工具"的知识库：它把 reader 查到的原始事实翻译成
+PASS / WARNING / FAIL 与一份可读可导出的结论。编排（按什么顺序跑、怎么上报
+进度、怎么兜异常）在 :class:`app.services.MBTilesInspectionService`。
 
 坐标约定（贯穿全项目）
 ----------------------
@@ -38,6 +43,14 @@
 - 本包不实现断点续传、不做图层合成、不碰 ADB（Slice 5+）。
 """
 
+from app.mbtiles.diagnostics import (
+    REQUIRED_TABLES,
+    TILES_REQUIRED_COLUMNS,
+    InspectionProgress,
+    MBTilesDiagnosticsResult,
+    ZoomTileStats,
+    render_report,
+)
 from app.mbtiles.models import (
     METADATA_KEY_ORDER,
     SUPPORTED_MAP_TYPES,
@@ -50,6 +63,9 @@ from app.mbtiles.validator import (
     COMPOSITION_METADATA_KEYS,
     OPTIONAL_METADATA_KEYS,
     REQUIRED_METADATA_KEYS,
+    parse_bool,
+    parse_bounds,
+    parse_zoom,
     validate_mbtiles,
 )
 from app.mbtiles.writer import MBTilesTileSink, MBTilesWriteError, MBTilesWriter
@@ -69,7 +85,17 @@ __all__ = [
     "MBTilesReader",
     # 校验
     "validate_mbtiles",
+    "parse_bounds",
+    "parse_zoom",
+    "parse_bool",
     "REQUIRED_METADATA_KEYS",
     "OPTIONAL_METADATA_KEYS",
     "COMPOSITION_METADATA_KEYS",
+    # 诊断（Slice 8）
+    "MBTilesDiagnosticsResult",
+    "ZoomTileStats",
+    "InspectionProgress",
+    "render_report",
+    "TILES_REQUIRED_COLUMNS",
+    "REQUIRED_TABLES",
 ]

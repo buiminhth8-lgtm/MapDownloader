@@ -6,8 +6,8 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 7：Windows GUI 下载管理与交互完善（状态机按钮矩阵、后台扫描已有瓦片、
-取消 / 完成 / 失败三条收尾路径、界面偏好记忆、任务列表扩到九列）
+Slice 8：MBTiles 完整检查与诊断工具（独立的可视化检查窗口、PASS/WARNING/FAIL
+三档结论、覆盖完整性与缺失瓦片定位、图片抽样与可选深度扫描、文本报告导出）
 
 完整链路：
 
@@ -43,7 +43,74 @@ Validator              (Slice 4：结构 + 抽样数据校验；Slice 6 增加�
 TaskService            (Slice 5：状态判定 + 落盘；启动时 DOWNLOADING → PAUSED)
     ↓
 UiTaskState 矩阵        (Slice 7：把"状态"翻译成"哪几个按钮能点"，逐格可断言)
+    ↓
+MBTilesInspectionService (Slice 8：同一个检查工具，下载收尾时自动跑一次"快速"档)
+    ↓
+MBTilesInspectorDialog (Slice 8：手动打开的独立检查窗口，可快速 / 深度 / 导出报告)
 ```
+
+## Slice 8：MBTiles 完整检查与诊断工具
+
+**"这个 .mbtiles 到底能不能用、哪里有问题"必须是一份看得见、写得下、导得出的结论**，
+而不是让用户自己装个 SQLite 工具去看。Slice 8 把 Slice 4 那个只回答"能不能读"的
+`validate_mbtiles`，升级成一个独立的诊断工具：`app/mbtiles/diagnostics.py` 负责
+**判定规则**，`app/services/mbtiles_inspection_service.py` 负责**编排**（顺序、
+进度、兜异常），`app/ui/mbtiles_inspector_dialog.py` 负责**展示**。
+
+三层各管一件事，这是本 Slice 最重要的一条边界：Reader 只回答"库里有什么"（SQL
+只出现在它那里），diagnostics 只回答"这算不算问题"，service 只回答"按什么顺序跑"。
+好处是规则可以脱离 SQLite 单独断言 —— 构造一个假的 reader 就能测。
+
+- **三档结论，`PASS` 必须是可达的** —— `errors` 有内容 → `FAIL`；只有 `warnings`
+  → `WARNING`；都没有 → `PASS`。看起来平平无奇，但这里藏着一个真实的坑：Slice 4
+  校验器会把"已抽样检查 N 张瓦片""抽样 N 张的图片格式为 [...]"这类**说明性文字**
+  写进 `warnings`，如果直接并进来，一个完美文件也会被判成 `WARNING` —— **`PASS`
+  将永远不可达**。于是诊断结果多了第三档 `notices`（普通提示）：它照样显示、照样
+  进报告，但**不影响结论**。这也正是 Spec §20 那句"少个 description 不该判 FAIL"
+  的落点（缺 `description` 只记 `WARNING`，文件仍然 `valid=True`）。
+
+- **检查项**（Spec §3–§14）：文件存在 / 是普通文件 / 非空 → SQLite 可打开 →
+  `metadata` 与 `tiles` 表存在、`tiles` 四个必需字段齐全 → `PRAGMA quick_check`
+  （重量级的 `integrity_check` 只在深度检查时跑）→ metadata 诊断（`format` 读不读
+  得动、`bounds` 是否落在 ±180 / ±85.05112878 之内、声明 zoom 与实际 zoom 是否一致）
+  → Zoom 统计（一条 `GROUP BY`，**绝不读 `tile_data`**）→ TMS/XYZ 坐标越界 →
+  重复坐标 → 空瓦片 → 图片抽样 → 覆盖完整性 → 可选全量深度扫描。
+
+- **抽样是分层的，而且可复现** —— 每个 zoom 都抽一点，而不是 `ORDER BY zoom_level
+  LIMIT 50`（那会全落在最小 zoom 上，"z17 的瓦片坏了"这种问题**永远抽不到**）；
+  定位用 `OFFSET` 而不是 `ORDER BY random()`（后者要先给全表排序建临时 B-tree）。
+  同一份库每次抽到同一批，结论才可能被复现 —— "有时 PASS 有时 FAIL"根本没法排查。
+
+- **图片判定的两级** —— magic bytes（复用 Slice 2 的 `detect_image_format`）先否掉
+  错误页/被截断的响应体；再用 Pillow `verify()` 真解一遍容器结构。**只有第二级才
+  抓得到"PNG 文件头 + 垃圾正文"**，而这恰恰是下载链路最容易产生的一类损坏。
+
+- **覆盖完整性复用 Slice 1 的 `calculate_tile_range`** —— 下载时算的目标集合与这里
+  算的期望集合必须语义一致，否则"下完了却报缺失"这种自相矛盾的结论迟早会出现。
+  缺失明细按 **XYZ** 输出（`z/x/y`），并且**封顶 100 条**：世界范围 z14 是 1.6 亿格，
+  把一个坏库的缺失坐标全展开，报告就成了几百 MB 的垃圾。缺得多时报告里写"另有
+  N 张未展开"。缺失**只记 WARNING，绝不判 FAIL** —— 结构与图片都有效时，文件仍然
+  局部可用，用户拿它看已经下好的那一块完全没问题。
+
+- **深度检查必须流式，而且必须能被放弃** —— `iter_tiles()` 走 `fetchmany(500)` 分批，
+  **不是** `fetchall()`：50 万张瓦片每张几十 KB，一次性取回就是几个 GB 的常驻内存。
+  用户关掉对话框时靠 `should_stop` 回调让扫描尽快收手，并按 `deep_scan_complete`
+  标明"没扫完"—— 半截的损坏张数被当成全量结论，是"数字对不上"里最难查的一类 bug。
+
+- **不许跑在 Qt 主线程**（Spec §18）—— 检查要跑几十秒甚至几分钟，全部在
+  `MBTilesInspectionWorker`（`QThread`）里执行，经队列信号回主线程；
+  对话框**绝不带 `WA_DeleteOnClose`**（后台线程还在跑时销毁它的 QThread 会让 Qt
+  直接中止进程），关窗走 `shutdown()`：先置放弃标记、再有界 `wait()`。
+
+- **只读**（Spec §23）—— 连接由 Reader 以 `mode=ro` 打开，诊断层只发
+  `SELECT` / `PRAGMA`，一条写语句都没有。唯一的写盘是**旁边的报告文本**
+  `xxx.mbtiles.report.txt`（UTF-8），检查工具绝不修库。
+
+- **下载收尾顺手诊断一次**（Spec §22）—— 下载完成链路改调
+  `MBTilesInspectionService.inspect(..., deep_scan=False, sample_size≈20)`，
+  完成弹窗里因此能多报出"缺失瓦片"与"抽样损坏"两项；绝不会为了这个在每次下载结束
+  后全量解一遍图片。老接口 `MBTilesValidationResult` 由 `to_validation()` 桥接，
+  字段语义不变，既有调用方无需改动。
 
 ## Slice 7：Windows GUI 下载管理与交互完善
 
@@ -234,8 +301,10 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 883 passed
+python -m pytest                # 973 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
+python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
+                                                    # 只跑 Slice 8 诊断规则 + 编排层
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -289,6 +358,25 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 （见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
 
+Slice 8 的检查窗口用专门的验收脚本留档（它同时是一份**可重复的实机验收**）：
+
+```bash
+python scripts/verify_slice8_inspector.py              # 真窗口 + 49 项检查 + 截图
+python scripts/verify_slice8_inspector.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice8_inspector.py --no-shots   # 只跑检查，不截图
+```
+
+它真的造四种文件（正常 / 缺瓦片 / 含坏图片 / 非 SQLite）、真的点按钮、真的等后台
+线程，然后按结论分别截 `docs/slice8_inspector_{pass,warning,fail,idle}.png`。
+
+> 为什么不能只靠 `pytest`：`pytest` 跑在 Qt `offscreen` 平台上，没有真实字体、
+> 没有 DPI 缩放、没有系统深浅色主题。而"检查"这个功能的价值**恰恰全在展示上**。
+> 这套脚本确实抓出过两个 offscreen 测试看不见的问题：状态那一行被判成
+> `PASS` 却在窄窗口里被裁掉一半；以及 Pillow 的原始报错
+> （`cannot identify image file <_io.BytesIO object at 0x…>`）**连对象地址一起**
+> 被写进了界面和报告 —— 用户看不懂，而且同一份坏文件每次的文案都不一样，
+> 根本没法比对。
+
 ### 实机验收（Spec §28 场景 A–E）
 
 ```bash
@@ -325,24 +413,26 @@ tianditu-offline-tool/
 │   ├── main.py            入口（日志初始化 + QApplication + MainWindow）
 │   ├── config/settings.py 全局常量，唯一魔数来源
 │   ├── models/            纯数据模型（dataclass / enum），不依赖 UI
-│   ├── ui/                界面层：主窗口 + 各面板 + 三个 QThread 桥
+│   ├── ui/                界面层：主窗口 + 各面板 + 四个 QThread 桥
 │   │                      （download_worker 跑编排 / connection_check 发 HTTP /
-│   │                       tile_scan_worker 查 SQLite）
+│   │                       tile_scan_worker 查 SQLite / mbtiles_inspector_dialog
+│   │                       里的 MBTilesInspectionWorker 跑诊断）
 │   │                      外加纯逻辑模块：task_actions（按钮矩阵）/ validation（校验）/
-│   │                       preferences（QSettings 偏好）/ widgets（折行标签）/ desktop（打开目录）
+│   │                       preferences（QSettings 偏好）/ widgets（折行标签 + 主题色）/ desktop（打开目录）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
 │   ├── geo/               瓦片坐标计算：bounds.py + tile_math.py（Slice 1 ✅）
 │   ├── downloader/        下载引擎：models / retry_policy / rate_limiter / tile_downloader / download_manager / resume / composite_tile_downloader（Slice 3 ✅ + Slice 5 ✅ + Slice 6 ✅）
-│   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）
+│   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）+ diagnostics（Slice 8 ✅：全部判定规则与结论模型）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
 │   ├── composer/          瓦片合成：tile_composer.py（Pillow alpha 合成，无状态可复用）（Slice 6 ✅）
-│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）
+│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）+ mbtiles_inspection_service.py（Slice 8 ✅：检查编排 / 进度 / 报告落盘）
 │   ├── package/           离线包打包与校验（尚未排期）
 │   └── android/           ADB 设备管理与导入（尚未排期；目前只有包文档，无实现）
-├── tests/                  pytest 用例（883 条）
+├── tests/                  pytest 用例（973 条）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
-├── docs/                   设计文档 + 界面留档截图（slice7_*.png）
+├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
+├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 49 项检查 + 截图）
 ├── scripts/verify_slice7_ui.py Slice 7 实机验收脚本（真窗口 + 49 项检查 + 截图）
 ├── scripts/verify_resume.py 断点续传端到端验证脚本（假服务端，不触网、不耗配额）
 ├── pytest.ini              pytest 配置（asyncio_mode = auto）
@@ -472,6 +562,37 @@ python scripts/verify_resume.py
 脚本跑三轮——「下到一半取消 → 重新打开只下缺的 → 全部已有再点一次」，把每轮的
 请求数 / 库里张数 / 任务状态都打出来；数字对不上就以非 0 退出码结束。
 
+## 用法：检查 MBTiles（诊断一个已有地图包）
+
+三种打开方式，都是同一个检查窗口（非模态，检查期间主界面照常可用）：
+
+- 菜单 **文件 → 检查 MBTiles…**
+- 主界面右侧「下载任务」列里选中一条 → 点 **[检查]**（自动带上该任务的产物路径）
+- 在窗口里点 **[选择文件…]** 自己挑任意 `.mbtiles`
+
+窗口里两个按钮的区别就是"花多少时间"：
+
+- **[快速检查]** —— 结构 + metadata + Zoom 统计 + 坐标 + 重复/空瓦片 + 覆盖完整性
+  + **分层抽样**图片（默认 50 张）。秒级到十几秒，日常用这个。
+- **[深度检查]** —— 在快速检查之外，**逐张**校验全部 `tile_data`（流式，不占内存），
+  同时把 SQLite 自检升级成 `PRAGMA integrity_check`。几十万张的库是分钟级操作。
+  窗口关掉可以随时放弃，结论会标明"没扫完"。
+
+结果区三档：
+
+| 结论 | 含义 | 判定 |
+| --- | --- | --- |
+| `PASS` | 没有发现问题 | 无 ERROR 且无 WARNING（普通提示不影响） |
+| `WARNING` | 文件可用，但有可疑之处 | 例如：缺 `description`、覆盖缺几张、声明 zoom 与实际不一致、`format=webp` 本工具读不动 |
+| `FAIL` | 文件有问题，不该直接用 | 例如：不是 SQLite、缺表/缺字段、坐标越界、空瓦片、图片无法解码、bounds 越界 |
+
+**[导出报告]** 会在被检查文件**旁边**写一个 `xxx.mbtiles.report.txt`（UTF-8），
+内容包含 metadata、逐 zoom 的期望/实际/缺失、缺失瓦片明细（XYZ，最多 100 条）、
+抽样与深度扫描统计、错误/告警/提示三档清单、以及最终结论 —— 直接贴进 issue 就能用。
+
+另外，**每次下载跑完都会自动跑一次"快速"档诊断**（`deep_scan=False`、抽样 20 张），
+完成弹窗里因此会多出"缺失瓦片 / 抽样损坏"两项。
+
 ## 后续计划
 
 - **离线包打包与校验** —— 地图包 manifest、Sha256 校验、离线包体积统计
@@ -479,8 +600,9 @@ python scripts/verify_resume.py
 - 失败瓦片清单与单点重试、速度曲线
 - Android / osmdroid（端侧读取离线包）
 
-> 以上都**尚未排期**，不再用 Slice 号承诺。Slice 7 排给了 Windows GUI 下载管理，
-> 而 Spec 明确禁止在那个 Slice 里实现 ADB——即不许用设备功能挤掉本 Slice 的交付。
+> 以上都**尚未排期**，不再用 Slice 号承诺。Slice 8 排给了 MBTiles 检查与诊断工具，
+> 而 Spec 明确禁止在那个 Slice 里实现 ADB / 打包 / 自动修复 MBTiles——即不许用设备
+> 功能或"顺手修一下"挤掉本 Slice 的交付。检查工具**只读**：它报告问题，不改库。
 
 ## 说明与注意事项
 
@@ -491,6 +613,10 @@ python scripts/verify_resume.py
   翻转只发生在 `MBTilesWriter` / `MBTilesReader` 内部的边界上，且复用 Slice 1 的
   `xyz_y_to_tms_y()`，没有第二套公式。一致性由测试锁住：`z=3, x=4, y_xyz=2`
   必须写成 `tile_row = 2³ − 1 − 2 = 5`，并且能用 `read_tile(3, 4, 2)` 读回来。
+  Slice 8 的诊断还多了一条推论：**坐标越界的行根本没有对应的 XYZ**，所以
+  `tms_y_to_xyz_y()` 对它会按契约抛 `ValueError`。"列出越界样本"本身就是在处理
+  越界行，因此那里必须容错（`_xyz_hint`）—— 否则一个专门用来报错的检查，会在
+  格式化自己的结论时崩掉，用户只看到一句"坐标检查失败"，永远不知道是哪张瓦片坏了。
 - **天地图 WMTS 的 `_w` 是"左上原点"** —— 请求 URL 里的 `TILEROW` 就是 **XYZ 的 `y`**，
   发请求时**不要**翻成 TMS；翻只翻存储那一次。写续传相关测试时这一点最容易搞错
   （把请求坐标也当成 TMS 去比对，会得到"跳过的瓦片又被请求了"的假故障）。

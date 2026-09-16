@@ -16,6 +16,10 @@
 
     DownloadTask(output_path) → 读已有 metadata → 一致性校验
         → ExistingTileIndex（已有瓦片跳过）→ 只下缺失的 → 写回同一个文件
+
+Slice 8 增加了第二个服务 :class:`MBTilesInspectionService`：把
+"检查一个已有 .mbtiles"编排成一个动作（Reader → Validator → Diagnostics），
+供 GUI 的检查对话框与下载完成后的快速诊断共用。
 """
 
 from app.services.map_download_service import (
@@ -29,6 +33,7 @@ from app.services.map_download_service import (
     read_existing_metadata,
     sanitize_map_name,
 )
+from app.services.mbtiles_inspection_service import MBTilesInspectionService
 
 __all__ = [
     "MapDownloadOutcome",
@@ -40,4 +45,6 @@ __all__ = [
     "read_existing_metadata",
     "build_output_path",
     "sanitize_map_name",
+    # Slice 8
+    "MBTilesInspectionService",
 ]

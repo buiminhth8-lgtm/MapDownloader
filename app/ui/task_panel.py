@@ -11,9 +11,9 @@ r"""下载任务列表面板（Slice 5；Slice 7 扩到九列 + 选中信息区�
     状态：已暂停（Zoom 8 ~ 17，矢量地图 + 中文注记）
     MBTiles：D:\maps\beijing.mbtiles
     文件已存在（1.42 GB），继续时已有瓦片会自动跳过
-    [继续] [删除记录]
+    [继续] [删除记录] [检查 MBTiles]
 
-面板只做三件事：展示任务、把"继续/删除/双击/选中"变成信号抛出去。
+面板只做三件事：展示任务、把"继续/删除/检查/双击/选中"变成信号抛出去。
 **它不碰 tasks.json、不拼路径、不去数瓦片**——那些是 ``app.tasks`` 与
 ``MainWindow`` 的职责。信息区里的"文件已存在"只做一次 ``is_file()``：
 数瓦片要查 SQLite，那是禁止在 Qt 主线程做的事（Spec §7）。
@@ -53,6 +53,8 @@ from PySide6.QtWidgets import (
 
 from app.config.settings import (
     TASK_PANEL_MAX_ROWS,
+    UI_TEXT_INSPECT_BUTTON,
+    UI_TEXT_INSPECT_BUTTON_HINT,
     UI_TEXT_TASK_DELETE,
     UI_TEXT_TASK_DELETE_HINT,
     UI_TEXT_TASK_INFO,
@@ -116,6 +118,10 @@ class TaskPanel(QGroupBox):
     #: 用户选中了一行（参数：task_id）；未选中任何行时参数为空串。
     #: MainWindow 用它把任务标记成"当前任务"，从而驱动按钮状态矩阵。
     selection_changed = Signal(str)
+    #: 用户点了「检查 MBTiles」（参数：选中任务的输出文件路径，没选中则为空串）。
+    #: Slice 8：检查工具是**独立**的（能检查任意 .mbtiles），因此这里只把
+    #: 选中的那个文件当作"方便的预填值"，为空也照样能开窗口另选。
+    inspect_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("下载任务", parent)
@@ -160,10 +166,17 @@ class TaskPanel(QGroupBox):
         self._resume_button = QPushButton(UI_TEXT_TASK_RESUME, self)
         self._delete_button = QPushButton(UI_TEXT_TASK_DELETE, self)
         self._delete_button.setToolTip(UI_TEXT_TASK_DELETE_HINT)
+        # Slice 8：检查入口放在任务面板的按钮行里（同一行加一个按钮，
+        # 面板高度不变——左列已经排到折叠线，任何"多占 30px"都可能把
+        # 「总进度」顶出可视区，那条红线由既有布局测试守着）。
+        # 它**始终可用**：检查是只读的，跟有没有选中任务、有没有在下载都无关。
+        self._inspect_button = QPushButton(UI_TEXT_INSPECT_BUTTON, self)
+        self._inspect_button.setToolTip(UI_TEXT_INSPECT_BUTTON_HINT)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self._resume_button)
         button_row.addWidget(self._delete_button)
+        button_row.addWidget(self._inspect_button)
         button_row.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -174,6 +187,7 @@ class TaskPanel(QGroupBox):
 
         self._resume_button.clicked.connect(self._on_resume_clicked)
         self._delete_button.clicked.connect(self._on_delete_clicked)
+        self._inspect_button.clicked.connect(self._on_inspect_clicked)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
 
@@ -260,6 +274,11 @@ class TaskPanel(QGroupBox):
     def delete_button(self) -> QPushButton:
         """「删除记录」按钮。"""
         return self._delete_button
+
+    @property
+    def inspect_button(self) -> QPushButton:
+        """「检查 MBTiles」按钮（Slice 8）。"""
+        return self._inspect_button
 
     @property
     def empty_label(self):
@@ -423,6 +442,18 @@ class TaskPanel(QGroupBox):
         task_id = self.selected_task_id()
         if task_id:
             self.delete_requested.emit(task_id)
+
+    @Slot()
+    def _on_inspect_clicked(self) -> None:
+        """「检查 MBTiles」：把选中任务的输出文件作为预填路径抛出去。
+
+        没选中任务时抛空串 —— 检查窗口照样能打开，让用户自己挑文件。
+        """
+        task = self._tasks.get(self.selected_task_id() or "")
+        path = ""
+        if task is not None and task.output_path:
+            path = str(task.output_path)
+        self.inspect_requested.emit(path)
 
     @Slot(QTableWidgetItem)
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:

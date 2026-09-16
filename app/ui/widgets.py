@@ -19,7 +19,9 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 __all__ = [
     "WrappingLabel",
     "apply_secondary_text",
+    "relative_luminance",
     "secondary_text_color",
+    "status_text_color",
     "wrap_anywhere",
 ]
 
@@ -68,6 +70,56 @@ def apply_secondary_text(widget: QWidget) -> None:
     palette = widget.palette()
     palette.setColor(QPalette.ColorRole.WindowText, secondary_text_color(palette))
     widget.setPalette(palette)
+
+
+#: 语义色（PASS 绿 / WARNING 琥珀 / FAIL 红）朝黑压的比例（浅色主题用）。
+_TEXT_TINT_ON_LIGHT = 0.35
+#: 语义色朝白提的比例（深色主题用）。
+_TEXT_TINT_ON_DARK = 0.45
+
+
+def relative_luminance(color: QColor) -> float:
+    """WCAG 相对亮度（0 = 黑，1 = 白）。
+
+    单独公开出来是为了让"对比度够不够"这件事可被**断言**：光看颜色值
+    说明不了任何问题，只有算出来才知道（Slice 7 的次要文字隐形就是这么发现的）。
+    """
+    channels = []
+    for value in (color.red(), color.green(), color.blue()):
+        ratio = value / 255
+        channels.append(ratio / 12.92 if ratio <= 0.03928 else ((ratio + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def status_text_color(palette: QPalette, base: QColor | str) -> QColor:
+    """把语义色（PASS 绿 / WARNING 琥珀 / FAIL 红）调成**当前主题下读得清**的颜色。
+
+    为什么不直接用那三个固定的十六进制值：任何颜色都不可能同时对纯白与
+    深色窗口背景都达到 4.5:1 —— 两个背景的亮度差了近 80 倍，这是数学上的
+    不可能，不是调参问题。因此按背景明暗把语义色**压暗或提亮**：
+    浅色主题往黑压、深色主题往白提，保住色相、拉开亮度。
+
+    Args:
+        palette: 取值来源（通常传控件的 ``palette()``）。
+        base: 语义色（``QColor`` 或 ``"#rrggbb"``）。
+
+    Returns:
+        适合当前背景的前景色。
+    """
+    color = QColor(base)
+    background = palette.color(QPalette.ColorRole.Window)
+    if relative_luminance(background) > 0.5:
+        return _mix(color, QColor(0, 0, 0), _TEXT_TINT_ON_LIGHT)
+    return _mix(color, QColor(255, 255, 255), _TEXT_TINT_ON_DARK)
+
+
+def _mix(color: QColor, other: QColor, weight: float) -> QColor:
+    """把 ``color`` 朝 ``other`` 混合 ``weight`` 比例（0 = 原样，1 = 全变）。"""
+    return QColor(
+        round(color.red() * (1 - weight) + other.red() * weight),
+        round(color.green() * (1 - weight) + other.green() * weight),
+        round(color.blue() * (1 - weight) + other.blue() * weight),
+    )
 
 
 def wrap_anywhere(text: str, width: int, metrics: QFontMetrics) -> str:

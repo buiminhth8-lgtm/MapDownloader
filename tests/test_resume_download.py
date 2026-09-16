@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 
 from app.config import settings
 from app.downloader import RateLimiter, ResumePolicy, RetryPolicy, SkipMode
@@ -36,7 +38,23 @@ from app.tasks import TaskService, TaskStore
 FAKE_TOKEN = "abcdefghijklmn"
 LAYER = MapLayerType.VECTOR
 
-FAKE_PNG = PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + b"tile-payload" * 8
+def _real_png() -> bytes:
+    """一张**真的**能被 Pillow 解码的 PNG，而不是"PNG 文件头 + 垃圾正文"。
+
+    Slice 4 时合成字节就够了（当时的下载后校验只看 magic bytes）。Slice 8 起
+    收尾校验升级成了完整诊断，会真的走 ``Image.open + verify()``，于是
+    "头对、正文是垃圾"会被正确地判成损坏瓦片 —— 那不是代码坏了，是夹具不再
+    真实。用真图之后 ``outcome.validation.valid is True`` 才真正说明
+    "这条路写出来的是一份可用地图"。
+    """
+    buffer = io.BytesIO()
+    Image.new("RGBA", (16, 16), (0, 0, 0, 0)).save(buffer, format="PNG")
+    data = buffer.getvalue()
+    assert data.startswith(PNG_SIGNATURE)
+    return data
+
+
+FAKE_PNG = _real_png()
 
 NO_RETRY = RetryPolicy(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0)
 NO_RATE_LIMIT = RateLimiter.disabled()

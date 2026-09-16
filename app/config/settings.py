@@ -454,13 +454,18 @@ UI_TEXT_CANCEL_CONFIRM: str = (
 
 #: 下载完成弹窗（Spec §16）
 UI_TEXT_COMPLETE_TITLE: str = "下载完成"
+#: Slice 8（Spec §22）追加了最后两行：完成小结要能一眼看出"有没有缺瓦片、
+#: 抽样的图片有没有坏的"——这两件事原先只写在 ``validation.warnings`` 里，
+#: 用户得去翻日志才知道。
 UI_TEXT_COMPLETE_BODY: str = (
     "文件：{path}\n"
     "地图：{map_type}\n"
     "Zoom：{zooms}\n"
     "瓦片：{tiles:,}\n"
     "文件大小：{size}\n"
-    "验证：{validation}"
+    "验证：{validation}\n"
+    "缺失瓦片：{missing}\n"
+    "抽样损坏：{corrupt}"
 )
 UI_TEXT_OPEN_DIRECTORY: str = "打开目录"
 UI_TEXT_OPEN_DIRECTORY_FAILED: str = "无法打开目录：{path}\n（{error}）"
@@ -495,4 +500,146 @@ UI_TEXT_TASK_INFO: str = (
 #: 想要那个数字，路径就在上面，点「继续」时程序会去扫描并报出来。
 UI_TEXT_TASK_INFO_FILE_EXISTS: str = "文件已存在（{size}），继续时已有瓦片会自动跳过"
 UI_TEXT_TASK_INFO_FILE_MISSING: str = "文件尚不存在，继续时会新建"
+
+# --------------------------------------------------------------------------- #
+# MBTiles 检查与诊断（Slice 8）
+# --------------------------------------------------------------------------- #
+#: 三档结论（Spec §20）。判定规则收敛在
+#: :meth:`app.mbtiles.diagnostics.MBTilesDiagnosticsResult.status`：
+#: 有 ERROR → FAIL；只有 WARNING → WARNING；都没有 → PASS。
+DIAGNOSTICS_STATUS_PASS: str = "PASS"
+DIAGNOSTICS_STATUS_WARNING: str = "WARNING"
+DIAGNOSTICS_STATUS_FAIL: str = "FAIL"
+
+#: 本工具"能直接读"的瓦片格式（Spec §5）。
+#:
+#: 刻意比 :data:`SUPPORTED_TILE_FORMATS` 窄：``webp`` / ``pbf`` 是 MBTiles 规范
+#: 允许的取值，但 osmdroid 与本项目的合成链路都读不了。遇到它们只记 WARNING
+#: 而不是 ERROR —— 文件对别的客户端可能仍然有效，诊断工具不该替用户判死刑。
+DIAGNOSTICS_SUPPORTED_FORMATS: frozenset[str] = frozenset({"png", "jpg", "jpeg"})
+
+#: 快速检查/深度检查默认抽样多少张瓦片（Spec §10 / §22）。
+#: 50 张足够覆盖"每个 zoom 各抽几张 + 多种图片格式"，又远小于全量。
+DIAGNOSTICS_DEFAULT_SAMPLE_SIZE: int = 50
+
+#: 抽样数量的可接受区间。``1`` 是下限（0 等于不做检查却还报 PASS）；
+#: 上限防止有人在 GUI 上填个 100 万把"快速检查"变成全量扫描。
+DIAGNOSTICS_MIN_SAMPLE_SIZE: int = 1
+DIAGNOSTICS_MAX_SAMPLE_SIZE: int = 500
+
+#: 深度检查（``deep_scan=True``）的候选抽样数。深度扫描本身就是全量，
+#: 这里的抽样结果只作为"概览"展示，取一个比快速检查略大的值即可。
+DIAGNOSTICS_DEEP_SAMPLE_SIZE: int = 100
+
+#: 深度图片扫描时每次从 SQLite 取多少行（Spec §11）。
+#: 500 × 单张几十 KB ≈ 十几 MB 峰值，属于"流式读取"而非"全量载入"。
+DIAGNOSTICS_DEEP_SCAN_BATCH_SIZE: int = 500
+
+#: 缺失瓦片明细最多展开多少条（Spec §13）。一个 z17 级别的库缺几万张是常事，
+#: 全展开既没人看得完，也会把报告文件撑到几十兆。
+MAX_MISSING_TILE_DETAILS: int = 100
+
+#: 缺失比例超过多少时把 WARNING 写得更醒目（Spec §21）。
+#: 1% 是"明显缺了一块"的量级；低于它的零散缺失只记普通提示，
+#: **绝不因此判 FAIL** —— 库结构与图片都有效时，文件仍然是局部可用的。
+DIAGNOSTICS_MISSING_WARNING_RATIO: float = 0.01
+
+#: 诊断报告的后缀（Spec §26）：``beijing.mbtiles`` → ``beijing.mbtiles.report.txt``
+DIAGNOSTICS_REPORT_SUFFIX: str = ".report.txt"
+
+#: GUI：选择 MBTiles 文件时的过滤器
+UI_TEXT_INSPECT_FILE_FILTER: str = "MBTiles 文件 (*.mbtiles);;所有文件 (*)"
+
+#: 检查工具（Spec §16 / §17）
+UI_TEXT_INSPECT_BUTTON: str = "检查 MBTiles"
+UI_TEXT_INSPECT_BUTTON_HINT: str = (
+    "检查任意 .mbtiles 的结构、metadata、Zoom 统计、坐标、覆盖完整性与图片抽样。"
+    "选中一条任务时会自动带上它的输出文件，也可以在检查窗口里另选文件。"
+)
+UI_TEXT_INSPECT_TITLE: str = "MBTiles 检查"
+UI_TEXT_INSPECT_CHOOSE_FILE: str = "选择文件…"
+UI_TEXT_INSPECT_QUICK: str = "快速检查"
+UI_TEXT_INSPECT_DEEP: str = "深度检查"
+UI_TEXT_INSPECT_DEEP_HINT: str = (
+    "深度检查会逐张读取全部 tile_data 校验图片，50 万张瓦片可能耗时数分钟。"
+    "日常使用请用「快速检查」。"
+)
+UI_TEXT_INSPECT_EXPORT: str = "导出报告"
+UI_TEXT_INSPECT_NEED_FILE: str = "请先选择一个 .mbtiles 文件"
+UI_TEXT_INSPECT_RUNNING: str = "正在检查…"
+UI_TEXT_INSPECT_TESTING: str = "检查中，请稍候…"
+UI_TEXT_INSPECT_FILE_LABEL: str = "文件"
+UI_TEXT_INSPECT_SIZE_LABEL: str = "大小"
+UI_TEXT_INSPECT_STATUS_LABEL: str = "状态"
+UI_TEXT_INSPECT_EMPTY_HINT: str = "尚未选择文件。选择一个 .mbtiles 后点「快速检查」。"
+UI_TEXT_INSPECT_GROUP_BASIC: str = "基本信息"
+UI_TEXT_INSPECT_GROUP_ZOOM: str = "Zoom 统计"
+UI_TEXT_INSPECT_GROUP_SAMPLE: str = "图片抽样"
+UI_TEXT_INSPECT_GROUP_DIAG: str = "诊断结果"
+UI_TEXT_INSPECT_EXPORT_DONE: str = "诊断报告已导出：{path}"
+UI_TEXT_INSPECT_EXPORT_FAILED: str = "导出诊断报告失败：{error}"
+UI_TEXT_INSPECT_FAILED: str = "检查失败：{error}"
+
+#: 基本信息区的字段名（顺序即显示顺序）。
+#: 用中文标签 + 原始键名的值：界面语言与全局一致，而 metadata 的键名本身
+#: （``name`` / ``format`` / ``bounds`` …）是 MBTiles 规范的一部分，
+#: 翻译了反而对不上号，所以它们出现在值里，不出现在标签里。
+UI_TEXT_INSPECT_FIELD_NAME: str = "名称"
+UI_TEXT_INSPECT_FIELD_FORMAT: str = "图片格式"
+UI_TEXT_INSPECT_FIELD_BOUNDS: str = "范围"
+UI_TEXT_INSPECT_FIELD_ZOOM: str = "Zoom"
+UI_TEXT_INSPECT_FIELD_TILES: str = "瓦片数"
+UI_TEXT_INSPECT_FIELD_MAP_TYPE: str = "地图类型"
+UI_TEXT_INSPECT_FIELD_COMPOSITION: str = "合成方式"
+UI_TEXT_INSPECT_FIELD_SCHEMA: str = "数据库"
+UI_TEXT_INSPECT_FIELD_CHECK: str = "SQLite 自检"
+
+#: Zoom 统计表的列名（顺序即列顺序）
+UI_TEXT_INSPECT_COLUMN_ZOOM: str = "Zoom"
+UI_TEXT_INSPECT_COLUMN_TILES: str = "瓦片"
+UI_TEXT_INSPECT_COLUMN_EXPECTED: str = "期望"
+UI_TEXT_INSPECT_COLUMN_MISSING: str = "缺失"
+
+#: 抽样结果的四行说明（Spec §17）
+UI_TEXT_INSPECT_SAMPLE_SUMMARY: str = (
+    "抽样：{samples} 张\n"
+    "有效：{valid} 张\n"
+    "损坏：{corrupt} 张\n"
+    "空瓦片：{empty} 张"
+)
+UI_TEXT_INSPECT_SAMPLE_FORMATS: str = "格式：{formats}"
+
+#: 值缺失时的占位符（"没有这一项"与"这一项是 0"必须能分辨）
+UI_TEXT_INSPECT_UNKNOWN: str = "—"
+
+#: 诊断结论的配色（深浅两套主题都要能看清，因此取中等亮度 + 加粗，
+#: 颜色只是辅助信号，文字本身已经写明 PASS / WARNING / FAIL）
+UI_TEXT_INSPECT_COLOR_PASS: str = "#2f9e44"
+UI_TEXT_INSPECT_COLOR_WARNING: str = "#e8a33d"
+UI_TEXT_INSPECT_COLOR_FAIL: str = "#e03131"
+
+#: 报告文件的行模板（Spec §26 要求的内容清单；措辞跟界面一致，用中文）。
+#: 字段名（``name`` / ``format`` / ``bounds`` …）保持原样：那是 MBTiles 规范
+#: 里的键名，翻译了反而对不上号。
+REPORT_FILE_LINE: str = "文件：{path}"
+REPORT_SIZE_LINE: str = "大小：{size}（{bytes} 字节）"
+REPORT_SQLITE_LINE: str = "SQLite quick_check：{result}"
+REPORT_TILE_COUNT_LINE: str = "瓦片总数：{count}"
+REPORT_EXPECTED_LINE: str = "期望总数：{count}"
+REPORT_MISSING_LINE: str = "缺失总数：{count}"
+REPORT_SAMPLE_LINE: str = (
+    "图片抽样：samples={samples} valid={valid} corrupt={corrupt} empty={empty}"
+)
+REPORT_RESULT_LINE: str = "结论：{result}"
+REPORT_METADATA_HEADER: str = "Metadata："
+REPORT_ZOOM_HEADER: str = "Zoom 统计（Zoom | Tiles | Expected | Missing）："
+REPORT_ERRORS_HEADER: str = "Errors："
+REPORT_WARNINGS_HEADER: str = "Warnings："
+#: 普通提示：只是说明检查做了什么，不影响 PASS/WARNING 判定（Spec §20）
+REPORT_NOTICES_HEADER: str = "Notices："
+REPORT_NONE: str = "（无）"
+REPORT_MISSING_DETAIL_HEADER: str = "缺失瓦片（前 {count} 个，XYZ）："
+REPORT_MISSING_DETAIL_TRUNCATED: str = "  …另有 {count:,} 个缺失瓦片未展开显示。"
+REPORT_DEEP_SCAN_LINE: str = "深度扫描：扫描 {scanned:,} 张，损坏 {corrupt:,} 张"
+REPORT_SAMPLE_FORMATS_LINE: str = "抽样格式：{formats}"
 

@@ -10,13 +10,14 @@ Qt / asyncio 边界（Slice 7，Spec §7）
 主线程里**不允许**出现：HTTP 请求、SQLite 查询、Pillow 编解码、MBTiles 校验、
 大量瓦片计算、等待 asyncio。本模块据此把三件事全部推给后台线程：
 
-===========  ==========================================  ==============================
-工作          为什么不能在主线程                          落在哪个 worker
-===========  ==========================================  ==============================
-连通性测试    发 HTTP                                     ``ConnectionTestWorker``
-瓦片下载      发 HTTP / SQLite / Pillow / asyncio 事件循环  ``DownloadWorker``
-已有瓦片扫描  SQLite 计数查询                              ``ExistingTileScanWorker``
-===========  ==========================================  ==============================
+==================  ==========================================  ==============================
+工作                 为什么不能在主线程                          落在哪个 worker
+==================  ==========================================  ==============================
+连通性测试           发 HTTP                                     ``ConnectionTestWorker``
+瓦片下载             发 HTTP / SQLite / Pillow / asyncio 事件循环  ``DownloadWorker``
+已有瓦片扫描         SQLite 计数查询                              ``ExistingTileScanWorker``
+MBTiles 检查（§8）   SQLite 自检 / 聚合 / Pillow 解码             ``MBTilesInspectionWorker``
+==================  ==========================================  ==============================
 
 主线程这边只剩"读表单 → 校验 → 起线程 → 收信号 → 改控件"。
 ``MainWindow`` 里不出现 ``httpx`` / ``sqlite3`` / ``PIL`` 的任何符号，
@@ -73,6 +74,8 @@ from app.config.settings import (
     UI_TEXT_EXIT_WITH_TASK_TITLE,
     UI_TEXT_FAILED_BODY,
     UI_TEXT_FAILED_TITLE,
+    UI_TEXT_INSPECT_BUTTON,
+    UI_TEXT_INSPECT_BUTTON_HINT,
     UI_TEXT_LARGE_TASK_CONFIRM,
     UI_TEXT_LARGE_TASK_CONFIRM_TITLE,
     UI_TEXT_MAP_NAME_AUTO_GENERATED,
@@ -126,6 +129,7 @@ from app.ui.download_panel import (
 )
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
+from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.preferences import UiPreferences
 from app.ui.task_actions import UiTaskState
 from app.ui.task_panel import TaskPanel
@@ -335,6 +339,9 @@ class MainWindow(QMainWindow):
         self._cancel_dialog: QMessageBox | None = None
         self._complete_dialog: QMessageBox | None = None
         self._failed_dialog: QMessageBox | None = None
+        #: MBTiles 检查窗口（Slice 8）。刻意**不**用 ``WA_DeleteOnClose``：
+        #: 后台线程还在读瓦片时销毁它，Qt 会中止整个进程。
+        self._inspector_dialog: MBTilesInspectorDialog | None = None
         #: 关窗确认结果（Spec §17：先提示，用户确认后才真正退出）
         self._exit_confirmed = False
         #: 最近一次"计算"的结果，用于输出路径变化时重绘「输出文件」行
@@ -370,6 +377,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("文件(&F)")
+
+        #: Slice 8：检查任意 .mbtiles。按钮在「下载任务」面板上，菜单里再给一份
+        #: —— 检查是个独立工具，不该逼用户先找到那个面板。
+        self.inspect_action = QAction(f"{UI_TEXT_INSPECT_BUTTON}(&I)…", self)
+        self.inspect_action.setToolTip(UI_TEXT_INSPECT_BUTTON_HINT)
+        # 用 lambda 吞掉 ``triggered`` 的 ``checked`` 参数：直接连过去的话
+        # 那个布尔值会落到 ``path`` 上（碰巧也能跑，但语义是错的）。
+        self.inspect_action.triggered.connect(lambda: self.open_mbtiles_inspector())
+        file_menu.addAction(self.inspect_action)
+        file_menu.addSeparator()
 
         quit_action = QAction("退出(&Q)", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
@@ -455,6 +472,8 @@ class MainWindow(QMainWindow):
         self.task_panel.task_activated.connect(self._on_task_activated)
         # Slice 7：选中任务后，四个动作按钮要跟着那个任务的状态走（Spec §6）
         self.task_panel.selection_changed.connect(self._on_task_selection_changed)
+        # Slice 8：检查工具入口（按钮 + 菜单各一条，都走同一个槽）
+        self.task_panel.inspect_requested.connect(self.open_mbtiles_inspector)
 
     # ------------------------------------------------------------------ #
     # 槽：下载动作
@@ -1428,6 +1447,11 @@ class MainWindow(QMainWindow):
         让他自己去资源管理器里翻是没道理的。
         """
         box = QMessageBox(QMessageBox.Icon.Information, UI_TEXT_COMPLETE_TITLE, "", parent=self)
+        # Slice 8（Spec §22）：完成小结里带上"缺失瓦片 / 抽样损坏"。
+        # 诊断在 service 里已经跑完（快速档，不做全量图片扫描），
+        # 这里只是把结论摆出来；没跑过（老调用方）时显示 "—" 而不是 "0"——
+        # "不知道"和"是 0"必须能分辨。
+        diagnostics = outcome.diagnostics
         box.setText(UI_TEXT_COMPLETE_BODY.format(
             path=outcome.output_path,
             map_type=describe_map_type(
@@ -1437,7 +1461,18 @@ class MainWindow(QMainWindow):
             zooms=outcome.validation.zoom_text,
             tiles=outcome.tile_count,
             size=outcome.size_text,
-            validation=outcome.validation.status_text,
+            validation=(
+                diagnostics.status if diagnostics is not None
+                else outcome.validation.status_text
+            ),
+            missing=(
+                diagnostics.missing_text if diagnostics is not None else "—"
+            ),
+            corrupt=(
+                f"{diagnostics.sample_corrupt}"
+                if diagnostics is not None and diagnostics.sample_size
+                else "—"
+            ),
         ))
         open_button = box.addButton(UI_TEXT_OPEN_DIRECTORY, QMessageBox.ButtonRole.ActionRole)
         close_button = box.addButton(QMessageBox.StandardButton.Close)
@@ -1470,6 +1505,39 @@ class MainWindow(QMainWindow):
         self._failed_dialog = box
         self._forget_dialog_on_destroy("_failed_dialog", box)
         box.show()
+
+    # ------------------------------------------------------------------ #
+    # MBTiles 检查工具（Slice 8）
+    # ------------------------------------------------------------------ #
+    @Slot()
+    @Slot(str)
+    def open_mbtiles_inspector(self, path: str = "") -> None:
+        """打开 MBTiles 检查窗口（Spec §16）。
+
+        刻意**复用同一个对话框实例**：用户往往会"检查完这个再看那个"，
+        每点一次就新建一个窗口，屏幕上会攒出一堆只能逐个关掉的窗口。
+        复用时不清空上一次的结果 —— 新文件还没检查之前，旧结论仍然有参考价值
+        （用户随时可以在里面点「选择文件…」换目标）。
+
+        非模态（``show()``）：检查要跑几十秒甚至几分钟，把主窗口锁住没有道理。
+        """
+        dialog = self._inspector_dialog
+        if dialog is None:
+            # 对话框由 MainWindow 持有，**绝不带 WA_DeleteOnClose**：
+            # 后台线程还在跑时销毁它的 QThread 会让 Qt 直接中止进程
+            # （见该模块的模块级说明）。关掉之后再点「检查」复用同一个实例。
+            dialog = MBTilesInspectorDialog(self)
+            dialog.log_message.connect(self.log_panel.append_log)
+            self._inspector_dialog = dialog
+
+        target = (path or "").strip()
+        if target:
+            dialog.set_path(target)
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.statusBar().showMessage("MBTiles 检查工具", 3000)
 
     @Slot()
     def _on_failed_dialog_resume(self) -> None:
@@ -2083,6 +2151,15 @@ class MainWindow(QMainWindow):
         self._close_dialogs()
         if pending is not None:
             self._discard_plan(pending)
+
+        # Slice 8：检查窗口可能正在读一个几十万张瓦片的库。关掉它并等它有界
+        # 退出——让一个 running 的 QThread 随着父窗口一起被销毁，Qt 会打一行
+        # "QThread: Destroyed while thread is still running" 然后中止进程。
+        inspector = self._inspector_dialog
+        if inspector is not None:
+            self.log_panel.append_log("关闭 MBTiles 检查窗口…")
+            inspector.shutdown()
+            inspector.close()
 
         download = self._download_worker
         running = download is not None and download.isRunning()

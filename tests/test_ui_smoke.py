@@ -62,6 +62,7 @@ from app.ui.download_panel import (
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
+from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.validation import auto_map_name
 
 #: 假 Token（禁止替换为真实密钥）
@@ -2510,3 +2511,203 @@ def test_task_started_from_resume_keeps_merged_composition(
 
     with MBTilesReader(path) as reader:
         assert reader.get_tile_count() == _expected_tile_count(window)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 8：MBTiles 检查与诊断工具
+# --------------------------------------------------------------------------- #
+def _make_complete_map(path: Path, *, zoom: int = 8) -> Path:
+    """写一个**覆盖完整**的地图包（走生产同一条 Writer 路径）。
+
+    ``GOOD_INSPECT_BOUNDS`` 在 z8 下恰好只映射到 1 张瓦片，所以"填满整个
+    期望集合"只要写一张 —— 用例因此能断言到 ``PASS``，而不是被覆盖缺失
+    拖成 ``WARNING``。
+    """
+    bounds = GeoBounds(116.0, 39.0, 116.5, 39.5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = MBTilesWriter(path)
+    writer.open()
+    writer.write_metadata(
+        MBTilesMetadata.for_bounds(bounds, zoom, zoom, name="inspector")
+    )
+    tile_range = calculate_tile_ranges(bounds, zoom, zoom)[0]
+    for x in range(tile_range.min_x, tile_range.max_x + 1):
+        for y in range(tile_range.min_y, tile_range.max_y + 1):
+            writer.write_tile(zoom, x, y, _real_png())
+    writer.close()
+    return path
+
+
+def _open_inspector(window: MainWindow, path: Path | str = "") -> MBTilesInspectorDialog:
+    window.open_mbtiles_inspector(str(path))
+    dialog = window._inspector_dialog
+    assert dialog is not None, "应当创建一个检查对话框"
+    return dialog
+
+
+def _wait_for_inspection(dialog: MBTilesInspectorDialog, qapp, timeout: int = 15_000) -> None:
+    """等后台检查线程结束（并把队列信号送回主线程）。
+
+    检查跑在 :class:`MBTilesInspectionWorker` 里（Spec §18：不许占 Qt 主线程），
+    所以"点一下 + processEvents()"不足以拿到结论，必须真的等线程结束。
+    """
+    worker = dialog.inspection_worker
+    assert worker is not None, "应当已启动后台检查线程"
+    assert worker.wait(timeout) is True, "后台检查线程没有在超时前结束"
+    for _ in range(8):
+        qapp.processEvents()
+
+
+def test_inspect_action_exists_in_file_menu(window: MainWindow) -> None:
+    """[检查 MBTiles] 必须是「文件」菜单里的一项（Spec §16）。"""
+    from app.config.settings import UI_TEXT_INSPECT_BUTTON
+
+    assert UI_TEXT_INSPECT_BUTTON in window.inspect_action.text()
+    # 挂在「文件」菜单下（遍历菜单栏找，而不是依赖局部变量）
+    texts = [
+        action.text()
+        for menu_action in window.menuBar().actions()
+        if menu_action.menu() is not None
+        for action in menu_action.menu().actions()
+    ]
+    assert any(UI_TEXT_INSPECT_BUTTON in text for text in texts)
+
+
+def test_inspector_dialog_is_reused(window: MainWindow, work_dir: Path) -> None:
+    """反复打开复用同一个实例：不然屏幕上会攒一堆只能逐个关掉的窗口。"""
+    first = _open_inspector(window, work_dir / "a.mbtiles")
+    second = _open_inspector(window, work_dir / "b.mbtiles")
+    assert first is second
+    assert first.path.endswith("b.mbtiles")
+
+
+def test_inspector_prefills_path_from_task_panel(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """任务列表里的「检查」要带着选中任务的产物路径打开对话框。"""
+    path = _make_complete_map(work_dir / "selected.mbtiles")
+    task = window.task_service.create_task(
+        name="selected",
+        bounds=GeoBounds(116.0, 39.0, 116.5, 39.5),
+        min_zoom=8,
+        max_zoom=8,
+        map_layer=MapLayerType.VECTOR,
+        output_path=path,
+        total_tiles=1,
+    )
+    window.task_service.set_status(task, DownloadTaskStatus.COMPLETED)
+    window._refresh_task_list(select_id=task.id)
+
+    window.task_panel.inspect_button.click()
+    qapp.processEvents()
+
+    dialog = window._inspector_dialog
+    assert dialog is not None
+    assert dialog.path == str(path)
+
+
+def test_inspector_without_file_reports_and_starts_nothing(
+    window: MainWindow, qapp
+) -> None:
+    """没选文件就点检查 → 只提示，不起线程（Spec §17）。"""
+    dialog = _open_inspector(window)
+    dialog.set_path("")
+    dialog.start_quick_check()
+    qapp.processEvents()
+
+    assert dialog.inspection_worker is None
+    assert dialog.is_running is False
+
+
+def test_inspector_quick_check_reaches_pass(window: MainWindow, work_dir: Path, qapp) -> None:
+    """端到端：一个好文件在对话框里跑完快速检查，结论是 PASS。"""
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    dialog = _open_inspector(window, path)
+
+    dialog.start_quick_check()
+    assert dialog.is_running is True  # 真的起了后台线程
+    _wait_for_inspection(dialog, qapp)
+
+    assert dialog.is_running is False
+    assert dialog.status_value.text() == "PASS"
+    assert dialog.zoom_table.rowCount() >= 1
+
+
+def test_inspector_deep_check_runs_in_background(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    path = _make_complete_map(work_dir / "deep.mbtiles")
+    dialog = _open_inspector(window, path)
+
+    dialog.start_deep_check()
+    worker = dialog.inspection_worker
+    assert worker is not None
+    assert worker.deep_scan is True
+    # 关键：检查必须跑在**别的线程**上，主线程要继续能响应
+    assert worker is not QThread.currentThread()
+    _wait_for_inspection(dialog, qapp)
+    assert dialog.status_value.text() == "PASS"
+
+
+def test_inspector_reports_failure_for_broken_file(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    broken = work_dir / "broken.mbtiles"
+    broken.write_bytes(b"definitely not sqlite" * 16)
+    dialog = _open_inspector(window, broken)
+
+    dialog.start_quick_check()
+    _wait_for_inspection(dialog, qapp)
+
+    assert dialog.status_value.text() == "FAIL"
+
+
+def test_inspector_export_report_writes_next_to_map(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """[导出报告] 落点是被检查文件旁边的 ``xxx.mbtiles.report.txt``（Spec §26）。"""
+    path = _make_complete_map(work_dir / "export.mbtiles")
+    dialog = _open_inspector(window, path)
+    dialog.start_quick_check()
+    _wait_for_inspection(dialog, qapp)
+
+    # 直接调导出（避免测试里弹文件对话框）
+    from app.services import MBTilesInspectionService
+
+    report = MBTilesInspectionService().export_report(dialog.result)
+    assert report.name == "export.mbtiles.report.txt"
+    assert "PASS" in report.read_text(encoding="utf-8")
+
+
+def test_inspector_close_is_safe(window: MainWindow, work_dir: Path, qapp) -> None:
+    """关窗不该崩：对话框**不能**带 WA_DeleteOnClose（后台线程还在跑时会中止进程）。"""
+    assert window._inspector_dialog is None
+    dialog = _open_inspector(window, _make_complete_map(work_dir / "close.mbtiles"))
+
+    assert dialog.close() is True
+    qapp.processEvents()
+    # 实例仍被主窗口持有，可以再打开
+    assert window.open_mbtiles_inspector(str(work_dir / "close.mbtiles")) is None
+    assert window._inspector_dialog is dialog
+
+
+def test_closing_window_shuts_down_inspector(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """主窗口关闭时，检查对话框要先收掉后台线程（否则关程序会卡住）。"""
+    dialog = _open_inspector(window, _make_complete_map(work_dir / "shutdown.mbtiles"))
+    dialog.show()
+    qapp.processEvents()
+
+    window.close()
+    qapp.processEvents()
+    assert dialog.inspection_worker is None
+
+
+def test_inspector_dialog_has_no_qt_main_thread_sql() -> None:
+    """检查对话框里不许出现 SQLite 调用（Spec §18：SQL 只能待在 reader 里）。"""
+    source = inspect.getsource(main_window_module)
+    assert "MBTilesInspectorDialog" in source
+    dialog_source = inspect.getsource(MBTilesInspectorDialog)
+    assert "sqlite3" not in dialog_source
+    assert "SELECT " not in dialog_source
