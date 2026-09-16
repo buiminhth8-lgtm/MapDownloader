@@ -55,7 +55,6 @@ import httpx
 from app.composer import TileComposer
 from app.config.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
-    DEFAULT_MAP_NAME,
     DEFAULT_MBTILES_BATCH_SIZE,
     DEFAULT_MBTILES_QUEUE_CAPACITY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -101,6 +100,10 @@ from app.models.map_layer import (
     MapType,
     composition_for,
 )
+#: Slice 9 起 :func:`sanitize_map_name` 住在 :mod:`app.models.naming`（见那里的
+#: 模块说明：包构建器也要用它，留在服务层会形成循环导入）。这里原样导入并在
+#: ``__all__`` 里继续导出，既有调用方与测试一行都不用改。
+from app.models.naming import sanitize_map_name
 from app.providers import TiandituProvider
 
 __all__ = [
@@ -121,49 +124,6 @@ LayerArgument = MapLayerType | MapType
 
 
 _logger = logging.getLogger(__name__)
-
-
-#: Windows 文件名非法字符（``\ / : * ? " < > |``）与其余控制字符
-_ILLEGAL_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
-
-#: 文件名里不允许出现的保留名（不带扩展名比较）
-_RESERVED_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{i}" for i in range(1, 10)}
-    | {f"LPT{i}" for i in range(1, 10)}
-)
-
-#: 地图名称的最大长度（避免超出文件系统上限）
-_MAX_NAME_LENGTH = 80
-
-
-def sanitize_map_name(name: str) -> str:
-    """把用户输入的地图名称规整成可安全用作文件名的形式。
-
-    只做"最小必要的清理"，不改变用户看得懂的部分：
-
-    - 去掉首尾空白，替换 Windows 非法字符与控制字符为 ``_``；
-    - 去掉结尾的点和空格（Windows 会静默丢弃，导致路径与预期不一致）；
-    - 命中 Windows 保留名（``CON`` / ``LPT1`` …）时加后缀；
-    - 清完为空 → 回退到 ``DEFAULT_MAP_NAME``。
-
-    Args:
-        name: 原始名称。
-
-    Returns:
-        可直接当作文件名主体使用的字符串（不含扩展名）。
-
-    >>> sanitize_map_name("  北京 地图  ")
-    '北京 地图'
-    >>> sanitize_map_name("a/b:c")
-    'a_b_c'
-    """
-    cleaned = _ILLEGAL_NAME_CHARS.sub("_", str(name).strip()).rstrip(". ")
-    if not cleaned:
-        return DEFAULT_MAP_NAME
-    if cleaned.split(".")[0].upper() in _RESERVED_NAMES:
-        cleaned = f"{cleaned}_map"
-    return cleaned[:_MAX_NAME_LENGTH]
 
 
 def build_output_path(output_dir: str | Path, map_name: str) -> Path:

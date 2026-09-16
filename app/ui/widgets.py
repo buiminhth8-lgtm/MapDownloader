@@ -170,6 +170,19 @@ class WrappingLabel(QLabel):
         self._source_text = text
         self._rewrap(force=True)
 
+    def setText(self, text: str) -> None:  # noqa: N802 - 与 QLabel 同名，便于替换
+        """``QLabel.setText`` 的等价物：转发到 :meth:`set_text`。
+
+        **这条转发不是可有可无的糖。** 本类把原始文本存在 ``_source_text`` 里、
+        ``text()`` 读的也是它；如果调用方走的是 ``QLabel.setText``，那么
+        C++ 那边的显示文本被改了，``_source_text`` 却没动 —— 于是
+        "眼睛看到的是新值、``text()`` 读出来的是旧值"（Slice 9 的打包对话框
+        就是这么写的：界面显示正常，断言却全读到占位符 ``—``）。
+        重写之后本类才是文档承诺的那种 ``QLabel`` 替代品：
+        两种写法都指向同一份状态，不存在"哪个是真值"的问题。
+        """
+        self.set_text(text)
+
     def text(self) -> str:  # noqa: A003 - 与 QLabel 同名，便于替换
         """返回**原始**文本（不含自动插入的换行符）。"""
         return self._source_text

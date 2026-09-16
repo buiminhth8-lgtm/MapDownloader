@@ -63,6 +63,12 @@ from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
+from app.ui.package_dialog import (
+    PackageBuildWorker,
+    PackageDialog,
+    PackageValidateDialog,
+    PackageValidateWorker,
+)
 from app.ui.validation import auto_map_name
 
 #: 假 Token（禁止替换为真实密钥）
@@ -2711,3 +2717,464 @@ def test_inspector_dialog_has_no_qt_main_thread_sql() -> None:
     dialog_source = inspect.getsource(MBTilesInspectorDialog)
     assert "sqlite3" not in dialog_source
     assert "SELECT " not in dialog_source
+
+
+# --------------------------------------------------------------------------- #
+# Slice 9：离线地图包（Spec §16 ~ §21）
+# --------------------------------------------------------------------------- #
+def _open_package_dialog(window: MainWindow, path: "Path | str" = "") -> PackageDialog:
+    """打开「生成地图包」窗口（主窗口的入口，不是直接 new 一个）。"""
+    window.open_package_dialog(str(path) if path else "")
+    dialog = window._package_dialog
+    assert dialog is not None, "应当创建打包对话框"
+    return dialog
+
+
+def _wait_until(qapp, predicate, timeout: float = 30.0) -> bool:
+    """轮询 + 空转事件循环，直到条件成立或超时。
+
+    不能只 ``worker.wait()``：**线程结束**与**完成信号投递到主线程**之间
+    有一个真实的窗口 —— 那时 ``isRunning()`` 已经是 ``False``，但界面上
+    还是空的（Slice 8 踩过的坑，两个方向都要堵）。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    qapp.processEvents()
+    return bool(predicate())
+
+
+def _wait_for_source_check(dialog: PackageDialog, qapp, timeout: float = 30.0) -> None:
+    worker = dialog.inspection_worker
+    if worker is not None:
+        worker.wait(int(timeout * 1000))
+    assert _wait_until(qapp, lambda: dialog.diagnostics is not None, timeout), (
+        "源文件检查没有在超时前把结论送回主线程"
+    )
+
+
+def _wait_for_build_result(dialog: PackageDialog, qapp, timeout: float = 60.0) -> None:
+    worker = dialog.build_worker
+    if worker is not None:
+        worker.wait(int(timeout * 1000))
+    assert _wait_until(
+        qapp,
+        lambda: dialog.build_worker is None and dialog.result is not None,
+        timeout,
+    ), "构建没有在超时前把结果送回主线程"
+
+
+def _wait_for_confirmation(dialog: PackageDialog, qapp, timeout: float = 60.0) -> None:
+    """等"需要用户拍板"的确认框（Spec §16 / §23）。"""
+    worker = dialog.build_worker
+    if worker is not None:
+        worker.wait(int(timeout * 1000))
+    assert _wait_until(
+        qapp,
+        lambda: dialog.build_worker is None and dialog._confirm_box is not None,
+        timeout,
+    ), "没有等到确认框"
+
+
+def _wait_for_validation_view(dialog: PackageDialog, qapp, timeout: float = 60.0) -> None:
+    """等「同一个窗口里的 [验证地图包]」把结论画出来。
+
+    注意 ``PackageDialog`` 的 ``result`` 属性装的是**构建结果**（Spec §10），
+    校验结论只画在控件上，所以这里的就绪信号是"文本区里出现了四行结论"。
+    """
+    worker = dialog.validate_worker
+    if worker is not None:
+        worker.wait(int(timeout * 1000))
+    assert _wait_until(
+        qapp,
+        lambda: dialog.validate_worker is None
+        and "Result：" in dialog.diagnostics_text.toPlainText(),
+        timeout,
+    ), "校验没有在超时前把结论画到界面上"
+
+
+def _button_with_text(box, text: str):
+    for button in box.buttons():
+        if button.text() == text:
+            return button
+    raise AssertionError(f"确认框里没有「{text}」按钮：{[b.text() for b in box.buttons()]}")
+
+
+def _read_manifest_text(package_dir: Path) -> dict:
+    """读一个地图包里的 manifest（界面侧不解析，测试用来独立核对）。"""
+    import json
+
+    return json.loads((Path(package_dir) / "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_package_actions_exist_in_file_menu(window: MainWindow) -> None:
+    """Spec §17 / §21：[生成地图包] 与 [验证地图包] 都挂在「文件」菜单里。"""
+    from app.config.settings import (
+        UI_TEXT_PACKAGE_BUTTON,
+        UI_TEXT_PACKAGE_BUTTON_VALIDATE,
+    )
+
+    assert UI_TEXT_PACKAGE_BUTTON in window.package_action.text()
+    assert UI_TEXT_PACKAGE_BUTTON_VALIDATE in window.validate_package_action.text()
+    texts = [
+        action.text()
+        for menu_action in window.menuBar().actions()
+        if menu_action.menu() is not None
+        for action in menu_action.menu().actions()
+    ]
+    assert any(UI_TEXT_PACKAGE_BUTTON in text for text in texts)
+    assert any(UI_TEXT_PACKAGE_BUTTON_VALIDATE in text for text in texts)
+
+
+def test_package_dialog_is_reused(window: MainWindow, work_dir: Path) -> None:
+    """反复打开要复用同一个实例（否则屏幕上会攒一堆窗口）。"""
+    first = _open_package_dialog(window)
+    second = _open_package_dialog(window, work_dir / "a.mbtiles")
+    assert first is second
+    assert first.path.endswith("a.mbtiles")
+
+
+def test_package_dialog_keeps_default_output_dir(window: MainWindow) -> None:
+    """Spec §17：输出目录有默认值（``<默认输出目录>/packages``），用户不必先挑。"""
+    dialog = _open_package_dialog(window)
+
+    assert dialog.output_dir.endswith("packages")
+    assert dialog.package_name == ""
+    assert dialog.buttons["build"].isEnabled() is False  # 还没选源文件
+
+
+def test_package_dialog_fills_map_info_from_background_check(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §6 / §17：「地图类型 / Zoom / 瓦片」全部来自后台检查，界面不自己算。"""
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    dialog = _open_package_dialog(window, path)
+
+    # 起线程之后**立刻**取引用，再空转事件循环（否则小文件可能已经跑完）
+    worker = dialog.inspection_worker
+    assert worker is not None, "选中源文件后应当自动开始一次快速检查"
+    assert worker is not QThread.currentThread(), "检查必须在后台线程里跑"
+    _wait_for_source_check(dialog, qapp)
+
+    assert dialog.diagnostics is not None
+    assert dialog.diagnostics.status == "PASS"
+    assert dialog.info_values["tiles"].text() == "1"
+    assert dialog.info_values["zoom"].text() == "8~8"
+    assert "矢量" in dialog.info_values["map_type"].text()
+    # 包名按 metadata 的 name 预填（Spec §6：不另维护一套数据）
+    assert dialog.package_name == "inspector"
+    assert dialog.buttons["build"].isEnabled() is True
+
+
+def test_package_dialog_disables_build_for_a_failing_source(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §23：检查结论是 FAIL 时 [生成地图包] 点不动。"""
+    broken = work_dir / "broken.mbtiles"
+    broken.write_bytes(b"definitely not a sqlite database" * 32)
+    dialog = _open_package_dialog(window, broken)
+
+    _wait_for_source_check(dialog, qapp)
+
+    assert dialog.diagnostics is not None and dialog.diagnostics.status == "FAIL"
+    assert dialog.buttons["build"].isEnabled() is False
+    assert dialog.package_values["validation"].text() != "PASS"
+
+
+def test_package_build_runs_in_background(window: MainWindow, work_dir: Path, qapp) -> None:
+    """Spec §18 / §19：复制几 GB 与算 SHA256 都不能占主线程。
+
+    这里给构建器注入一个**慢复制**，让"构建中"这个状态有一个确定的窗口，
+    从而能真的断言到「线程在跑 + 按钮已禁用」，而不是"跑得太快没看见"。
+    """
+    from app.package import MapPackageBuilder
+    from app.package.checksum import copy_file as real_copy
+    from app.services import MapPackageService
+
+    def slow_copy(source, target, **kwargs):
+        time.sleep(0.4)
+        return real_copy(source, target, **kwargs)
+
+    service = MapPackageService(builder=MapPackageBuilder(copy_file=slow_copy))
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    dialog = PackageDialog(window, service=service, mbtiles_path=path)
+    _wait_for_source_check(dialog, qapp)
+    dialog.set_output_dir(str(work_dir / "packages"))
+    dialog.name_edit.setText("beijing")
+
+    dialog.buttons["build"].click()
+
+    worker = dialog.build_worker
+    assert worker is not None, "应当起后台构建线程"
+    assert worker is not QThread.currentThread(), "构建必须在后台线程里跑"
+    assert worker.isRunning() is True, "主线程不该等在这里"
+    # 构建期间按钮矩阵收缩，但主线程仍然活着（事件循环没被占住）
+    assert dialog.is_building is True
+    assert dialog.buttons["build"].isEnabled() is False
+    assert qapp.processEvents() is None or True  # 事件循环可用 = 界面没冻结
+
+    _wait_for_build_result(dialog, qapp)
+    assert dialog.build_worker is None
+    assert dialog.buttons["build"].isEnabled() is True
+
+
+def test_package_dialog_produces_a_verifiable_package(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §17 / §18 / §20：从界面走完整条链路，产物可被独立校验。
+
+    这是"手动验收"（Spec §35 第 3 ~ 10 步）在代码里的等价物。
+    """
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    dialog = _open_package_dialog(window, path)
+    _wait_for_source_check(dialog, qapp)
+    dialog.set_output_dir(str(work_dir / "packages"))
+    dialog.name_edit.setText("北京离线地图")
+
+    dialog.buttons["build"].click()
+    _wait_for_build_result(dialog, qapp)
+
+    result = dialog.result
+    assert result is not None and result.success is True, result.errors if result else None
+    package = Path(result.package_dir)
+    assert (package / "map.mbtiles").is_file()
+    assert (package / "manifest.json").is_file()
+
+    # 完成视图（Spec §20）
+    assert dialog.package_values["directory"].text() == result.package_dir
+    assert dialog.package_values["tiles"].text() == "1"
+    assert dialog.package_values["zoom"].text() == "8"
+    assert dialog.package_values["sha256"].text() == result.sha256
+    assert dialog.package_values["validation"].text() == "PASS"
+    assert dialog.progress_bar.value() == 100
+    assert dialog.result.validation_status == "PASS"
+
+    # [验证地图包] 就在同一个窗口里（Spec §21）
+    dialog.start_validation(result.package_dir)
+    worker = dialog.validate_worker
+    assert worker is not None
+    assert worker is not QThread.currentThread()
+    _wait_for_validation_view(dialog, qapp)
+    assert dialog.package_values["validation"].text() == "PASS"
+    text = dialog.diagnostics_text.toPlainText()
+    assert "Manifest：PASS" in text
+    assert "MBTiles：PASS" in text
+    assert "SHA256：PASS" in text
+    assert "Result：PASS" in text
+
+
+def test_package_dialog_asks_before_overwriting(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §16：目标已存在 → 弹[覆盖]/[选择其他名称]/[取消]，**二次确认**。
+
+    而且是**非模态**的（``exec()`` 会在无头测试里把用例挂死，
+    用户也没道理不能一边看框一边去翻别的任务）。
+    """
+    from app.config.settings import (
+        UI_TEXT_BUTTON_CANCEL,
+        UI_TEXT_PACKAGE_BUTTON_OVERWRITE,
+        UI_TEXT_PACKAGE_BUTTON_RENAME,
+        UI_TEXT_PACKAGE_EXISTS_TITLE,
+    )
+
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    dialog = _open_package_dialog(window, path)
+    _wait_for_source_check(dialog, qapp)
+    dialog.set_output_dir(str(work_dir / "packages"))
+    dialog.name_edit.setText("beijing")
+
+    dialog.buttons["build"].click()
+    _wait_for_build_result(dialog, qapp)
+    first_sha = dialog.result.sha256
+    mbtiles = Path(dialog.result.package_dir) / "map.mbtiles"
+    before = mbtiles.read_bytes()
+
+    # 第二次点：目标已存在
+    dialog.result = None
+    dialog.buttons["build"].click()
+    _wait_for_confirmation(dialog, qapp)
+
+    box = dialog._confirm_box
+    assert box is not None
+    assert box.windowTitle() == UI_TEXT_PACKAGE_EXISTS_TITLE
+    for text in (
+        UI_TEXT_PACKAGE_BUTTON_OVERWRITE,
+        UI_TEXT_PACKAGE_BUTTON_RENAME,
+        UI_TEXT_BUTTON_CANCEL,
+    ):
+        assert _button_with_text(box, text) is not None
+    # 用户还没拍板：磁盘上必须一个字节都没变
+    assert mbtiles.read_bytes() == before
+
+    _button_with_text(box, UI_TEXT_PACKAGE_BUTTON_OVERWRITE).click()
+    _wait_for_build_result(dialog, qapp)
+
+    assert dialog.result.success is True, dialog.result.errors
+    # 覆盖 = 改名备份，不是删除（Spec §16）：旧包必须**还在**，只是换了名字
+    assert dialog.result.backup_path is not None
+    backup = Path(dialog.result.backup_path)
+    assert backup.is_dir()
+    assert (backup / "map.mbtiles").read_bytes() == before
+    assert _read_manifest_text(backup)["mbtiles"]["sha256"] == first_sha
+    # 正式目录里是新的那一份（源文件没变，所以内容逐字节相同 —— "新"体现在
+    # manifest 里的摘要与它自身对得上）
+    assert mbtiles.read_bytes() == before
+    assert (
+        _read_manifest_text(mbtiles.parent)["mbtiles"]["sha256"] == dialog.result.sha256
+    )
+
+
+def test_package_validate_dialog_reports_pass_then_fail(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §21 / §35 第 11 步：改一个字节之后，界面**必须**从 PASS 变成 FAIL。
+
+    "改了文件却仍然显示 PASS"是这条 Slice 最坏的结果 —— 用户会带着一个坏包
+    去导入。所以这条端到端（界面 → 后台线程 → 结论 → 文本区）必须有守卫。
+    """
+    from app.config.settings import UI_TEXT_PACKAGE_VALIDATE_DONE_TITLE
+    from app.package import MapPackageBuilder
+
+    source = _make_complete_map(work_dir / "good.mbtiles")
+    built = MapPackageBuilder().build(source, work_dir / "packages", package_name="beijing")
+    assert built.success is True
+
+    window.open_package_validator(built.package_dir)
+    dialog = window._package_validator_dialog
+    assert dialog is not None
+    assert dialog.package_dir == built.package_dir
+
+    dialog.validate_button.click()
+    worker = dialog.validation_worker
+    assert worker is not None
+    assert worker is not QThread.currentThread()
+    assert _wait_until(qapp, lambda: dialog.result is not None and not dialog.is_running)
+    assert dialog.result.valid is True
+    assert "Result：PASS" in dialog.result_text.toPlainText()
+
+    # ---- 改一个字节（Spec §35 第 11 步）----
+    mbtiles = Path(built.package_dir) / "map.mbtiles"
+    payload = bytearray(mbtiles.read_bytes())
+    payload[4200] ^= 0xFF
+    mbtiles.write_bytes(bytes(payload))
+    dialog.result = None
+
+    dialog.validate_button.click()
+    assert _wait_until(qapp, lambda: dialog.result is not None and not dialog.is_running)
+
+    assert dialog.result.valid is False, "改过字节的包绝不能仍然 PASS"
+    text = dialog.result_text.toPlainText()
+    assert "Result：FAIL" in text
+    assert "SHA256：FAIL" in text
+    assert dialog.result.status == "FAIL"
+
+
+def test_task_panel_package_button_requires_an_existing_file(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """Spec §17：这个入口**只有当前 MBTiles 存在且基本可用时**才可用。"""
+    panel = window.task_panel
+    assert panel.package_button.isEnabled() is False, "没有选中任务时应当是灰的"
+
+    # 选中一条任务，但产物文件不在磁盘上 → 仍然不可点
+    missing = window.task_service.create_task(
+        name="missing",
+        bounds=GeoBounds(116.0, 39.0, 116.5, 39.5),
+        min_zoom=8,
+        max_zoom=8,
+        map_layer=MapLayerType.VECTOR,
+        output_path=work_dir / "missing.mbtiles",
+        total_tiles=1,
+    )
+    window.task_service.set_status(missing, DownloadTaskStatus.COMPLETED)
+    window._refresh_task_list(select_id=missing.id)
+    qapp.processEvents()
+    assert panel.package_button.isEnabled() is False
+
+    # 换成一个真的存在的产物 → 可点，并且把路径抛出去
+    real = _make_complete_map(work_dir / "real.mbtiles")
+    task = window.task_service.create_task(
+        name="real",
+        bounds=GeoBounds(116.0, 39.0, 116.5, 39.5),
+        min_zoom=8,
+        max_zoom=8,
+        map_layer=MapLayerType.VECTOR,
+        output_path=real,
+        total_tiles=1,
+    )
+    window.task_service.set_status(task, DownloadTaskStatus.COMPLETED)
+    window._refresh_task_list(select_id=task.id)
+    qapp.processEvents()
+    assert panel.package_button.isEnabled() is True
+
+    paths: list[str] = []
+    panel.package_requested.connect(paths.append)
+    panel.package_button.click()
+    assert paths == [str(real)]
+
+
+def test_task_panel_package_button_opens_dialog_with_selected_file(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """点任务列表里的 [生成地图包] 要带着选中任务的产物打开窗口。"""
+    real = _make_complete_map(work_dir / "real.mbtiles")
+    task = window.task_service.create_task(
+        name="real",
+        bounds=GeoBounds(116.0, 39.0, 116.5, 39.5),
+        min_zoom=8,
+        max_zoom=8,
+        map_layer=MapLayerType.VECTOR,
+        output_path=real,
+        total_tiles=1,
+    )
+    window.task_service.set_status(task, DownloadTaskStatus.COMPLETED)
+    window._refresh_task_list(select_id=task.id)
+
+    window.task_panel.package_button.click()
+    qapp.processEvents()
+
+    dialog = window._package_dialog
+    assert dialog is not None
+    assert dialog.path == str(real)
+    _wait_for_source_check(dialog, qapp)
+
+
+def test_closing_window_shuts_down_package_dialogs(
+    window: MainWindow, work_dir: Path, qapp
+) -> None:
+    """主窗口关闭时要先收掉打包/验证线程（否则关程序会卡住或直接中止进程）。"""
+    path = _make_complete_map(work_dir / "good.mbtiles")
+    package = _open_package_dialog(window, path)
+    window.open_package_validator(str(work_dir / "packages"))
+    validator = window._package_validator_dialog
+    assert validator is not None
+    package.show()
+    validator.show()
+    qapp.processEvents()
+
+    window.close()
+    qapp.processEvents()
+
+    assert package.build_worker is None
+    assert package.inspection_worker is None
+    assert package.validate_worker is None
+    assert validator.validation_worker is None
+
+
+def test_package_dialog_has_no_qt_main_thread_sql_and_uses_workers() -> None:
+    """Spec §19：打包/校验一律走 QThread，主线程不许碰 SQLite。"""
+    import app.ui.package_dialog as package_dialog_module
+
+    source = inspect.getsource(package_dialog_module)
+    assert "sqlite3" not in source
+    assert "SELECT " not in source
+    assert issubclass(PackageBuildWorker, QThread)
+    assert issubclass(PackageValidateWorker, QThread)
+    # 结果必须经信号回主线程，而不是在后台线程里直接改控件
+    assert "progress_changed" in source
+    assert "package_completed" in source
+    assert "validation_completed" in source

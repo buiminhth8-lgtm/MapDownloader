@@ -89,6 +89,10 @@ from app.config.settings import (
     UI_TEXT_OPEN_DIRECTORY,
     UI_TEXT_OPEN_DIRECTORY_FAILED,
     UI_TEXT_OPEN_DIRECTORY_NEED_PATH,
+    UI_TEXT_PACKAGE_BUTTON,
+    UI_TEXT_PACKAGE_BUTTON_HINT,
+    UI_TEXT_PACKAGE_BUTTON_VALIDATE,
+    UI_TEXT_PACKAGE_BUTTON_VALIDATE_HINT,
     UI_TEXT_RESUME_TOKEN_REQUIRED,
     UI_TEXT_SCANNING_EXISTING,
     UI_TEXT_TASK_DELETE_HINT,
@@ -130,6 +134,7 @@ from app.ui.download_panel import (
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
+from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import UiPreferences
 from app.ui.task_actions import UiTaskState
 from app.ui.task_panel import TaskPanel
@@ -342,6 +347,11 @@ class MainWindow(QMainWindow):
         #: MBTiles 检查窗口（Slice 8）。刻意**不**用 ``WA_DeleteOnClose``：
         #: 后台线程还在读瓦片时销毁它，Qt 会中止整个进程。
         self._inspector_dialog: MBTilesInspectorDialog | None = None
+        #: Slice 9：离线地图包的两个窗口。同样由主窗口持有、**不带
+        #: WA_DeleteOnClose**（打包线程跑着时销毁 QThread 会中止进程），
+        #: 关掉之后再打开时复用同一个实例。
+        self._package_dialog: PackageDialog | None = None
+        self._package_validator_dialog: PackageValidateDialog | None = None
         #: 关窗确认结果（Spec §17：先提示，用户确认后才真正退出）
         self._exit_confirmed = False
         #: 最近一次"计算"的结果，用于输出路径变化时重绘「输出文件」行
@@ -386,6 +396,23 @@ class MainWindow(QMainWindow):
         # 那个布尔值会落到 ``path`` 上（碰巧也能跑，但语义是错的）。
         self.inspect_action.triggered.connect(lambda: self.open_mbtiles_inspector())
         file_menu.addAction(self.inspect_action)
+
+        #: Slice 9：把 .mbtiles 打包成离线地图包 / 校验一个已有的包。
+        #: 两个都是独立工具，因此与检查一样放在「文件」菜单里（§17 / §21），
+        #: 下载任务面板上另有 [生成地图包] 按钮（选中任务时可用）。
+        self.package_action = QAction(f"{UI_TEXT_PACKAGE_BUTTON}(&P)…", self)
+        self.package_action.setToolTip(UI_TEXT_PACKAGE_BUTTON_HINT)
+        self.package_action.triggered.connect(lambda: self.open_package_dialog())
+        file_menu.addAction(self.package_action)
+
+        self.validate_package_action = QAction(
+            f"{UI_TEXT_PACKAGE_BUTTON_VALIDATE}(&V)…", self
+        )
+        self.validate_package_action.setToolTip(UI_TEXT_PACKAGE_BUTTON_VALIDATE_HINT)
+        self.validate_package_action.triggered.connect(
+            lambda: self.open_package_validator()
+        )
+        file_menu.addAction(self.validate_package_action)
         file_menu.addSeparator()
 
         quit_action = QAction("退出(&Q)", self)
@@ -474,6 +501,8 @@ class MainWindow(QMainWindow):
         self.task_panel.selection_changed.connect(self._on_task_selection_changed)
         # Slice 8：检查工具入口（按钮 + 菜单各一条，都走同一个槽）
         self.task_panel.inspect_requested.connect(self.open_mbtiles_inspector)
+        # Slice 9：打包入口（任务列表里的 [生成地图包] 带着选中任务的产物路径）
+        self.task_panel.package_requested.connect(self._on_task_package_requested)
 
     # ------------------------------------------------------------------ #
     # 槽：下载动作
@@ -1539,6 +1568,75 @@ class MainWindow(QMainWindow):
         dialog.activateWindow()
         self.statusBar().showMessage("MBTiles 检查工具", 3000)
 
+    # ------------------------------------------------------------------ #
+    # 离线地图包（Slice 9）
+    # ------------------------------------------------------------------ #
+    @Slot()
+    @Slot(str)
+    def open_package_dialog(self, path: str = "") -> None:
+        """打开「生成地图包」窗口（Spec §17）。
+
+        与检查窗口同一套规矩：**复用同一个实例**、**非模态**（打包 GB 级的文件
+        要几分钟，把主窗口锁住没有道理）、由主窗口持有引用而**不带**
+        ``WA_DeleteOnClose``（后台线程还在跑时销毁它的 ``QThread`` 会让 Qt
+        直接中止进程）。
+
+        传进来的 ``path`` 是**源 .mbtiles**：对话框收到之后会立刻在后台跑一次
+        快速检查，界面上那几行地图信息与 [生成地图包] 的可用性都由它决定
+        （Spec §6 / §17：界面不自己算地图信息）。
+        """
+        dialog = self._package_dialog
+        if dialog is None:
+            dialog = PackageDialog(self)
+            dialog.log_message.connect(self.log_panel.append_log)
+            self._package_dialog = dialog
+
+        target = (path or "").strip()
+        if target and target != dialog.path:
+            dialog.set_source(target)
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.statusBar().showMessage(UI_TEXT_PACKAGE_BUTTON, 3000)
+
+    @Slot()
+    @Slot(str)
+    def open_package_validator(self, path: str = "") -> None:
+        """打开「验证地图包」窗口（Spec §21）。
+
+        ``path`` 是**地图包目录**（不是 .mbtiles）。同一个实例复用。
+        """
+        dialog = self._package_validator_dialog
+        if dialog is None:
+            dialog = PackageValidateDialog(self)
+            dialog.log_message.connect(self.log_panel.append_log)
+            self._package_validator_dialog = dialog
+
+        target = (path or "").strip()
+        if target:
+            dialog.set_package_dir(target)
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.statusBar().showMessage(UI_TEXT_PACKAGE_BUTTON_VALIDATE, 3000)
+
+    @Slot(str)
+    def _on_task_package_requested(self, path: str) -> None:
+        """任务列表里的 [生成地图包]：带着选中任务的产物路径打开窗口。
+
+        路径为空（没选中任务 / 任务没有产物）时不打开窗口，只在日志里说清楚
+        —— Spec §17 要求这个入口"只有当前 MBTiles 存在时才可用"。
+        """
+        target = (path or "").strip()
+        if not target:
+            self.log_panel.append_log(
+                "请先在「下载任务」里选中一条任务（需要已有 .mbtiles）", "WARNING"
+            )
+            return
+        self.open_package_dialog(target)
+
     @Slot()
     def _on_failed_dialog_resume(self) -> None:
         """失败提示框里的「继续补齐」：与列表里的「继续」走同一条路。"""
@@ -2160,6 +2258,20 @@ class MainWindow(QMainWindow):
             self.log_panel.append_log("关闭 MBTiles 检查窗口…")
             inspector.shutdown()
             inspector.close()
+
+        # Slice 9：打包窗口可能正在复制一个几 GB 的文件或算 SHA256。与检查窗口
+        # 同样的处理：先置中止标记让它尽快收手，再有界等待 —— 构建器收到中止会
+        # 把 .building 临时目录清掉，正式地图包一个字节都不会被污染。
+        package = self._package_dialog
+        if package is not None:
+            self.log_panel.append_log("关闭离线地图包窗口…")
+            package.shutdown()
+            package.close()
+
+        validator = self._package_validator_dialog
+        if validator is not None:
+            validator.shutdown()
+            validator.close()
 
         download = self._download_worker
         running = download is not None and download.isRunning()

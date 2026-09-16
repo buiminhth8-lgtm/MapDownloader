@@ -6,8 +6,9 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 8：MBTiles 完整检查与诊断工具（独立的可视化检查窗口、PASS/WARNING/FAIL
-三档结论、覆盖完整性与缺失瓦片定位、图片抽样与可选深度扫描、文本报告导出）
+Slice 9：离线地图包构建与校验（`.mbtiles` → `map.mbtiles` + `manifest.json` 的
+标准离线包；流式 SHA256、临时目录 + 原子发布、manifest 与文件的事实一致性校验，
+以及"改一个字节就 FAIL"的篡改检测）
 
 完整链路：
 
@@ -47,7 +48,129 @@ UiTaskState 矩阵        (Slice 7：把"状态"翻译成"哪几个按钮能点"
 MBTilesInspectionService (Slice 8：同一个检查工具，下载收尾时自动跑一次"快速"档)
     ↓
 MBTilesInspectorDialog (Slice 8：手动打开的独立检查窗口，可快速 / 深度 / 导出报告)
+    ↓
+MapPackageService      (Slice 9：打包编排——输出目录命名、复用源检查结论、进度、结果)
+    ↓  PackageBuildWorker（后台线程；GB 级文件不许冻住界面）
+MapPackageBuilder      (Slice 9：copy 源文件 → 流式 SHA256 → 写 manifest.json
+    ↓                   → 发布前自校验 → 临时目录 + 原子改名；源文件一个字节不动)
+<输出目录>/<包名>/      { manifest.json, map.mbtiles }
+    ↓
+MapPackageValidator    (Slice 9：manifest 解析 / 文件存在 / 大小一致 / SHA256 对得上，
+                       四道关 → 三行结论 + 人话失败原因)
 ```
+
+**离线包的形状**（`formatVersion = 1`，这是给 Android 那侧看的契约）：
+
+```text
+<输出目录>/<包名>/
+├── map.mbtiles      源文件的**副本**（不是移动、不是软链、不是引用）
+└── manifest.json    camelCase、字段顺序固定、UTF-8、indent=2、末尾带换行
+```
+
+`manifest.json` 里有：`formatVersion` / `id` / `name` / `provider` / `mapType` /
+`labels` / `composition` / `tileScheme` / `tileFormat` / `minZoom` / `maxZoom` /
+`bounds { west, south, east, north }` / `tileCount` / `mbtiles { file, size, sha256 }` /
+`createdAt`。三条硬约束：
+
+- **不许出现绝对路径**——`mbtiles.file` 永远是 `map.mbtiles`，包换个盘符、换台机器
+  都得能用；
+- **不许出现 Token**；
+- `sha256` 是对 **`map.mbtiles` 这一份文件**算的，不是对源文件算的。
+
+`sha256` 的用途只有一个：**到了 Android 那侧、或者几个月后重新拿到这个包的时候，
+能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
+手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
+5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 9：离线地图包构建与校验
+
+**`.mbtiles` 只是"地图数据"，不是"能交付的包"。** 一个能交给 Android 的离线包，
+除了数据本身，还得带上"这份数据是什么、多大、原本长什么样、有没有被改过"——也就是
+`manifest.json`。Slice 9 把 Slice 4 产出的 `map.mbtiles` 收口成一个可交付、可验证的目录。
+
+几层各管一件事（边界和 Slice 8 一样写死）：
+
+| 模块 | 只回答 |
+|---|---|
+| `app/package/models.py` | manifest 长什么样：字段、顺序、序列化、解析、异常类型 |
+| `app/package/checksum.py` | SHA256 怎么算、大文件怎么复制（**分块**，与业务无关） |
+| `app/package/package_builder.py` | 怎么把源文件变成一个包（顺序、原子性、失败清理） |
+| `app/package/package_reader.py` | 怎么在**不信任** manifest 的前提下安全地读出路径 |
+| `app/package/package_validator.py` | 这个包还能不能信（只读：报告问题，不改东西） |
+| `app/ui/package_dialog.py` | 显示、发请求、把失败说清楚（计算全在后台线程里） |
+
+### 先写临时目录、再改名（Spec §15）
+
+打包最怕的不是"失败"，是**"看起来成功了，其实是个半成品"**。所以整个构建过程都写在
+`<输出目录>/<包名>.building/` 里，只有当 **`map.mbtiles` 复制完 + SHA256 算完 +
+`manifest.json` 写完 + 发布前自校验 PASS** 这四件事全部成立，才 `os.replace()` 到正式
+目录名。任何一步出问题，`.building` 直接删掉——**正式目录名要么不存在，要么就是完整
+可用的**，没有中间态。
+
+这条有测试逐个门守着：复制中途异常 / SHA256 抛错 / 复制失败 / 自校验不过，四条失败
+路径都必须做到"正式目录不存在、`.building` 也没留下"。
+
+### 源文件是 **copy**，不是 move（Spec §8）
+
+用户的 `beijing.mbtiles` 是他自己的资产，打包**不动它一个字节**（验收脚本前后各算一次
+SHA256 比对）。唯一例外：源文件本身已经就在 `<包>/map.mbtiles` 这个位置上——那时原地
+构建，不自己复制给自己。
+
+### 覆盖 = 旧包改名备份（Spec §16）
+
+目标目录已存在时**不删**，先改名成带时间戳的备份，再建新的。理由很直接：覆盖是用户
+手滑最贵的一次操作，而磁盘很便宜。测试里有两条反向用例：覆盖**失败**时旧包必须还在；
+覆盖成功时**备份里必须还是原来那一份**（不是空壳）。
+
+### manifest 里不许有"猜"出来的东西
+
+`bounds` / `minZoom` / `maxZoom` / `tileCount` / `format` 全部来自 **Slice 8 那份检查
+结论**，不是从文件名或界面参数推的——推出来的东西迟早和文件对不上，而"对不上"的那一刻
+用户是不知道的。唯一需要推导的是 `composition`：老工具生成的 MBTiles 可能根本不写这个
+字段，这时按 `labels` 推（`labels=true` → `merged`，否则 `single`），**并且在结果里挂
+一条 warning 说明"这个值是我推的"**，而不是装作它本来就有。
+
+### 读 manifest 也是攻击面（Spec §10）
+
+`manifest.json` 是文本，`mbtiles.file` 是文本里来的路径。如果它写着
+`../../../Windows/System32/...`，一个只会 `join` 的实现就会去动包**外面**的文件。
+所以两道关：文件名先过白名单正则，解析出的路径再过一次 `resolve()` +
+`ensure_inside()`（必须真的落在包目录内）。有测试直接拿 `../evil.mbtiles` 打过来。
+
+### 构建器**不抛异常**
+
+`MapPackageBuilder.build()` 的任何故障都变成 `PackageBuildResult.errors` 里的一行。
+理由是调用方有三个（服务层 / GUI 后台线程 / 脚本），抛异常的话三处都要各写一遍 `try`，
+而后台线程里漏掉一个就是整个进程的锅。用返回值表达失败：一处写，三处安全。
+
+### 界面（Spec §17 / §20 / §21）
+
+- **`[文件] → [生成地图包]`**：选源文件 → **自动**跑一次快速检查（后台线程）→
+  「地图信息」区显示地图类型 / Zoom / 瓦片数；检查 FAIL 时 **[生成地图包] 直接禁用**，
+  不让用户点到一半才发现没有数据。
+- 构建跑在 `PackageBuildWorker`（`QThread`）里，进度按档位映射到总进度（检查 / 复制 /
+  SHA256 / 写 manifest / 自校验 / 发布）；完成后「地图包内容」区给出**目录、大小、瓦片、
+  Zoom、完整 SHA256、验证结论**，外加 `[打开目录]`。
+- **`[验证地图包]` 是独立入口**（Spec §21）：主窗口菜单可以直接打开，也可以从打包完成
+  视图去验一个**已经存在的包**——不重新打包、不经过网络。
+- 需要用户拍板的两件事（源有警告 / 目标已存在）**不在构建器里弹窗**：构建器只返回
+  `needs_confirmation` + `confirmation_reason`，由界面去问。构建器不 import Qt。
+
+### 这一 Slice 写测试时抓出来的三个缺陷
+
+都是"看着对、其实不对"的那种：
+
+1. `WrappingLabel.setText()` 走的是 `QLabel.setText`，而 `text()` 返回的是自己存的
+   `_source_text`——**写进去的和读出来的不是同一个东西**。界面显示占位符 `—`，而断言
+   "已经填好了"的代码却是绿的。
+2. 构建器在 metadata 没写 `composition` 时**默认填了 `single`**，没有按 `labels` 推导
+   ——单图层包会被标成合成包（Spec §24）。
+3. 校验完成后 `_on_validated` 先渲染四行结论、紧接着又渲染了一次空的诊断列表，**把刚
+   画好的结论擦掉了**——用户看到的是一个空框。
+
+> 验收脚本自己也吃过一次亏：它把瓦片数**写死**成 `7×6=42`，而 `BOUNDS` 在 z12 下实际是
+> 7×8=**56**，于是每次都"失败"。现在这个数改成用生产同一套瓦片数学**算出来**的，断言变成
+> "manifest 里的数字 == 算出来的数字"——脚本不会再跟着参数一起过期。
 
 ## Slice 8：MBTiles 完整检查与诊断工具
 
@@ -272,9 +395,9 @@ Slice 0 基础（仍有效）：
 - 基础数据模型：图元类型、下载任务、离线包、Android 设备
 - 统一配置项 `app/config/settings.py`
 
-暂未实现（**尚未排期**，不对应任何具体 Slice 号）：
+当时暂未实现（**尚未排期**，不对应任何具体 Slice 号）：
 
-- 地图包 manifest、离线包级 Sha256 校验、离线包体积统计
+- ~~地图包 manifest、离线包级 Sha256 校验~~ —— **Slice 9 已交付**（见上）
 - ADB / Android 导入（设备发现、push、设备侧校验）
 - 失败瓦片清单与单点重试、速度曲线
 
@@ -301,10 +424,13 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 973 passed
+python -m pytest                # 1141 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
+python -m pytest tests/test_checksum.py tests/test_package_builder.py \
+                 tests/test_package_reader.py tests/test_package_validator.py -q
+                    # 只跑 Slice 9 打包链路（原子构建 / 篡改检测 / 只读保证）
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -325,6 +451,10 @@ python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection
 | `tests/test_tile_scan_worker.py` | **Slice 7** 后台扫描：计数正确性、**确实跑在另一个线程**、放弃标记、失败不冒泡 |
 | `tests/test_download_worker.py` | **Slice 7** 线程胶水：进度先于完成、信号回主线程、暂停 / 取消、异常变信号、Token 无公开出口 |
 | `tests/test_ui_widgets.py` | **Slice 7** 折行标签：逐字符断词、以及"次要文字色"在深浅两套调色板下的对比度 ≥ 4.5:1 |
+| `tests/test_checksum.py` | **Slice 9** 流式 SHA256（分块、进度、可中止）、大文件复制、拒绝自我复制 |
+| `tests/test_package_builder.py` | **Slice 9** 原子构建：四条失败路径都不留半成品、copy 不是 move、覆盖 = 改名备份、警告与 FAIL 两种"先问用户"、进度单调收在 100% |
+| `tests/test_package_reader.py` | **Slice 9** manifest 解析与路径安全：`../` 穿越被拒、未来 `formatVersion` 被拒、损坏 JSON 只说人话 |
+| `tests/test_package_validator.py` | **Slice 9** 四道关逐条断言、改一个字节 → FAIL、处理不了的异常一律不冒泡、结论与构建器一致 |
 
 `tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
 （`test_dismissing_complete_dialog_then_closing_window_is_safe` /
@@ -357,6 +487,26 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 `--with-tasks` 会预置几条不同状态的任务记录，用于留档 Slice 5 的「下载任务」面板
 （见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
+
+Slice 9 的打包与校验同样是**可重复的实机验收**：
+
+```bash
+python scripts/verify_slice9_package.py              # 真窗口 + 75 项检查 + 截图
+python scripts/verify_slice9_package.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice9_package.py --no-shots   # 只跑检查，不截图
+```
+
+四个场次：**A** 服务层跑完整条链路（构建 → 校验 → 改一个字节 → 必须 FAIL → 复原），
+**B** 警告确认 / FAIL 拒包 / 覆盖备份，**C** 真窗口点按钮（构建 → 校验 → 篡改后重验），
+**D** 静态守卫（对话框里没有 SQLite 调用、校验器里没有 `INSERT/UPDATE/DELETE/DROP`、
+`checksum.py` 里没有整文件 `read_bytes`）。截图落在
+`docs/slice9_package_{dialog,complete,validate_pass,verify_fail}.png` 与
+`docs/slice9_validate_dialog.png`。
+
+> 场次 C 里有一条断言是拿**几何量**做的，不是看图：`_layout_problems()` 会检查顶层
+> 布局里兄弟控件的 `geometry()` 有没有相交、有没有控件越过内容区顶边或对话框底边。
+> 起因是我盯着一张缩图，觉得第一个 group box 的标题压住了别的东西；逐行扫像素才发现
+> `y=0~9` 完全是空的——**是缩图的抗锯齿骗了眼睛**。人眼会被骗，`geometry()` 不会。
 
 Slice 8 的检查窗口用专门的验收脚本留档（它同时是一份**可重复的实机验收**）：
 
@@ -413,10 +563,11 @@ tianditu-offline-tool/
 │   ├── main.py            入口（日志初始化 + QApplication + MainWindow）
 │   ├── config/settings.py 全局常量，唯一魔数来源
 │   ├── models/            纯数据模型（dataclass / enum），不依赖 UI
-│   ├── ui/                界面层：主窗口 + 各面板 + 四个 QThread 桥
+│   ├── ui/                界面层：主窗口 + 各面板 + 六个 QThread 桥
 │   │                      （download_worker 跑编排 / connection_check 发 HTTP /
 │   │                       tile_scan_worker 查 SQLite / mbtiles_inspector_dialog
-│   │                       里的 MBTilesInspectionWorker 跑诊断）
+│   │                       里的 MBTilesInspectionWorker 跑诊断 / package_dialog
+│   │                       里的 PackageBuildWorker 与 PackageValidateWorker）
 │   │                      外加纯逻辑模块：task_actions（按钮矩阵）/ validation（校验）/
 │   │                       preferences（QSettings 偏好）/ widgets（折行标签 + 主题色）/ desktop（打开目录）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
@@ -425,13 +576,14 @@ tianditu-offline-tool/
 │   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）+ diagnostics（Slice 8 ✅：全部判定规则与结论模型）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
 │   ├── composer/          瓦片合成：tile_composer.py（Pillow alpha 合成，无状态可复用）（Slice 6 ✅）
-│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）+ mbtiles_inspection_service.py（Slice 8 ✅：检查编排 / 进度 / 报告落盘）
-│   ├── package/           离线包打包与校验（尚未排期）
+│   ├── services/          编排层：map_download_service.py（下载 → 落盘 → 校验 → 续传 一条链，Slice 4 ✅ + Slice 5 ✅ + Slice 6 ✅；Slice 7 增加 sanitize_map_name）+ mbtiles_inspection_service.py（Slice 8 ✅：检查编排 / 进度 / 报告落盘）+ map_package_service.py（Slice 9 ✅：打包编排 / 输出目录命名 / 校验入口）
+│   ├── package/           离线包打包与校验：models / checksum / package_builder / package_reader / package_validator（Slice 9 ✅）
 │   └── android/           ADB 设备管理与导入（尚未排期；目前只有包文档，无实现）
-├── tests/                  pytest 用例（973 条）
+├── tests/                  pytest 用例（1141 条）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
-├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png）
+├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
+├── scripts/verify_slice9_package.py Slice 9 离线地图包实机验收（真窗口 + 75 项检查 + 截图）
 ├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 52 项检查 + 截图）
 ├── scripts/verify_slice7_ui.py Slice 7 实机验收脚本（真窗口 + 49 项检查 + 截图）
 ├── scripts/verify_resume.py 断点续传端到端验证脚本（假服务端，不触网、不耗配额）
@@ -593,16 +745,118 @@ python scripts/verify_resume.py
 另外，**每次下载跑完都会自动跑一次"快速"档诊断**（`deep_scan=False`、抽样 20 张），
 完成弹窗里因此会多出"缺失瓦片 / 抽样损坏"两项。
 
+## 用法：生成离线地图包
+
+一个 `.mbtiles` 是地图数据；一个**离线包**是可以交付、可以验证的目录：
+
+```text
+北京离线地图/
+├── map.mbtiles      源文件的一份副本
+└── manifest.json    这份数据是什么、多大、有没有被改过
+```
+
+三种入口，都是同一个对话框（非模态，打包期间主界面照常可用）：
+
+- 菜单 **文件 → 生成地图包…**
+- 主界面右侧「下载任务」列里选中一条任务 → 点 **[生成地图包]**（该任务的产物文件
+  还不存在时这个按钮是灰的——包不该从半成品里出）
+- 在窗口里点 **[选择文件…]** 自己挑任意 `.mbtiles`
+
+进去之后：
+
+1. 选好源 `.mbtiles`，程序**自动**跑一次快速检查（后台线程，几秒），
+   「地图信息」区显示**地图类型 / Zoom / 瓦片数**。
+   - 检查结果是 `FAIL` → **[生成地图包] 直接禁用**，状态栏说明原因；
+   - 检查结果是 `WARNING` → 先问一句"缺了几张瓦片，还打吗"，你点了才继续。
+2. 填「地图名称」（就是包名，也是目录名）与「输出目录」——默认帮你填上次用的目录。
+3. 点 **[生成地图包]**。过程分六档，进度条按档位推进：
+   检查源文件 → 复制 `map.mbtiles` → 计算 SHA256 → 写 `manifest.json` → 自校验 → 发布。
+4. 完成后「地图包内容」区给出：
+
+   ```text
+   地图包目录：D:\maps\packages\北京离线地图
+   MBTiles：  28.00 KB
+   瓦片：      56
+   Zoom：      12
+   SHA256：    1054d10055ab22c90bf469348150d5daa4ccc25b523da95cb1d850ae6ec1bcf5
+   结果：      PASS
+   ```
+
+   下面还有 **[打开目录]** 与 **[验证地图包]**。
+5. 如果目标目录**已经存在**，会先问一次；确认后是**改名备份**旧包，不是删除。
+
+`manifest.json` 的实际样子（字段顺序固定、UTF-8、`indent=2`、末尾带换行）：
+
+```json
+{
+  "formatVersion": 1,
+  "id": "pkg_20260916",
+  "name": "北京离线地图",
+  "provider": "tianditu",
+  "mapType": "vector",
+  "labels": true,
+  "composition": "merged",
+  "tileScheme": "web_mercator",
+  "tileFormat": "png",
+  "minZoom": 12,
+  "maxZoom": 12,
+  "bounds": {
+    "west": 116.0,
+    "south": 39.0,
+    "east": 116.5,
+    "north": 39.5
+  },
+  "tileCount": 56,
+  "mbtiles": {
+    "file": "map.mbtiles",
+    "size": 28672,
+    "sha256": "1054d10055ab22c90bf469348150d5daa4ccc25b523da95cb1d850ae6ec1bcf5"
+  },
+  "createdAt": "2026-09-16T11:09:14+08:00"
+}
+```
+
+`id` 是 `<名字的 ASCII 化>_<创建日期>`（`beijing_20260916`）。名字是纯中文时回落成
+`pkg_20260916`——**不猜拼音**：把中文转拼音要揣一本词典，而它猜错的时候没人会发现。
+`id` 是**确定性**的：同一份输入永远得到同一个 id。
+
+`mbtiles.file` **永远是相对文件名**。包整个拷进 U 盘、换个盘符、发到别人机器上，
+Android 那侧照样能按它找到数据——所以 manifest 里**一行绝对路径都不许有**。
+
+### 验证一个已有的包
+
+菜单 **文件 → 验证地图包…**，或者从打包完成视图点 **[验证地图包]**。四道关逐条报：
+
+```text
+Manifest：PASS
+MBTiles： PASS
+SHA256：  PASS
+Result：  PASS
+```
+
+任何一项不过就是 `FAIL`，失败原因写成人话，例如：
+
+```text
+MBTiles SHA256 mismatch：manifest 记 1054d100…bcf5，实际 b217e710…372a
+```
+
+**想自己验一遍篡改检测**：用十六进制工具把包里的 `map.mbtiles` 改**一个字节**
+（长度别动），再点一次验证 —— `Manifest` 和 `MBTiles` 仍然 `PASS`（文件还在、大小没变），
+但 `SHA256` 必须变成 `FAIL`。这正是"大小检查挡不住、SHA256 才挡得住"的那类损坏：
+磁盘静默损坏、传输截断、被人手改过，都长这样。
+
 ## 后续计划
 
-- **离线包打包与校验** —— 地图包 manifest、Sha256 校验、离线包体积统计
-- **ADB 导入** —— 设备发现、push、设备侧校验（`app/android/` 目前只有包文档，无实现）
+- **ADB 导入** —— 设备发现、push `map.mbtiles`、设备侧校验（`app/android/` 目前只有
+  包文档，无实现）
 - 失败瓦片清单与单点重试、速度曲线
 - Android / osmdroid（端侧读取离线包）
 
-> 以上都**尚未排期**，不再用 Slice 号承诺。Slice 8 排给了 MBTiles 检查与诊断工具，
-> 而 Spec 明确禁止在那个 Slice 里实现 ADB / 打包 / 自动修复 MBTiles——即不许用设备
-> 功能或"顺手修一下"挤掉本 Slice 的交付。检查工具**只读**：它报告问题，不改库。
+> 以上**尚未排期**，不再用 Slice 号承诺时间。已经交付的是：Slice 8 = MBTiles 检查与
+> 诊断工具，Slice 9 = 离线地图包构建与校验（manifest + 流式 SHA256 + 篡改检测）。
+> 每个 Slice 的 Spec 都会明确禁止"顺手做下一个"——Slice 9 的 Spec 就点名不许在这一
+> 个里实现 ADB、不许做 zip 压缩、不许加密、不许在打包时"顺手修一下" MBTiles。所以
+> ADB 导入是**下一个** Slice 的事，不是这一个的。包校验器**只读**：它报告问题，不改东西。
 
 ## 说明与注意事项
 

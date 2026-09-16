@@ -102,7 +102,7 @@ def auto_map_name(west: float, south: float, east: float, north: float) -> str:
 
     Returns:
         形如 ``map_39.05N_116.05E`` 的名称；坐标非数值时退回 ``offline_map``
-        （由 :func:`app.services.sanitize_map_name` 的兜底值决定，
+        （由 :func:`app.models.naming.sanitize_map_name` 的兜底值决定，
         这里不重复那条规则，只保证不抛异常）。
     """
     try:

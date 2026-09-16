@@ -11,9 +11,9 @@ r"""下载任务列表面板（Slice 5；Slice 7 扩到九列 + 选中信息区�
     状态：已暂停（Zoom 8 ~ 17，矢量地图 + 中文注记）
     MBTiles：D:\maps\beijing.mbtiles
     文件已存在（1.42 GB），继续时已有瓦片会自动跳过
-    [继续] [删除记录] [检查 MBTiles]
+    [继续] [删除记录] [检查 MBTiles] [生成地图包]
 
-面板只做三件事：展示任务、把"继续/删除/检查/双击/选中"变成信号抛出去。
+面板只做三件事：展示任务、把"继续/删除/检查/打包/双击/选中"变成信号抛出去。
 **它不碰 tasks.json、不拼路径、不去数瓦片**——那些是 ``app.tasks`` 与
 ``MainWindow`` 的职责。信息区里的"文件已存在"只做一次 ``is_file()``：
 数瓦片要查 SQLite，那是禁止在 Qt 主线程做的事（Spec §7）。
@@ -55,6 +55,8 @@ from app.config.settings import (
     TASK_PANEL_MAX_ROWS,
     UI_TEXT_INSPECT_BUTTON,
     UI_TEXT_INSPECT_BUTTON_HINT,
+    UI_TEXT_PACKAGE_BUTTON,
+    UI_TEXT_PACKAGE_BUTTON_HINT,
     UI_TEXT_TASK_DELETE,
     UI_TEXT_TASK_DELETE_HINT,
     UI_TEXT_TASK_INFO,
@@ -122,6 +124,10 @@ class TaskPanel(QGroupBox):
     #: Slice 8：检查工具是**独立**的（能检查任意 .mbtiles），因此这里只把
     #: 选中的那个文件当作"方便的预填值"，为空也照样能开窗口另选。
     inspect_requested = Signal(str)
+    #: 用户点了「生成地图包」（参数：选中任务的输出文件路径）。
+    #: Slice 9 / Spec §17：这个入口**只有当前 MBTiles 存在时才可用**，
+    #: 因此与「检查」不同 —— 没得可打包时按钮是灰的，参数也不会是空串。
+    package_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("下载任务", parent)
@@ -172,11 +178,18 @@ class TaskPanel(QGroupBox):
         # 它**始终可用**：检查是只读的，跟有没有选中任务、有没有在下载都无关。
         self._inspect_button = QPushButton(UI_TEXT_INSPECT_BUTTON, self)
         self._inspect_button.setToolTip(UI_TEXT_INSPECT_BUTTON_HINT)
+        # Slice 9：打包入口同样放在这一行（再加一个按钮，面板高度不变）。
+        # 与「检查」的关键区别：**只有选中的任务确实有一个 .mbtiles 时才可用**
+        # （Spec §17）。检查是只读的、什么时候都能开；打包要读一个几 GB 的文件，
+        # 让用户点开一个"里面什么都没有"的窗口没有意义。
+        self._package_button = QPushButton(UI_TEXT_PACKAGE_BUTTON, self)
+        self._package_button.setToolTip(UI_TEXT_PACKAGE_BUTTON_HINT)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self._resume_button)
         button_row.addWidget(self._delete_button)
         button_row.addWidget(self._inspect_button)
+        button_row.addWidget(self._package_button)
         button_row.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -188,6 +201,7 @@ class TaskPanel(QGroupBox):
         self._resume_button.clicked.connect(self._on_resume_clicked)
         self._delete_button.clicked.connect(self._on_delete_clicked)
         self._inspect_button.clicked.connect(self._on_inspect_clicked)
+        self._package_button.clicked.connect(self._on_package_clicked)
         self._table.itemSelectionChanged.connect(self._on_selection_changed)
         self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
 
@@ -279,6 +293,15 @@ class TaskPanel(QGroupBox):
     def inspect_button(self) -> QPushButton:
         """「检查 MBTiles」按钮（Slice 8）。"""
         return self._inspect_button
+
+    @property
+    def package_button(self) -> QPushButton:
+        """「生成地图包」按钮（Slice 9）。
+
+        与「检查」的关键区别：它**只有在选中任务的产物文件确实存在时才可用**
+        （Spec §17），所以测试要断言的不只是"按钮存在"，还有"什么时候是灰的"。
+        """
+        return self._package_button
 
     @property
     def empty_label(self):
@@ -384,6 +407,21 @@ class TaskPanel(QGroupBox):
         has_selection = self.selected_task_id() is not None
         self._resume_button.setEnabled(has_selection)
         self._delete_button.setEnabled(has_selection)
+        # Slice 9 / Spec §17：打包按钮额外要求"选中的任务确实有一个产物文件"。
+        # 只做一次 ``is_file()``：与"数瓦片要查一遍 SQLite"不是一个量级，
+        # 而"这个文件在不在"正是用户此刻能不能打包的全部判据。
+        self._package_button.setEnabled(self._selected_output_file() is not None)
+
+    def _selected_output_file(self) -> Path | None:
+        """选中任务的产物文件路径；没选中 / 没有产物 / 文件不在 → ``None``。"""
+        task = self._tasks.get(self.selected_task_id() or "")
+        if task is None or not task.output_path:
+            return None
+        path = Path(str(task.output_path))
+        try:
+            return path if path.is_file() else None
+        except OSError:  # pragma: no cover - 网络盘 / 权限异常
+            return None
 
     def _refresh_info(self) -> None:
         """重画选中任务的信息区（Spec §10）。
@@ -454,6 +492,19 @@ class TaskPanel(QGroupBox):
         if task is not None and task.output_path:
             path = str(task.output_path)
         self.inspect_requested.emit(path)
+
+    @Slot()
+    def _on_package_clicked(self) -> None:
+        """「生成地图包」：把选中任务的产物路径抛出去（Spec §17）。
+
+        与「检查」不同，这里**不会**抛空串：按钮在文件不存在时本来就是灰的，
+        能点就说明一定有一个可打包的文件。留一个兜底分支只是为了防止
+        "按钮状态与文件状态之间那一瞬间的变化"（用户在文件被删掉后立刻点下）。
+        """
+        path = self._selected_output_file()
+        if path is None:
+            return
+        self.package_requested.emit(str(path))
 
     @Slot(QTableWidgetItem)
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:

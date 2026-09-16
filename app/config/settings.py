@@ -643,3 +643,209 @@ REPORT_MISSING_DETAIL_TRUNCATED: str = "  …另有 {count:,} 个缺失瓦片未
 REPORT_DEEP_SCAN_LINE: str = "深度扫描：扫描 {scanned:,} 张，损坏 {corrupt:,} 张"
 REPORT_SAMPLE_FORMATS_LINE: str = "抽样格式：{formats}"
 
+
+# --------------------------------------------------------------------------- #
+# Slice 9：离线地图包（Spec §2 ~ §32）
+# --------------------------------------------------------------------------- #
+#: manifest 的格式版本（Spec §2 / §26）。Android 侧读到更大的值就该拒绝，
+#: 而不是"尽力解析"——本工具**不实现**升级机制，只负责把这个数字写准。
+PACKAGE_FORMAT_VERSION: int = 1
+
+#: 地图包内的固定文件名（Spec §2）。这两个名字是**协议的一部分**：
+#: Android 导入器按名字找文件，改一个字就等于换了一种包格式。
+PACKAGE_MANIFEST_FILENAME: str = "manifest.json"
+PACKAGE_MBTILES_FILENAME: str = "map.mbtiles"
+
+#: 预览图文件名（Spec §22：可选能力，本 Slice 不生成）
+PACKAGE_PREVIEW_FILENAME: str = "preview.png"
+
+#: manifest 里 provider / tileScheme 的默认值（Spec §2）
+PACKAGE_DEFAULT_PROVIDER: str = "tianditu"
+PACKAGE_DEFAULT_TILE_SCHEME: str = "web_mercator"
+
+#: 构建中的临时目录后缀（Spec §15）：``<name>.building``。
+#: 正式目录只会在**全部步骤成功之后**由一次 ``os.replace`` 出现。
+PACKAGE_BUILDING_SUFFIX: str = ".building"
+
+#: 覆盖已有地图包时，旧目录改名成 ``<name>.backup-<时间戳>``（Spec §16）。
+#: 与 Slice 5 的"重新下载是改名备份"一致：绝不静默删除用户数据。
+PACKAGE_BACKUP_SUFFIX_FORMAT: str = ".backup-%Y%m%d-%H%M%S"
+
+#: 分块复制与流式 SHA256 的块大小（Spec §4 / §9 / §32）。
+#: 4 MiB 是"系统调用次数"与"单次内存峰值"之间的折中：GB 级文件不会整读进内存。
+PACKAGE_COPY_CHUNK_SIZE: int = 4 * 1024 * 1024
+PACKAGE_SHA256_CHUNK_SIZE: int = 4 * 1024 * 1024
+
+#: 构建进度条按阶段分段（Spec §18）。每段的百分比区间在这里定死，
+#: 免得 GUI 与 service 各算一套、进度条忽快忽慢。
+#: 区间取值依据：复制（字节最多）与 SHA256（要读全文件）各占大头。
+PACKAGE_BUILD_STAGE_RANGES: dict[str, tuple[int, int]] = {
+    "check": (0, 6),
+    "copy": (6, 66),
+    "sha256": (66, 90),
+    "manifest": (90, 94),
+    "validate": (94, 100),
+}
+
+#: 校验阶段的分段（Spec §21 的四行结论对应四步）
+PACKAGE_VALIDATE_STAGE_RANGES: dict[str, tuple[int, int]] = {
+    "manifest": (0, 10),
+    "size": (10, 20),
+    "checksum": (20, 70),
+    "mbtiles": (70, 90),
+    "metadata": (90, 100),
+}
+
+#: 地图包构建前的快速诊断抽样张数（Spec §23 复用 Slice 8）。
+#: 打包前只需要"这个库基本是好的"，不需要全量图片扫描（那是分钟级）。
+PACKAGE_PRECHECK_SAMPLE_SIZE: int = 20
+
+#: bounds 比对容差：manifest 里存的是十进制小数，读回来与 metadata 的字符串
+#: 解析结果做浮点比较，必须给容差。1e-6 ≈ 0.1 米，远小于一个瓦片的尺寸。
+PACKAGE_BOUNDS_TOLERANCE: float = 1e-6
+
+#: 默认输出目录名（放在用户选择的目录下）：``<output>/packages``
+PACKAGE_DEFAULT_DIR_NAME: str = "packages"
+
+#: SHA256 的十六进制长度（校验用，别写裸 64）
+PACKAGE_SHA256_LENGTH: int = 64
+
+# --- 构建 / 校验的结论文案（Spec §14 / §20 / §21）-----------------------------
+UI_TEXT_PACKAGE_STATUS_LABEL: str = "验证"
+UI_TEXT_PACKAGE_MANIFEST_LABEL: str = "Manifest"
+UI_TEXT_PACKAGE_MBTILES_LABEL: str = "MBTiles"
+UI_TEXT_PACKAGE_SHA256_LABEL: str = "SHA256"
+UI_TEXT_PACKAGE_RESULT_LABEL: str = "结果"
+UI_TEXT_PACKAGE_UNKNOWN: str = "—"
+
+#: 构建阶段的进度文案（Spec §18 逐字要求这五句）
+UI_TEXT_PACKAGE_STAGE_CHECK: str = "正在检查 MBTiles…"
+UI_TEXT_PACKAGE_STAGE_COPY: str = "正在复制地图文件…"
+UI_TEXT_PACKAGE_STAGE_SHA256: str = "正在计算 SHA256…"
+UI_TEXT_PACKAGE_STAGE_MANIFEST: str = "正在生成 manifest…"
+UI_TEXT_PACKAGE_STAGE_VALIDATE: str = "正在验证地图包…"
+UI_TEXT_PACKAGE_STAGE_DONE: str = "地图包生成完成"
+
+#: 校验阶段的进度文案
+UI_TEXT_PACKAGE_STAGE_READ_MANIFEST: str = "正在读取 manifest…"
+UI_TEXT_PACKAGE_STAGE_SIZE: str = "正在核对文件大小…"
+UI_TEXT_PACKAGE_STAGE_MBTILES: str = "正在检查 MBTiles…"
+UI_TEXT_PACKAGE_STAGE_METADATA: str = "正在比对 metadata…"
+
+#: 复制 / 哈希的细粒度进度（``{done}`` / ``{total}`` 已是可读大小）
+UI_TEXT_PACKAGE_PROGRESS_COPY: str = "正在复制地图文件…{done} / {total}"
+UI_TEXT_PACKAGE_PROGRESS_SHA256: str = "正在计算 SHA256…{percent}%"
+
+#: GUI 文案（Spec §17 / §20 / §21）
+UI_TEXT_PACKAGE_TITLE: str = "生成离线地图包"
+UI_TEXT_PACKAGE_VALIDATE_TITLE: str = "验证离线地图包"
+UI_TEXT_PACKAGE_BUTTON: str = "生成地图包"
+UI_TEXT_PACKAGE_BUTTON_HINT: str = (
+    "把 .mbtiles 整理成标准离线地图包（map.mbtiles + manifest.json + SHA256），"
+    "供 Android 端导入。选中一条任务时会带上它的输出文件。"
+)
+UI_TEXT_PACKAGE_BUTTON_VALIDATE: str = "验证地图包"
+UI_TEXT_PACKAGE_BUTTON_VALIDATE_HINT: str = (
+    "校验一个离线地图包：manifest 是否合法、文件大小与 SHA256 是否对得上、"
+    "MBTiles 是否有效、metadata 与 manifest 是否一致。"
+)
+UI_TEXT_PACKAGE_SOURCE_LABEL: str = "源 MBTiles"
+UI_TEXT_PACKAGE_NAME_LABEL: str = "地图名称"
+UI_TEXT_PACKAGE_MAP_TYPE_LABEL: str = "地图类型"
+UI_TEXT_PACKAGE_ZOOM_LABEL: str = "Zoom"
+UI_TEXT_PACKAGE_TILES_LABEL: str = "瓦片"
+UI_TEXT_PACKAGE_OUTPUT_LABEL: str = "输出目录"
+UI_TEXT_PACKAGE_PACKAGE_LABEL: str = "地图包目录"
+UI_TEXT_PACKAGE_CHOOSE_FILE: str = "选择文件…"
+UI_TEXT_PACKAGE_CHOOSE_DIR: str = "选择目录…"
+UI_TEXT_PACKAGE_GROUP_SOURCE: str = "地图信息"
+UI_TEXT_PACKAGE_GROUP_INFO: str = "地图信息（来自 MBTiles）"
+UI_TEXT_PACKAGE_GROUP_PACKAGE: str = "地图包内容"
+UI_TEXT_PACKAGE_GROUP_DIAG: str = "检查与验证结果"
+#: 还没生成过任何包时，「地图包内容」区顶部的那句话
+UI_TEXT_PACKAGE_BODY_PLACEHOLDER: str = "尚未生成地图包"
+UI_TEXT_PACKAGE_FILE_FILTER: str = "MBTiles 文件 (*.mbtiles);;所有文件 (*)"
+UI_TEXT_PACKAGE_COMPLETE_TITLE: str = "地图包生成完成"
+UI_TEXT_PACKAGE_COMPLETE_BODY: str = (
+    "目录：{directory}\n"
+    "MBTiles：{size}\n"
+    "瓦片：{tiles}\n"
+    "Zoom：{zooms}\n"
+    "SHA256：{sha256}\n"
+    "验证：{validation}"
+)
+UI_TEXT_PACKAGE_FAILED_TITLE: str = "地图包生成失败"
+UI_TEXT_PACKAGE_VALIDATE_DONE_TITLE: str = "地图包验证完成"
+UI_TEXT_PACKAGE_VALIDATE_BODY: str = (
+    "Manifest：{manifest}\n"
+    "MBTiles：{mbtiles}\n"
+    "SHA256：{checksum}\n"
+    "\n"
+    "Result：{result}"
+)
+UI_TEXT_PACKAGE_NEED_SOURCE: str = "请先选择一个 .mbtiles 文件"
+UI_TEXT_PACKAGE_NEED_DIR: str = "请先选择输出目录"
+UI_TEXT_PACKAGE_NEED_NAME: str = "请填写地图名称"
+UI_TEXT_PACKAGE_NEED_PACKAGE: str = "请先选择一个地图包目录"
+UI_TEXT_PACKAGE_RUNNING: str = "正在生成地图包，请稍候…"
+UI_TEXT_PACKAGE_VALIDATING: str = "正在验证地图包，请稍候…"
+UI_TEXT_PACKAGE_FAILED: str = "生成地图包失败：{error}"
+UI_TEXT_PACKAGE_VALIDATE_FAILED: str = "验证失败：{error}"
+UI_TEXT_PACKAGE_PASS_STATUS: str = "PASS"
+
+#: 地图包结论的配色（与 Slice 8 检查窗口同一套语义色；实际显示时会按
+#: 当前主题把颜色朝黑/朝白压一下，保证深浅两套主题都读得清）
+UI_TEXT_PACKAGE_COLOR_PASS: str = "#2f9e44"
+UI_TEXT_PACKAGE_COLOR_FAIL: str = "#e03131"
+
+#: 覆盖确认（Spec §16）。必须说清"旧包去哪了"，否则用户以为被删了。
+UI_TEXT_PACKAGE_EXISTS_TITLE: str = "地图包已存在"
+UI_TEXT_PACKAGE_EXISTS_BODY: str = (
+    "地图包已存在：\n{path}\n\n"
+    "选择「覆盖」会把现有地图包改名备份（不会删除），然后用新的包替换它。"
+)
+UI_TEXT_PACKAGE_BUTTON_OVERWRITE: str = "覆盖"
+UI_TEXT_PACKAGE_BUTTON_RENAME: str = "选择其他名称"
+UI_TEXT_PACKAGE_BACKUP_DONE: str = "已备份原有地图包：{path}"
+
+#: MBTiles 带 WARNING 时的二次确认（Spec §23）
+UI_TEXT_PACKAGE_WARNING_TITLE: str = "MBTiles 存在警告"
+UI_TEXT_PACKAGE_WARNING_BODY: str = (
+    "MBTiles 存在警告，是否继续生成地图包？\n\n{warnings}"
+)
+UI_TEXT_PACKAGE_BUTTON_CONTINUE: str = "继续生成"
+
+#: 失败原因文案（Spec §6 / §8 / §12 / §14 / §16）
+PACKAGE_ERROR_SOURCE_MISSING: str = "源文件不存在：{path}"
+PACKAGE_ERROR_SOURCE_NOT_FILE: str = "源路径不是文件：{path}"
+PACKAGE_ERROR_SOURCE_INSPECT_FAIL: str = "MBTiles 检查未通过（FAIL），不生成地图包：{reasons}"
+PACKAGE_ERROR_SOURCE_WARNING: str = "MBTiles 存在警告，需要确认后才能生成地图包"
+PACKAGE_ERROR_METADATA_MISSING: str = "MBTiles metadata 缺少关键字段，无法生成 manifest：{fields}"
+PACKAGE_ERROR_EXISTS: str = "目标目录已存在：{path}"
+PACKAGE_ERROR_COPY_SELF: str = "源文件与目标位置是同一个文件，已跳过复制"
+PACKAGE_ERROR_NO_TILE: str = "MBTiles 里没有瓦片，不生成地图包"
+PACKAGE_ERROR_BUILD_FAILED: str = "生成地图包失败：{error}"
+PACKAGE_ERROR_MANIFEST_MISSING: str = "缺少 manifest.json：{path}"
+PACKAGE_ERROR_MANIFEST_JSON: str = "manifest.json 不是合法的 JSON：{error}"
+PACKAGE_ERROR_MANIFEST_FORMAT_VERSION: str = (
+    "manifest 的 formatVersion={version} 不受支持（本工具支持 {supported}）"
+)
+PACKAGE_ERROR_MANIFEST_FIELD: str = "manifest 字段非法：{error}"
+PACKAGE_ERROR_MANIFEST_PATH: str = "manifest 的 mbtiles.file 指向包外：{value}"
+PACKAGE_ERROR_MBTILES_MISSING: str = "地图包里缺少 MBTiles 文件：{path}"
+PACKAGE_ERROR_SIZE_MISMATCH: str = "MBTiles 大小不一致：manifest 记录 {expected} 字节，实际 {actual} 字节"
+PACKAGE_ERROR_SHA256_MISMATCH: str = "MBTiles SHA256 mismatch：manifest 记录 {expected}，实际 {actual}"
+PACKAGE_ERROR_MBTILES_INVALID: str = "MBTiles 检查未通过（{status}）：{reasons}"
+PACKAGE_WARNING_METADATA_MISSING: str = "MBTiles metadata 缺少 {field}，无法与 manifest 比对"
+PACKAGE_WARNING_METADATA_DIFF: str = "MBTiles metadata 的 {field} 与 manifest 不一致：{actual} ≠ {expected}"
+PACKAGE_ERROR_METADATA_DIFF: str = "关键字段不一致：{field} —— manifest {expected}，MBTiles {actual}"
+PACKAGE_WARNING_CHECKSUM_SKIPPED: str = "已跳过 SHA256 校验（verify_checksum=False）"
+PACKAGE_WARNING_MBTILES_SKIPPED: str = "已跳过 MBTiles 检查（inspect_mbtiles=False）"
+
+#: 构建结果里的一行说明
+PACKAGE_LINE_DIRECTORY: str = "地图包目录：{path}"
+PACKAGE_LINE_MANIFEST: str = "manifest：{path}"
+PACKAGE_LINE_MBTILES: str = "map.mbtiles：{path}"
+PACKAGE_LINE_SHA256: str = "SHA256：{sha256}"
+PACKAGE_LINE_VALIDATION: str = "验证结论：{result}"
+
