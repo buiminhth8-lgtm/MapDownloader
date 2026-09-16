@@ -83,6 +83,34 @@ def _wait_until(app, predicate, timeout_s: float = 30.0) -> bool:
     return False
 
 
+def _start_and_wait(dialog, app, *, deep: bool, timeout_ms: int = 60_000):
+    """点检查 → 抢在 pump 之前取线程 → 等它跑完 → 把队列信号送回主线程。
+
+    **必须抢在 ``processEvents()`` 之前取线程**：小文件几十毫秒就跑完，
+    ``pump`` 正好把"已完成"的队列信号投递到主线程，``_on_completed`` 里已经把
+    ``self._worker`` 置成 ``None``，之后再问只会拿到 ``None``。
+
+    等待也不能只看 ``is_running``：线程结束与信号投递之间有一个窗口，
+    那时 ``is_running`` 已经是 ``False`` 但 ``result`` 还是 ``None``——
+    用 ``is_running`` 当条件会在那个窗口里立刻返回，然后断言到一个空的界面。
+    所以既 ``wait()`` 线程，又空转事件循环直到 ``result`` 真的到位。
+
+    Returns:
+        ``(worker, settled, was_running)``；``settled`` 表示结论已回主线程，
+        ``was_running`` 是**启动瞬间**观察到的运行态（按钮矩阵那一条要用它，
+        等线程跑完再问只会是 ``False``）。
+    """
+    (dialog.start_deep_check if deep else dialog.start_quick_check)()
+    worker = dialog.inspection_worker
+    was_running = dialog.is_running
+    if worker is not None:
+        worker.wait(timeout_ms)
+    settled = _wait_until(
+        app, lambda: dialog.result is not None and not dialog.is_running, timeout_s=10
+    )
+    return worker, settled, was_running
+
+
 def _shot(widget, name: str, enabled: bool) -> None:
     """把任意控件存成 ``docs/<name>``。
 
@@ -302,23 +330,16 @@ def scene_dialog(app, window, checker: Checker, work_dir: Path, shots: bool) -> 
     _shot(dialog, "slice8_inspector_idle.png", shots)
 
     # --- 快速检查 ---
-    dialog.start_quick_check()
-    # 先取线程再 pump：pump 会把"已完成"的队列信号投递到主线程，
-    # 那时 _worker 已经被清成 None —— 检查"确实起了后台线程"必须抢在那之前。
-    worker = dialog.inspection_worker
+    worker, settled, was_running = _start_and_wait(dialog, app, deep=False)
     checker.check(worker is not None, "[快速检查] 起了后台线程")
     if worker is not None:
         checker.check(
             worker is not QThread.currentThread(),
             "检查跑在后台线程（没占 Qt 主线程）",
         )
-    checker.check(dialog.is_running is True, "运行中按钮矩阵已切换")
-    _pump(app)
-    if worker is not None:
-        worker.wait(30_000)
-        _pump(app)
-
+    checker.check(was_running, "运行中按钮矩阵已切换")
     checker.check(dialog.is_running is False, "线程结束后回到空闲")
+    checker.check(settled, "结论已回主线程（不是只看线程结束）")
     checker.check(
         dialog.status_value.text() == "WARNING",
         "缺瓦片的地图包显示 WARNING",
@@ -337,16 +358,12 @@ def scene_dialog(app, window, checker: Checker, work_dir: Path, shots: bool) -> 
     corrupt_path = _build_corrupt(work_dir / "dialog-corrupt.mbtiles")
     dialog.set_path(str(corrupt_path))
     _pump(app)
-    dialog.start_deep_check()
-    # 同样先取线程再 pump：文件小的时候深度检查几十毫秒就跑完，
-    # pump 之后再问 `inspection_worker` 只会拿到 None。
-    worker = dialog.inspection_worker
+    worker, settled, _ = _start_and_wait(dialog, app, deep=True)
     checker.check(
         worker is not None and worker.deep_scan is True,
         "[深度检查] 带上了 deep_scan 标记",
     )
-    _pump(app)
-    _wait_until(app, lambda: not dialog.is_running, timeout_s=60)
+    checker.check(settled, "深度检查结论已回主线程")
     checker.check(dialog.status_value.text() == "FAIL", "含坏瓦片显示 FAIL")
     _shot(dialog, "slice8_inspector_fail.png", shots)
 
@@ -354,9 +371,8 @@ def scene_dialog(app, window, checker: Checker, work_dir: Path, shots: bool) -> 
     good_path = _build_good(work_dir / "dialog-good.mbtiles")
     dialog.set_path(str(good_path))
     _pump(app)
-    dialog.start_quick_check()
-    _pump(app)
-    _wait_until(app, lambda: not dialog.is_running, timeout_s=30)
+    _, settled, _ = _start_and_wait(dialog, app, deep=False)
+    checker.check(settled, "正常文件的结论已回主线程")
     checker.check(dialog.status_value.text() == "PASS", "正常文件显示 PASS")
     _shot(dialog, "slice8_inspector_pass.png", shots)
 

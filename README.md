@@ -361,7 +361,7 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 Slice 8 的检查窗口用专门的验收脚本留档（它同时是一份**可重复的实机验收**）：
 
 ```bash
-python scripts/verify_slice8_inspector.py              # 真窗口 + 49 项检查 + 截图
+python scripts/verify_slice8_inspector.py              # 真窗口 + 52 项检查 + 截图
 python scripts/verify_slice8_inspector.py --offscreen  # 无显示环境（CI）
 python scripts/verify_slice8_inspector.py --no-shots   # 只跑检查，不截图
 ```
@@ -432,7 +432,7 @@ tianditu-offline-tool/
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
 ├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
-├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 49 项检查 + 截图）
+├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 52 项检查 + 截图）
 ├── scripts/verify_slice7_ui.py Slice 7 实机验收脚本（真窗口 + 49 项检查 + 截图）
 ├── scripts/verify_resume.py 断点续传端到端验证脚本（假服务端，不触网、不耗配额）
 ├── pytest.ini              pytest 配置（asyncio_mode = auto）
