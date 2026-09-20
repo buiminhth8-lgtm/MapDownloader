@@ -22,6 +22,7 @@
 - [用法：按行政区域下载（GeoJSON 多边形）](docs/polygon_region_download.md) —— Slice 16
 - [Zoom 策略：分级推荐区间](docs/zoom_strategy.md) —— Slice 17
 - [行政区域层级模型（中国 → 省 → 市）](docs/region_catalog.md) —— Slice 18
+- [行政区域级联选择 + 推荐 Zoom](docs/region_selection_ui.md) —— Slice 19
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -228,6 +229,112 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
 
+## Slice 19：行政区域级联选择 + 推荐 Zoom
+
+Slice 18 把"一个中国预设"升级成了**层级目录**，但界面上还是**一条下拉列全部行政区**
+—— 国家和省、市混在一起，用户看不出哪条挂在谁下面。这一版把它换成
+**国家 → 省 → 市三段级联**，并让 Zoom 由区域等级决定：
+
+```text
+国家： [演示国 ▾]        ← 只列国家级
+省份： [北省 ▾]          ← 跟着国家重填，首项是「全部（不限定省份）」
+城市： [河城 ▾]          ← 跟着省份重填，首项是「全部（不限定城市）」
+下载级别： 城市级 · 演示国 / 北省 / 河城
+下载策略： ◉ 推荐 Zoom   ○ 自定义 Zoom
+Zoom 建议： 推荐 Zoom: Z12~16    当前 Zoom: Z12~16
+Min Zoom: 12（只读）    Max Zoom: 16（只读）
+推荐说明： 城市级地图适合城市范围任务规划。
+```
+
+### 三段里只有一段是"生效"的
+
+`selected_region_id = city or province or country`。于是"只选国家"与"选到市"走的是
+**同一条**下游链路（`RegionService.get_region()` → 加载边界 → `DownloadRegion` →
+候选瓦片估算）。界面**从不**自己拼一个 `DownloadRegion` —— 那样就会出现两处
+"边界文件在哪、缺文件怎么办"的实现。
+
+「全部」这一项的 `itemData` 是 `None` 而不是某个哨兵 id：`-1` 与任何合法下标都不相等，
+这种判断到处都会漏（这个坑 Android 侧的 Spinner 已经踩过一次）。
+
+### 推荐 Zoom 与自定义 Zoom
+
+| | 推荐 Zoom（默认） | 自定义 Zoom |
+| --- | --- | --- |
+| Min / Max | 按等级从策略表取（Z4~10 / Z9~13 / Z12~16） | 用户说了算 |
+| 可编辑 | ❌ 只读 | ✅ |
+| 超范围 | 不可能超 | 给一句警告 |
+
+推荐模式下把 Min/Max 设成**只读**，是为了堵住一类看不出来的错误：界面显示 `Z12~16`、
+实际下载用的却是用户上次手打的 `8~17`。**自定义模式下超范围只警告、不改值**——
+与 Slice 17 定下的"服务层没有 `clamp()`"是同一条规矩。
+
+模式切换**不改值**：`推荐（Z12~16）→ 点自定义` 值仍是 12~16 只是可编辑了；
+`自定义 8~17 → 点推荐` 值变成 12~16 并重新只读。控制器刻意**不缓存**用户的值——
+`effective_range(min_zoom, max_zoom)` 把控件里的值当参数收进来按模式选一个返回，
+少一个字段就少一处不同步。
+
+### `RegionSelectionController` 是 Qt-free 的
+
+`app/ui/region_selection.py` 不 import PySide6：它只持有三个 id 与一个模式，把目录查询
+与策略查询转给 `RegionService` / `ZoomStrategyService`。于是级联、等级推导、模式切换、
+异常分支这些容易写错的逻辑能在毫秒级的纯对象用例里断言，只有"控件行为"（只读、
+可见性、信号有没有接）才落到 widget 用例里。
+
+### 关窗重开还在那儿
+
+| 键 | 值 |
+| --- | --- |
+| `download/region_type` | `rectangle` / `polygon` |
+| `download/country_id` / `province_id` / `city_id` | 三段 id **分别**存 |
+| `download/zoom_mode` | `recommended` / `custom` |
+| `download/custom_min_zoom` / `custom_max_zoom` | 用户自己定的区间 |
+
+三段分开存：界面是按三段恢复的，只存末端 id 就得反推"它的父亲是谁"——那是目录的职责。
+Slice ≤18 的老键 `download/min_zoom` / `download/max_zoom` **只读不写**（升级后上次调好
+的区间不会变成"从没设过"），`clear()` 会把老键一起删。偏好里存着不存在的 id 时**逐级
+回退**：市 → 省 → 国，一个都不认识才落回自定义矩形。
+
+恢复的**顺序**也有讲究：区域必须排在 Zoom 之前。恢复一个行政区域会把模式带到「推荐」，
+而推荐模式会立刻把建议值填进 Min/Max；顺序反了的话用户上次设的 `8~17` 会被顶掉。
+
+### 结果区多了两样
+
+行政区域算完后结果区第一段是 `区域 / 级别 / 推荐 Zoom / 候选 / 区域内 / 过滤 / 比例`；
+`Zoom 明细` 每行末尾多了「预计容量」（用生产的 `estimate_size_bytes()` + `format_size()`，
+不在这里乘一个自己的常数）：
+
+```text
+Zoom 明细（候选 / 选中 / 过滤 / 预计容量）：
+  z12  169 / 169 / 0  4.95 MB
+  z13  600 / 600 / 0  17.58 MB
+```
+
+### 与矩形模式的兼容
+
+矩形模式下这 14 个新增控件（三段下拉 / 级别 / 策略 / 推荐说明）**整块收起**，
+`QGridLayout` 在整行都隐藏时会把行高压到 0，界面与 Slice ≤18 逐像素一致；
+经纬度框照旧可编辑、Zoom 也不受策略影响（`zoom_mode` 只决定"下次切到行政区域时
+用哪种策略"和"关窗存哪一项"）。
+
+### 这一 Slice 写测试抓出来的三个缺陷
+
+1. `UiPreferences.clear()` 只删了**新键**，没删 `download/min_zoom` / `max_zoom`
+   —— 而 `zoom_range` 在新键缺失时会回退读老键。于是 `clear()` 之后"从没设过"
+   这个事实被老配置悄悄推翻了（`assert preferences.zoom_range is None` 拿到 `(11, 13)`）。
+2. `select_region()` 切换时没有先清掉 `_country_id/_province_id/_city_id`，于是
+   "市 → 只选省"会留下上一次的市，等级算出来是 `CITY` 而界面上显示的是省。
+3. **（实机验收脚本抓的）**面板一度把几何的**原始外包矩形**（9 位小数）交给下载器，
+   而同一份几何写进 MBTiles metadata 时只留 6 位小数。夹具的边界恰好瓦片对齐时，
+   Inspector 从 metadata 反推的候选范围**多出一圈**（多出来的那列 / 那行只是"碰到"
+   了多边形边沿），于是**完整的包被判成"缺失 10 张"、打包器拒绝出包** ——
+   一处纯粹由精度不一致造出来的假警报。改回传界面上那四个数（= 写进 metadata 的
+   那一份），往返就自洽了，行为也与 Slice ≤18 一致。
+
+详见 [docs/region_selection_ui.md](docs/region_selection_ui.md)。
+实机验收：`python scripts/verify_slice19_region_ui.py`
+（真 windows 平台插件、真窗口、真关窗再开新窗口、真点「计算」，90 项检查，
+截图落 `docs/slice19_*.png`）。
+
 ## Slice 18：行政区域层级模型（中国 → 省 → 市）
 
 Slice 16 给了"按行政区域裁剪"，Slice 17 给了"这一级该下到多少 Zoom"，
@@ -311,6 +418,10 @@ Slice 17 那张策略表得到。存一份进目录就是第二个真相，改�
 区域下拉框的**数据来源**从"内置常量"换成 `RegionService.list_presets()`，
 条目类型没变，所以面板其余代码一行没动。于是"把资源目录指到别处"这件事对界面
 同样成立。**没有**做层级下拉、省市选择器、区域管理页 —— 那些是 Slice 19 / 20。
+
+> **Slice 19 更新**：层级下拉已经做了。那条"列全部行政区"的下拉被**三段级联**
+> 取代，数据来源仍是本 Slice 的 `RegionService`，等级也仍由目录条目给出。
+> 见上面那一章与 [docs/region_selection_ui.md](docs/region_selection_ui.md)。
 
 目录读不出来时（文件丢了 / JSON 语法错 / 版本号不认识）**不让界面崩**：
 退回由内置扁平预设合成的目录，`catalog_error` 记下原因、日志留一行 ERROR。
@@ -919,6 +1030,9 @@ python -m pytest tests/test_zoom_policy.py tests/test_zoom_strategy.py -q
 python -m pytest tests/test_region_catalog.py tests/test_region_loader.py \
                  tests/test_region_hierarchy.py tests/test_region_validation.py -q
                     # 只跑 Slice 18 行政区域（目录读取 / 层级 / 路径安全 / lazy load / 校验）
+python -m pytest tests/test_region_selection_controller.py \
+                 tests/test_download_panel_region_selection.py -q
+                    # 只跑 Slice 19 级联与策略（选择状态 / 等级推导 / 只读 / 回退 / 持久化）
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -955,6 +1069,8 @@ python -m pytest tests/test_region_catalog.py tests/test_region_loader.py \
 | `tests/test_polygon_inspection.py` | **Slice 16** Inspector：多边形按几何算期望值；边界不可用标 UNKNOWN + WARNING，**不许**按外包矩形误报"缺失 N 张" |
 | `tests/test_zoom_policy.py` | **Slice 17** 四级区间逐个数钉死、策略自洽与重叠带、CUSTOM 不警告、单一来源三条静态守卫、`app.geo` ↔ `app.planning` 导入顺序（子进程） |
 | `tests/test_zoom_strategy.py` | **Slice 17** 推荐 / 评估（超范围只 warning、**不改写**用户 Zoom）、非法输入逐条拒绝、`recommend_with_estimate` 与直接调 `RegionTileEstimator` 逐字段一致 |
+| `tests/test_region_selection_controller.py` | **Slice 19** 级联状态（换国家清省 / 市、只选国 / 省 / 市各自的等级）、推荐区间取自策略、自定义保原值、`ZoomMode.parse` 宽容、`download_region` 真的用边界、缺 / 坏边界安全返回 `None` |
+| `tests/test_download_panel_region_selection.py` | **Slice 19** 控件行为：矩形模式逐像素兼容、三段下拉联动、推荐模式自动填值且只读、模式切换不改值、两个单选互斥、范围倒置只提示、估算用区域内张数、偏好往返与脏 id 回退 |
 
 `tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
 （`test_dismissing_complete_dialog_then_closing_window_is_safe` /
@@ -1006,16 +1122,32 @@ Slice 18 的三级行政区目录同样有实机留档 —— 下拉框是**新�
 最容易被"退回内置常量"这种改动悄悄破坏：
 
 ```bash
-python scripts/verify_slice18_regions.py              # 真 windows 插件 + 三级目录 + 路径安全 + 70 项检查
+python scripts/verify_slice18_regions.py              # 真 windows 插件 + 三级目录 + 路径安全 + 79 项检查
 python scripts/verify_slice18_regions.py --offscreen  # 无显示环境（CI）
 python scripts/verify_slice18_regions.py --no-shots   # 只跑检查，不截图
 ```
 
 截图落在 `docs/slice18_regions_dropdown.png`（下拉项全部来自目录）、
-`docs/slice18_regions_city_zoom.png`（选中市级：建议 Z12~16、默认 8~17 会报警）、
+`docs/slice18_regions_city_zoom.png`（选中市级：建议 Z12~16、自定义 8~17 会报警）、
 `docs/slice18_regions_three_levels.png`（按市级区域真的算一次）。
 脚本在临时目录里造的是**合成方块**，不往仓库的 `resources/regions/` 写任何东西 ——
 法定地图内容必须由使用者用授权数据自己放。
+
+Slice 19 的级联与策略切换是**控件之间的关系**（三个下拉联动、两个单选互斥、只读切换，
+以及"关窗重开还在不在"），这些恰好是 offscreen 下最容易失真的部分：
+
+```bash
+python scripts/verify_slice19_region_ui.py              # 真 windows 插件 + 真窗口 + 真关窗再开 + 90 项检查
+python scripts/verify_slice19_region_ui.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice19_region_ui.py --no-shots   # 只跑检查，不截图
+```
+
+截图落在 `docs/slice19_cascade_city.png`（三段级联选到市级）、
+`docs/slice19_zoom_recommended.png`（推荐模式：Min/Max 自动填 Z12~16 且只读）、
+`docs/slice19_zoom_warning.png`（自定义 8~17：有警告，值没被改）、
+`docs/slice19_polygon_estimate.png`（真点「计算」后的结果区，含逐级明细四列）。
+恢复那一段是**真的关一次窗**（走 `closeEvent` → `_save_preferences`）再用同一个
+偏好文件开一个新窗口 —— 写个 `set_region_id()` 再断言控件状态是自欺。
 
 Slice 10 的设备区与三个弹窗同样有可重复的实机留档：
 
@@ -1157,7 +1289,8 @@ tianditu-offline-tool/
 ├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png / slice10_*.png /
 │                           slice16_polygon_*.png / slice17_zoom_*.png / slice18_regions_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
-├── scripts/verify_slice18_regions.py Slice 18 行政区域层级验收（真窗口 + 三级目录 + 路径安全 + 70 项检查 + 截图）
+├── scripts/verify_slice19_region_ui.py Slice 19 级联 + 推荐 Zoom 验收（真窗口 + 真关窗再开 + 90 项检查 + 截图）
+├── scripts/verify_slice18_regions.py Slice 18 行政区域层级验收（真窗口 + 三级目录 + 路径安全 + 79 项检查 + 截图）
 ├── scripts/verify_slice17_zoom.py Slice 17 分级 Zoom 策略验收（真窗口 + 真下载 + 51 项检查 + 截图）
 ├── scripts/verify_slice16_polygon.py Slice 16 多边形区域下载验收（真窗口 + 真下载 + 70 项检查 + 截图）
 ├── scripts/verify_slice10_android.py Slice 10 实机验收（真 adb 替身 + 真窗口 + 118 项检查 + 截图）
@@ -1656,11 +1789,11 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 
 ## 后续计划
 
-- **Slice 19：分层下载计划** —— 拿 Slice 18 的目录做"全国 Z4~10 + 重点省 Z9~13"这种
-  多区域组合计划：拆成若干子任务、合并估算总容量、给出磁盘占用与依赖顺序。
-  Slice 18 只提供**数据源**（目录 + 层级 + 等级 → Zoom 建议），一行下载编排都没写。
-- **Slice 20：区域管理界面** —— 层级下拉 / 省市选择器 / 区域增删改查。
-  Slice 18 在界面侧只改了"下拉框的数据来源"这一处。
+- **分层下载计划** —— 拿 Slice 18 的目录做"全国 Z4~10 + 重点省 Z9~13"这种多区域
+  组合计划：拆成若干子任务、合并估算总容量、给出磁盘占用与依赖顺序。
+  Slice 19 只做了**选一个区域 + 定 Zoom**，一行下载编排都没写。
+- **区域管理界面** —— 区域增删改查、校验报告进界面、导入授权数据。
+  Slice 19 只消费了目录的**读取侧**。
 - **Slice 11：Android 端导入** —— 端侧读 `<导入区>/<id>/manifest.json`、校验 SHA256、
   把 `map.mbtiles` 交给 osmdroid 加载。Slice 10 只负责把文件**搬到设备上并证明搬对了**，
   端侧怎么导入是下一 Slice 的事（`manifest.json` 最后传就是给它当"包齐了"的信号用的）
@@ -1671,11 +1804,13 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 > 诊断工具，Slice 9 = 离线地图包构建与校验（manifest + 流式 SHA256 + 篡改检测），
 > Slice 10 = ADB 设备管理与离线地图包传输（Windows → Android），
 > Slice 16 = GeoJSON 区域下载与中国行政区域预设，Slice 17 = 分级 Zoom 策略，
-> Slice 18 = 行政区域层级模型（中国 → 省 → 市）。
+> Slice 18 = 行政区域层级模型（中国 → 省 → 市），
+> Slice 19 = 行政区域级联选择 + 推荐 Zoom。
 > 每个 Slice 的 Spec 都会明确禁止"顺手做下一个"——Slice 10 的 Spec 就点名不许在这一
 > 个里实现 Android 端导入、不许碰 App 私有目录、不许 `adb install` / `root` / `remount`、
-> 不许压缩、不许改 MBTiles；Slice 18 的 Spec 同样点名不许实现分层下载计划（Slice 19）
-> 与区域管理界面（Slice 20）。所以那些是**下一个** Slice 的事，不是这一个的。
+> 不许压缩、不许改 MBTiles；Slice 19 的 Spec 同样点名不许实现多区域下载计划（Mission）、
+> 不许动 Android 侧与下载器内核，也不许提前做区域管理界面。所以那些是**下一个**
+> Slice 的事，不是这一个的。
 
 ## 说明与注意事项
 

@@ -172,6 +172,19 @@ Zoom 一改就刷新，自定义等级时整行收起。**界面里没有任何 
 本 Slice **只做策略核心 + 测试 + 最小提示**，没有实现省市行政区数据、分层下载计划、
 Mission 航线缓冲，也没有改 Downloader 核心与 Android 端。
 
+> **Slice 19 更新（2026-09-20）**：策略层多了一个界面侧的消费者 ——
+> **推荐 / 自定义 Zoom** 两个单选（`app/ui/region_selection.py` 的 `ZoomMode`）。
+> 三条边界没变，只是落实得更硬：
+>
+> - 「推荐 Zoom」模式下 Min/Max 由等级决定并**只读**（避免"显示的"与"生效的"不一致）；
+> - 「自定义 Zoom」模式下超范围只显示警告，值一个字都不改；
+> - 界面显示的推荐区间与 `推荐说明` **逐字**来自 `ZoomRecommendation.range_text` /
+>   `reason`，没有第二份文案（`scripts/verify_slice19_region_ui.py` 场景 B/H 守着）。
+>
+> 另外结果区的 `Zoom 明细` 多了「预计容量」一列，用的是生产的
+> `estimate_size_bytes()` + `format_size()`。详见
+> [region_selection_ui.md](region_selection_ui.md)。
+
 ---
 
 ## 8. 怎么验收

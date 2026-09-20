@@ -605,55 +605,107 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     from PySide6.QtCore import Qt
 
     panel = window.download_panel
-    combo = panel.region_combo
+    country_combo = panel.country_combo
+    province_combo = panel.province_combo
+    city_combo = panel.city_combo
     tooltip_role = Qt.ItemDataRole.ToolTipRole
 
-    texts = [combo.itemText(index) for index in range(combo.count())]
+    def _texts(combo) -> list[str]:
+        return [combo.itemText(index) for index in range(combo.count())]
+
+    def _tips(combo, *, skip_first: bool = False) -> list[str]:
+        start = 1 if skip_first else 0
+        return [
+            str(combo.itemData(index, tooltip_role))
+            for index in range(start, combo.count())
+        ]
+
+    country_texts = _texts(country_combo)
     checker.check(
-        texts == ["演示国", "北省", "南省", "河城", "山城"],
-        "下拉项**全部来自目录**（含三级），不再来自内置常量",
-        str(texts),
+        country_texts == ["演示国"],
+        "「国家」下拉只列国家级（三级不再挤在一个平面列表里）",
+        str(country_texts),
     )
-    tooltips = [
-        str(combo.itemData(index, tooltip_role)) for index in range(combo.count())
-    ]
-    expected_suffixes = [entry["geojson"].replace("/", os.sep) for entry in FIXTURE_ENTRIES]
+    province_texts = _texts(province_combo)
     checker.check(
-        all(tip.endswith(suffix) for tip, suffix in zip(tooltips, expected_suffixes)),
+        province_texts == ["全部（不限定省份）", "北省", "南省"],
+        "「省份」下拉按当前国家刷新（首项是「不限定省份」）",
+        str(province_texts),
+    )
+    city_texts = _texts(city_combo)
+    checker.check(
+        city_texts == ["全部（不限定城市）"],
+        "还没选省时「城市」下拉只有「不限定城市」（选了省才展开）",
+        str(city_texts),
+    )
+    # 分隔符两种都可能出现（条目里存的是 posix 相对路径，Windows 上 str(Path)
+    # 会给反斜杠）→ 归一化后再比，免得把"脚本自己写死了分隔符"报成产品缺陷。
+    expected_paths = [
+        str(entry["geojson"]).replace("\\", "/")
+        for entry in FIXTURE_ENTRIES
+        if entry["level"] in ("country", "province")
+    ]
+    tips = _tips(country_combo) + _tips(province_combo, skip_first=True)
+    checker.check(
+        [tip.replace("\\", "/") for tip in tips] == expected_paths,
         "每一行的提示（tooltip）指向**分层路径**下的边界文件",
-        str(tooltips[:2]),
+        str(tips),
     )
 
     panel.set_region_type(RegionType.POLYGON)
     _pump(app)
-    panel.set_region_id("demoland")
-    _pump(app)
     checker.check(
         panel.current_region_level() is RegionLevel.COUNTRY,
-        "选中国家级 → 等级 COUNTRY",
+        "只选国家 → 等级 COUNTRY（不必再选省 / 市）",
         panel.current_region_level().value,
+    )
+    checker.check(
+        panel.level_text.startswith("全国级"),
+        "「下载级别」一行显示等级与路径（来自目录条目）",
+        panel.level_text,
     )
     first_line = panel.zoom_policy_text.splitlines()[:1]
     checker.check(
-        first_line == [f"推荐 Zoom：{ZoomStrategyService().recommend(RegionLevel.COUNTRY).range_text}"],
+        first_line
+        == [
+            f"推荐 Zoom：{ZoomStrategyService().recommend(RegionLevel.COUNTRY).range_text}"
+        ],
         "国家级建议区间来自策略层（不是抄来的常量）",
         repr(first_line),
     )
     _shot(window, "slice18_regions_dropdown.png", shots)
 
-    panel.set_region_id("northland")
+    # --- 级联：选省 → 城市下拉跟着刷新 ---
+    province_combo.setCurrentIndex(1)
     _pump(app)
     checker.check(
         panel.current_region_level() is RegionLevel.PROVINCE,
-        "选中省级 → 等级 PROVINCE",
+        "选省级 → 等级 PROVINCE",
         panel.current_region_level().value,
     )
-    panel.set_region_id("rivertown")
+    checker.check(
+        panel.current_region_id() == "northland",
+        "省级这一步的生效 id 是省自己（还没选市）",
+        str(panel.current_region_id()),
+    )
+    checker.check(
+        _texts(city_combo) == ["全部（不限定城市）", "河城"],
+        "选省后「城市」下拉刷新成该省的城市",
+        str(_texts(city_combo)),
+    )
+
+    # --- 级联：选市 → 等级 CITY，生效 id 换成市 ---
+    city_combo.setCurrentIndex(1)
     _pump(app)
     checker.check(
         panel.current_region_level() is RegionLevel.CITY,
         "选中市级 → 等级 CITY",
         panel.current_region_level().value,
+    )
+    checker.check(
+        panel.current_region_id() == "rivertown",
+        "选了市之后生效 id 变成市（市 → 省 → 国 的兜底顺序只在缺项时生效）",
+        str(panel.current_region_id()),
     )
     city_line = panel.zoom_policy_text.splitlines()[:1]
     expected_city = f"推荐 Zoom：{ZoomStrategyService().recommend(RegionLevel.CITY).range_text}"
@@ -662,13 +714,37 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
         "市级建议区间 Z12~16 来自策略层",
         repr(city_line),
     )
-    # 界面默认 Zoom 是 8~17，对**市级**而言确实超上界 —— 于是这一行会出现警告，
-    # 而警告的等级是「城市级」（等级取自目录条目，不是写死的）。这条同时验证了
-    # Slice 17 的策略在 Slice 18 的目录数据上没有走样。
+
+    # Slice 19 起默认是**推荐模式**：Zoom 由等级决定，界面上显示的就该是建议值，
+    # 不存在"用户超范围"这回事。
+    recommendation = ZoomStrategyService().recommend(RegionLevel.CITY)
+    data = panel.get_form_data()
+    checker.check(
+        (data["min_zoom"], data["max_zoom"])
+        == (recommendation.min_zoom, recommendation.max_zoom),
+        "推荐模式自动把 Zoom 填成策略建议值（界面显示 == 建议值）",
+        f"{data['min_zoom']}~{data['max_zoom']}",
+    )
+    checker.check(
+        "警告" not in panel.zoom_policy_text,
+        "推荐模式下不存在「用户超范围」（值就是建议值）",
+        panel.zoom_policy_text.replace("\n", " / "),
+    )
+
+    # 切到**自定义**后给 8~17，对市级而言确实超上界 —— 于是这一行出现警告，而警告
+    # 的等级是「城市级」（等级取自目录条目，不是写死的）。这同时验证了 Slice 17 的
+    # 策略在 Slice 18/19 的目录数据上没有走样。
+    panel.set_zoom_range(8, 17)
+    _pump(app)
     checker.check(
         "城市级" in panel.zoom_policy_text and "Z12~16" in panel.zoom_policy_text,
-        "默认 8~17 对市级区域产生「城市级」警告（等级来自目录）",
+        "自定义 8~17 对市级区域产生「城市级」警告（等级来自目录）",
         panel.zoom_policy_text.replace("\n", " / "),
+    )
+    checker.check(
+        panel.zoom_range_text() == "8 ~ 17",
+        "只警告、不改用户输入（自定义模式下的 Zoom 原样保留）",
+        panel.zoom_range_text(),
     )
     panel.set_zoom_range(12, 16)
     _pump(app)
@@ -876,7 +952,7 @@ def scene_manual_checklist(checker: Checker) -> None:
         ("9. Zoom 建议按等级来自策略层", "场景 F：界面首行 == 策略服务输出"),
         ("10. 目录不可用时兜底不崩", "场景 G：catalog_error 有值且中国还在"),
         ("11. 仓库不含内置边界数据", "场景 A：*.geojson 数量为 0"),
-        ("12. 未提前实现 Slice 19 / 20", "场景 H：app/regions 无等级字面量、无下载计划"),
+        ("12. 未提前实现 Slice 20", "场景 H：app/regions 无等级字面量、无下载计划"),
     ]
     for title, coverage in steps:
         checker.check(True, title, coverage)

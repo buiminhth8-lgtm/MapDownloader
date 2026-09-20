@@ -21,7 +21,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QWidget
 
 from app.config.settings import APP_NAME, ORG_NAME
-from app.ui.preferences import SECRET_KEY_FRAGMENTS, UiPreferences
+from app.ui.preferences import SECRET_KEY_FRAGMENTS, RegionSelection, UiPreferences
 
 
 @pytest.fixture()
@@ -132,10 +132,22 @@ def test_managed_keys_contain_no_secret_fragments(
     preferences.set_output_dir("D:/maps")
     preferences.set_map_type("vector")
     preferences.set_zoom_range(8, 17)
+    # Slice 19 新增的键也要写一遍：漏掉它们的话，这条守卫对新增的那几行
+    # 等于没跑 —— 而"行政区 id"这一类键名恰好是最容易顺手带上敏感词的地方。
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="china",
+            province_id="zhejiang",
+            city_id="hangzhou",
+        )
+    )
+    preferences.set_zoom_mode("recommended")
     preferences.save_geometry(QWidget())
 
     keys = preferences.stored_keys()
     assert keys, "至少要真的写出几个键，否则这条断言是空转的"
+    assert "download/city_id" in keys, "前提：新增的键确实写进去了"
 
     for key in keys:
         lowered = key.lower()
@@ -294,3 +306,97 @@ def test_ini_backend_file_is_a_real_file(preferences: UiPreferences) -> None:
     name = preferences.settings.fileName()
     assert name.endswith(".ini")
     assert Path(name).exists(), f"IniFormat 的落点应当是一个真实文件：{name}"
+
+
+# --------------------------------------------------------------------------- #
+# 区域选择与 Zoom 模式（Slice 19，Spec §14）
+# --------------------------------------------------------------------------- #
+def test_region_selection_round_trip(preferences: UiPreferences) -> None:
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="china",
+            province_id="zhejiang",
+            city_id="hangzhou",
+        )
+    )
+
+    stored = preferences.region_selection
+    assert stored == RegionSelection(
+        region_type="polygon",
+        country_id="china",
+        province_id="zhejiang",
+        city_id="hangzhou",
+    )
+    assert stored.is_empty is False
+
+
+def test_empty_region_selection_clears_the_previous_values(
+    preferences: UiPreferences,
+) -> None:
+    """"不限定省"要能把上次那个省**清掉**，而不是留着残值。
+
+    留着的话，下次打开会变成"国还是那个国、省却变成了上次选的"，而用户
+    记得自己明明选了"全部"。
+    """
+    preferences.set_region_selection(
+        RegionSelection(region_type="polygon", country_id="china", province_id="zhejiang")
+    )
+    preferences.set_region_selection(RegionSelection(region_type="polygon", country_id="china"))
+
+    stored = preferences.region_selection
+    assert stored.province_id is None
+    assert stored.city_id is None
+
+
+def test_region_selection_defaults_to_empty(preferences: UiPreferences) -> None:
+    assert preferences.region_selection == RegionSelection()
+    assert preferences.region_selection.is_empty is True
+
+
+def test_zoom_mode_round_trip(preferences: UiPreferences) -> None:
+    assert preferences.zoom_mode is None
+    preferences.set_zoom_mode("recommended")
+    assert preferences.zoom_mode == "recommended"
+    preferences.set_zoom_mode(None)
+    assert preferences.zoom_mode is None, "存 None 表示清除（不做成一个空字符串键）"
+
+
+def test_custom_zoom_keys_are_the_managed_ones(preferences: UiPreferences) -> None:
+    """Slice 19 起缩放区间落在 ``custom_*`` 上（Spec §14 的命名）。"""
+    preferences.set_zoom_range(8, 17)
+
+    assert preferences.settings.contains("download/custom_min_zoom")
+    assert preferences.settings.contains("download/custom_max_zoom")
+
+
+def test_legacy_zoom_keys_are_still_read(preferences: UiPreferences) -> None:
+    """老配置（Slice ≤18 写的 ``download/min_zoom``）要能被读出来。
+
+    升级不该让一个已经调到顺手位置的用户"回到出厂设置"。
+    """
+    preferences.settings.setValue("download/min_zoom", 11)
+    preferences.settings.setValue("download/max_zoom", 13)
+
+    assert preferences.zoom_range == (11, 13)
+
+
+def test_new_zoom_keys_win_over_the_legacy_ones(preferences: UiPreferences) -> None:
+    """新键一旦存在，老键就不该再有机会覆盖它 —— 哪怕新值更小。"""
+    preferences.settings.setValue("download/min_zoom", 11)
+    preferences.settings.setValue("download/max_zoom", 13)
+    preferences.set_zoom_range(5, 7)
+
+    assert preferences.zoom_range == (5, 7)
+
+
+def test_clear_also_removes_the_legacy_keys(preferences: UiPreferences) -> None:
+    """``clear()`` 要连只读的老键一起清：否则"清空偏好"之后旧值又冒出来了。"""
+    preferences.settings.setValue("download/min_zoom", 11)
+    preferences.settings.setValue("download/max_zoom", 13)
+    preferences.set_zoom_range(5, 7)
+
+    preferences.clear()
+
+    assert preferences.zoom_range is None
+    assert not preferences.settings.contains("download/min_zoom")

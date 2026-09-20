@@ -61,6 +61,7 @@ from app.ui.download_panel import (
     ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
+from app.ui.region_selection import ZoomMode
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
@@ -365,6 +366,10 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
         # Slice 16：区域类型（矩形 / 行政区域）与据此构造的下载区域
         "region_type",
         "region",
+        # Slice 19：当前生效的区域 id / 等级 / 下载策略
+        "region_id",
+        "region_level",
+        "zoom_mode",
     }
     assert data["token"] == ""
     # Slice 6 起下拉框放的是"地图类型"（矢量 / 影像），底图图层由它派生
@@ -383,6 +388,10 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
     assert data["region"].bounds == GeoBounds(
         west=data["west"], south=data["south"], east=data["east"], north=data["north"]
     )
+    # Slice 19：矩形模式下没有行政区域，等级是 CUSTOM（不套用等级策略）
+    assert data["region_id"] is None
+    assert data["region_level"] is RegionLevel.CUSTOM
+    assert data["zoom_mode"] is ZoomMode.RECOMMENDED
 
 
 def test_form_data_reflects_edits(window: MainWindow) -> None:
@@ -3617,34 +3626,65 @@ def _use_region_root(monkeypatch, root: Path) -> None:
 
 
 def test_region_combo_is_filled_from_the_catalog(window: MainWindow) -> None:
-    """当前只有中国时，界面与 Slice 16 一模一样（Spec §15）。"""
+    """当前只有中国时，界面上就是那一条（Spec §15）。"""
     panel = window.download_panel
 
     assert [preset.region_id for preset in panel.region_service.list_presets()] == ["china"]
+    # Slice 19 起下拉里放的是**目录条目**（`.id`），不再是 Slice 16 的扁平预设
+    # （`.region_id`）：级联需要 `parent_id` 这类层级字段，扁平预设没有。
     item = panel.region_combo.itemData(0)
-    assert item.region_id == "china"
+    assert item.id == "china"
     # 面板不再自己维护名单：条目直接来自目录，连文件路径都是目录算出来的
     assert panel.region_combo.itemText(0) == "中国（边界文件未就绪）"
-    assert str(item.geojson_path).endswith(str(Path("country") / "china.geojson"))
+    # 目录里存的是**相对资源目录**的路径（始终用正斜杠，Spec §12）
+    assert item.geojson_path == "country/china.geojson"
+    # 三级级联在矩形模式下**不参与下载**：对外报的 id 必须是 None
+    panel.set_region_type(RegionType.POLYGON)
+    assert panel.current_region_id() == "china"
+    panel.set_region_type(RegionType.RECTANGLE)
+    assert panel.current_region_id() is None
 
 
 def test_region_combo_follows_a_redirected_catalog(
     window: MainWindow, monkeypatch, region_root: Path
 ) -> None:
-    """把资源目录指向合成树 → 下拉框换成那 6 条，且**不用改任何代码**。"""
+    """把资源目录指向合成树 → 三级下拉换成那 6 条，且**不用改任何代码**。
+
+    Slice 19 起这一段从"一条平铺下拉"变成了三段级联，因此断言也随之改成
+    逐级检查 —— 守的性质没变（条目全部来自目录、重定向资源目录界面就跟着变），
+    而且更强了一点：级联关系本身也来自目录，不是界面上写死的。
+    """
     panel = window.download_panel
     _use_region_root(monkeypatch, region_root)
 
     panel.reload_region_boundary()
 
-    assert panel.region_combo.count() == 6
-    ids = [panel.region_combo.itemData(i).region_id for i in range(panel.region_combo.count())]
-    assert ids == ["demoland", "northland", "southland", "rivertown", "hilltown", "lakecity"]
-    assert [panel.region_combo.itemText(i) for i in range(3)] == [
-        "示例国",
+    assert panel.country_combo.count() == 1
+    assert panel.country_combo.itemText(0) == "示例国"
+    assert panel.country_combo.itemData(0).id == "demoland"
+
+    # 国家下面两个省，加一条"全部（不限定省份）"
+    assert [panel.province_combo.itemText(i) for i in range(panel.province_combo.count())] == [
+        "全部（不限定省份）",
         "示例北省",
         "示例南省",
-    ], "边界文件就位时不再带「未就绪」后缀"
+    ]
+    assert [panel.city_combo.itemText(i) for i in range(panel.city_combo.count())] == [
+        "全部（不限定城市）"
+    ], "还没选省时城市没有可选项"
+
+    # 选省 → 城市列表跟着换（级联关系来自目录，不是界面自己推导的）
+    panel.province_combo.setCurrentIndex(1)
+    assert [
+        panel.city_combo.itemData(i).id
+        for i in range(1, panel.city_combo.count())
+    ] == ["rivertown", "hilltown"]
+
+    panel.province_combo.setCurrentIndex(2)
+    assert [
+        panel.city_combo.itemData(i).id
+        for i in range(1, panel.city_combo.count())
+    ] == ["lakecity"]
 
 
 def test_picking_a_city_uses_the_city_zoom_policy(

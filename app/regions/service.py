@@ -130,6 +130,19 @@ class RegionService:
         return self._catalog_error
 
     @property
+    def strategy(self) -> ZoomStrategyService:
+        """Zoom 策略服务（Slice 19）。
+
+        界面侧要"取推荐值 / 判断是否超范围"，而本服务已经持有策略实例（见
+        :meth:`get_zoom_recommendation`）。把它暴露出来是为了让
+        :class:`~app.ui.region_selection.RegionSelectionController` 复用**同一个**
+        实例，而不是各造一个 —— 两者读的是同一张
+        :data:`~app.planning.DEFAULT_ZOOM_POLICIES`，多一个实例不会算出不同结果，
+        但会多一处"注入点"，验收脚本想固定策略表时就得多改一处。
+        """
+        return self._strategy
+
+    @property
     def loader(self) -> RegionLoader:
         """与当前目录配套的加载器。"""
         return RegionLoader(self.catalog, root=self.root)

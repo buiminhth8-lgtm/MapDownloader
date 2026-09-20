@@ -269,11 +269,16 @@ region.geometry, region.bounds           # 交给既有的估算器 / 过滤器
 
 ## 9. 界面接了什么
 
-只接了**最小的一环**：区域下拉框的选项**从 `RegionService.list_presets()` 来**，
+本 Slice 只接了**最小的一环**：区域下拉框的选项**从 `RegionService.list_presets()` 来**，
 不再是直接读 `REGION_PRESETS` 常量。于是"把 `REGION_RESOURCE_DIR` 指到别处"
 这件事对界面同样成立（`tests/test_ui_smoke.py` 里有一条重定向后下拉跟着变的用例）。
 
 **没有**做层级下拉、省市选择器、区域管理页 —— 那些是 Slice 19 / 20。
+
+> **Slice 19 更新（2026-09-20）**：层级导航已经接上了。那个"一条下拉列全部行政区"
+> 的控件被**三段级联**（国家 / 省 / 市）取代，数据来源仍是本 Slice 的
+> `RegionService`（`list_countries()` / `list_provinces()` / `list_cities()`），
+> 等级也仍由目录条目给出。细节见 [region_selection_ui.md](region_selection_ui.md)。
 
 ---
 
@@ -303,18 +308,21 @@ region.geometry, region.bounds           # 交给既有的估算器 / 过滤器
 
 ---
 
-## 11. 下一步（Slice 19 要用的东西）
+## 11. 下一步
 
-这个 Slice 只把**数据源**准备好了。Slice 19 会拿它做分层下载计划：
+### Slice 19 已经用掉了什么（2026-09-20）
 
-| 能力 | 现在有没有 |
+| 能力 | 状态 |
 | --- | --- |
-| 目录条目 + 层级查询 | ✅ 本 Slice |
-| 路径安全 / 校验 | ✅ 本 Slice |
-| `level` → Zoom 建议 | ✅ Slice 17，本 Slice 接上 |
-| **按层级生成多区域下载计划** | ❌ Slice 19 |
-| **区域管理界面（增删改查）** | ❌ Slice 20 |
-| 磁盘占用预估 / 依赖检查 | ❌ Slice 19 |
+| 目录条目 + 层级查询 | ✅ Slice 18 → Slice 19 的级联下拉 |
+| 路径安全 / 校验 | ✅ Slice 18 |
+| `level` → Zoom 建议 | ✅ Slice 17，Slice 19 接进界面（推荐 / 自定义策略） |
+| **按层级生成多区域下载计划** | ❌ 仍待做 |
+| **区域管理界面（增删改查）** | ❌ 仍待做 |
+| 磁盘占用预估 / 依赖检查 | ❌ 仍待做 |
+
+Slice 19 只消费了目录的**读取侧**（`list_countries` / `list_provinces` /
+`list_cities` / `get_region`）。目录写入、校验报告进界面、多区域计划都还没做。
 
 放数据的步骤没变，只是路径从平铺改成分层：
 
@@ -322,5 +330,10 @@ region.geometry, region.bounds           # 交给既有的估算器 / 过滤器
 2. 在 `resources/regions/index.json` 的 `regions` 里加一条，写清
    `id` / `name` / `level` / `parentId` / `geojson`；
 3. 跑一次 `service.validate(deep=True)` 确认没有 ERROR。
+
+**加完之后界面不用改**：三段下拉是遍历目录来的，等级也来自条目。补一条省级记录，
+省份下拉就多一项；补一条市级记录，选到它的省时城市下拉就多一项 —— 只有一件事要
+注意：新条目的 `parentId` 必须指到同文件里某个条目的 `id`，否则它不会出现在任何
+一级的下拉里（`validate()` 会报 `parent_missing`）。
 
 策略核心、加载器、界面提示都不需要改动。

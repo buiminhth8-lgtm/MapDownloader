@@ -5,11 +5,16 @@
 
 **存**（都是"下次打开还在那儿"能明显减少重复劳动的东西）::
 
-    download/output_dir     最近使用的输出目录
-    download/map_type       上次选的地图类型
-    download/min_zoom       上次的缩放区间
-    download/max_zoom
-    window/geometry         窗口大小与位置
+    download/output_dir       最近使用的输出目录
+    download/map_type         上次选的地图类型
+    download/custom_min_zoom  上次**手动**设置的缩放区间（Slice 19 起改名）
+    download/custom_max_zoom
+    download/region_type      上次的区域类型（自定义矩形 / 行政区域）
+    download/country_id       上次选的三级行政区（Slice 19）
+    download/province_id
+    download/city_id
+    download/zoom_mode        上次的下载策略（推荐 / 自定义）
+    window/geometry           窗口大小与位置
 
 **不存**：天地图 Token。理由不是"不方便"，而是密钥不该落在注册表 / 配置文件里
 ——那是个任何程序都能读、还会被各种"清理工具"打包上传的地方。Token 只能在内存
@@ -25,12 +30,13 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from PySide6.QtCore import QByteArray, QSettings
 
 from app.config.settings import APP_NAME, ORG_NAME
 
-__all__ = ["SECRET_KEY_FRAGMENTS", "UiPreferences"]
+__all__ = ["SECRET_KEY_FRAGMENTS", "RegionSelection", "UiPreferences"]
 
 _logger = logging.getLogger(__name__)
 
@@ -45,18 +51,65 @@ _WINDOW_GROUP = "window"
 #: 存储键（集中在一处，避免"读了 A 写了 B"这种只在重启后才暴露的错）
 _KEY_OUTPUT_DIR = f"{_DOWNLOAD_GROUP}/output_dir"
 _KEY_MAP_TYPE = f"{_DOWNLOAD_GROUP}/map_type"
-_KEY_MIN_ZOOM = f"{_DOWNLOAD_GROUP}/min_zoom"
-_KEY_MAX_ZOOM = f"{_DOWNLOAD_GROUP}/max_zoom"
+_KEY_CUSTOM_MIN_ZOOM = f"{_DOWNLOAD_GROUP}/custom_min_zoom"
+_KEY_CUSTOM_MAX_ZOOM = f"{_DOWNLOAD_GROUP}/custom_max_zoom"
+_KEY_REGION_TYPE = f"{_DOWNLOAD_GROUP}/region_type"
+_KEY_COUNTRY_ID = f"{_DOWNLOAD_GROUP}/country_id"
+_KEY_PROVINCE_ID = f"{_DOWNLOAD_GROUP}/province_id"
+_KEY_CITY_ID = f"{_DOWNLOAD_GROUP}/city_id"
+_KEY_ZOOM_MODE = f"{_DOWNLOAD_GROUP}/zoom_mode"
 _KEY_GEOMETRY = f"{_WINDOW_GROUP}/geometry"
+
+#: Slice ≤18 用的键名。**只读不写**（Slice 19，Spec §14 把"用户的 Zoom"
+#: 明确成了 ``custom_*``）。留着这一对是为了让老配置里的缩放区间不至于
+#: 在升级后被当成"从没设过"—— 那对一个已经调到顺手位置的用户来说是退步。
+_LEGACY_KEY_MIN_ZOOM = f"{_DOWNLOAD_GROUP}/min_zoom"
+_LEGACY_KEY_MAX_ZOOM = f"{_DOWNLOAD_GROUP}/max_zoom"
 
 #: 本类会写出的全部键（测试用；新增键时这里必须同步）
 _MANAGED_KEYS: tuple[str, ...] = (
     _KEY_OUTPUT_DIR,
     _KEY_MAP_TYPE,
-    _KEY_MIN_ZOOM,
-    _KEY_MAX_ZOOM,
+    _KEY_CUSTOM_MIN_ZOOM,
+    _KEY_CUSTOM_MAX_ZOOM,
+    _KEY_REGION_TYPE,
+    _KEY_COUNTRY_ID,
+    _KEY_PROVINCE_ID,
+    _KEY_CITY_ID,
+    _KEY_ZOOM_MODE,
     _KEY_GEOMETRY,
 )
+
+#: 只需要**读**（清理与迁移时要一并处理，但不该被当成"我们写的键"）
+_LEGACY_KEYS: tuple[str, ...] = (_LEGACY_KEY_MIN_ZOOM, _LEGACY_KEY_MAX_ZOOM)
+
+
+@dataclass(frozen=True)
+class RegionSelection:
+    """行政区选择在偏好里的快照（Slice 19，Spec §14）。
+
+    三个 id 分开存而不是只存一个"当前生效 id"：界面是按三段下拉恢复的，
+    只存一个末端 id 就得反推"它的父亲是谁"——那是目录的职责，不该在
+    偏好这一层再实现一遍。
+
+    Attributes:
+        region_type: ``RegionType.value``（``rectangle`` / ``polygon``）。
+        country_id: 国家 id。
+        province_id: 省 id（"不限定省"时是 ``None``）。
+        city_id: 市 id（"不限定市"时是 ``None``）。
+    """
+
+    region_type: str = ""
+    country_id: str | None = None
+    province_id: str | None = None
+    city_id: str | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        """一条都没存过。"""
+        return not any(
+            (self.region_type, self.country_id, self.province_id, self.city_id)
+        )
 
 
 class UiPreferences:
@@ -122,17 +175,55 @@ class UiPreferences:
 
     @property
     def zoom_range(self) -> tuple[int, int] | None:
-        """上次使用的 ``(min_zoom, max_zoom)``；记录不完整时返回 ``None``。"""
-        low = self._read_int(_KEY_MIN_ZOOM)
-        high = self._read_int(_KEY_MAX_ZOOM)
+        """上次**手动设置**的 ``(min_zoom, max_zoom)``；没记录时返回 ``None``。
+
+        没写过新键时会退回读 Slice ≤18 的 ``download/min_zoom`` / ``max_zoom``
+        （一次性的迁移读取，见 ``_LEGACY_KEYS``）。两者都缺才算"没有记录"。
+        """
+        low = self._read_int(_KEY_CUSTOM_MIN_ZOOM, fallback=_LEGACY_KEY_MIN_ZOOM)
+        high = self._read_int(_KEY_CUSTOM_MAX_ZOOM, fallback=_LEGACY_KEY_MAX_ZOOM)
         if low is None or high is None:
             return None
         return (low, high)
 
     def set_zoom_range(self, min_zoom: int, max_zoom: int) -> None:
         """记住缩放区间。"""
-        self._write_int(_KEY_MIN_ZOOM, min_zoom)
-        self._write_int(_KEY_MAX_ZOOM, max_zoom)
+        self._write_int(_KEY_CUSTOM_MIN_ZOOM, min_zoom)
+        self._write_int(_KEY_CUSTOM_MAX_ZOOM, max_zoom)
+
+    # ------------------------------------------------------------------ #
+    # 区域选择（Slice 19，Spec §14）
+    # ------------------------------------------------------------------ #
+    @property
+    def region_selection(self) -> RegionSelection:
+        """上次的行政区选择；没记录过时返回一个全空的快照。"""
+        return RegionSelection(
+            region_type=self._read_text(_KEY_REGION_TYPE) or "",
+            country_id=self._read_text(_KEY_COUNTRY_ID),
+            province_id=self._read_text(_KEY_PROVINCE_ID),
+            city_id=self._read_text(_KEY_CITY_ID),
+        )
+
+    def set_region_selection(self, selection: RegionSelection) -> None:
+        """记住行政区选择（空字段会被清除，不会留下上一次的残值）。"""
+        self._write_text(_KEY_REGION_TYPE, selection.region_type or None)
+        self._write_text(_KEY_COUNTRY_ID, selection.country_id)
+        self._write_text(_KEY_PROVINCE_ID, selection.province_id)
+        self._write_text(_KEY_CITY_ID, selection.city_id)
+
+    @property
+    def zoom_mode(self) -> str | None:
+        """上次的下载策略（``recommended`` / ``custom``）；没记录时返回 ``None``。"""
+        return self._read_text(_KEY_ZOOM_MODE)
+
+    def set_zoom_mode(self, value: str | None) -> None:
+        """记住下载策略。
+
+        存的是模式**名字**（字符串）而不是控件状态：偏好这一层不认识
+        ``ZoomMode`` 枚举，认不出来时由界面回落到推荐模式 —— 一个脏字符串
+        不该让程序起不来。
+        """
+        self._write_text(_KEY_ZOOM_MODE, value)
 
     # ------------------------------------------------------------------ #
     # 窗口几何
@@ -168,8 +259,13 @@ class UiPreferences:
     # 清理
     # ------------------------------------------------------------------ #
     def clear(self) -> None:
-        """清空本类管理的全部键（不动键空间里的其它内容）。"""
-        for key in _MANAGED_KEYS:
+        """清空本类管理的全部键（不动键空间里的其它内容）。
+
+        ``_LEGACY_KEYS`` 也要删：它们虽然不是我们写的，但 :attr:`zoom_range`
+        会在新键缺失时**回退读它们**。只删新键的话，一次 ``clear()`` 之后
+        "从没设过缩放区间"这个事实会被老配置悄悄推翻。
+        """
+        for key in (*_MANAGED_KEYS, *_LEGACY_KEYS):
             self._settings.remove(key)
         self._written.clear()
         self._sync()
@@ -195,7 +291,14 @@ class UiPreferences:
             self._written.discard(key)
         self._sync()
 
-    def _read_int(self, key: str) -> int | None:
+    def _read_int(self, key: str, *, fallback: str | None = None) -> int | None:
+        """读一个整数键；本键没有而给了 ``fallback`` 时改读它（迁移用）。
+
+        ``fallback`` 只在**本键完全不存在**时才生效：如果用户已经用新版本
+        存过值（哪怕存的是 0），老键就不该再有机会覆盖它。
+        """
+        if not self._settings.contains(key) and fallback is not None:
+            key = fallback
         value = self._settings.value(key)
         if value is None:
             return None

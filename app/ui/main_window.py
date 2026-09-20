@@ -178,7 +178,8 @@ from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
-from app.ui.preferences import UiPreferences
+from app.ui.preferences import RegionSelection, UiPreferences
+from app.ui.region_selection import ZoomMode
 from app.ui.task_actions import UiTaskState
 from app.ui.task_panel import TaskPanel
 from app.ui.task_progress_panel import TaskProgressPanel
@@ -2835,12 +2836,64 @@ class MainWindow(QMainWindow):
         if map_type is not None:
             self.download_panel.set_map_type(map_type)
 
+        # 区域选择（Slice 19，Spec §14）。**必须先于 Zoom**：恢复一个行政区域会
+        # 把模式带到「推荐」，而推荐模式会立刻把推荐值填进 Min/Max —— 顺序反了
+        # 的话，用户上次设的 8~17 会被推荐值顶掉，然后才轮到"恢复 Zoom"，
+        # 恢复出来的就变成了两个都不是的值。
+        self._restore_region_selection(prefs.region_selection)
+
         zoom = prefs.zoom_range
         if zoom is not None:
             self.download_panel.set_zoom_range(zoom[0], zoom[1])
 
+        # 模式放在最后：它是"这对 Zoom 该怎么理解"的说明（Spec §14）。
+        # 认不出来的值由 ``ZoomMode.parse`` 回落到推荐 —— 一个脏字符串不该
+        # 让程序起不来。
+        if prefs.zoom_mode:
+            self.download_panel.set_zoom_mode(ZoomMode.parse(prefs.zoom_mode))
+
         if prefs.restore_geometry(self):
             self.log_panel.append_log("已恢复上次的窗口位置与大小")
+
+    def _restore_region_selection(self, selection: RegionSelection) -> None:
+        """恢复上次的行政区选择；认不出来就**安全回退**（Spec §14）。
+
+        回退是**逐级**的：市认不出来试省，省认不出来试国，一个都不认识才落回
+        自定义矩形。一个"已经不存在的旧 id"往往只是目录改名或删了一层，用户
+        真正想下的多半还是那个国家 —— 直接扔掉整条链才是真正的退步。
+
+        全程不抛异常：偏好是锦上添花，读不出来就该当没存过。
+        """
+        if selection.is_empty or not selection.region_type:
+            return
+        if RegionType.parse(selection.region_type) is not RegionType.POLYGON:
+            # 上次就是自定义矩形（或值认不出来）→ 保持默认的矩形
+            return
+
+        deepest = selection.city_id or selection.province_id or selection.country_id
+        service = self.download_panel.region_controller.service
+        for candidate in (selection.city_id, selection.province_id, selection.country_id):
+            if not candidate:
+                continue
+            # 先问目录里有没有这一条，再动界面：`set_region_id` 会把面板切到
+            # 「行政区域」，对着一个不存在的 id 反复切，最后反而留在多边形模式
+            # 上 —— 那正是"回退没生效"的样子。
+            if service.get_region(candidate) is None:
+                continue
+            if self.download_panel.set_region_id(candidate):
+                if candidate != deepest:
+                    self.log_panel.append_log(
+                        f"上次的行政区域只剩「{candidate}」还在目录里，已按它恢复",
+                        "WARNING",
+                    )
+                return
+
+        # 一个都不认识 → 安全回退到自定义矩形（Spec §14），并把模式**真的**切回去
+        self.download_panel.set_region_type(RegionType.RECTANGLE)
+        self.log_panel.append_log(
+            "上次选的行政区域在当前目录里已经不存在，已退回「自定义矩形」",
+            "WARNING",
+        )
 
     def _save_preferences(self) -> None:
         """关闭时记下这次的输出目录 / 地图类型 / 缩放区间 / 窗口位置。
@@ -2849,10 +2902,26 @@ class MainWindow(QMainWindow):
         想看到的是"我上次调到哪儿了"，而不是"上次跑的那个任务用的参数"。
         """
         prefs = self.preferences
-        data = self.download_panel.get_form_data()
+        panel = self.download_panel
+        data = panel.get_form_data()
         prefs.set_output_dir(str(data["output_dir"]))
         prefs.set_map_type(data["map_type"].value)
         prefs.set_zoom_range(data["min_zoom"], data["max_zoom"])
+        # 行政区选择（Slice 19，Spec §14）：三段 id 分别存，恢复时按
+        # 国 → 省 → 市 逐级铺（见 `_restore_region_selection`）。
+        controller = panel.region_controller
+        country = controller.country
+        province = controller.province
+        city = controller.city
+        prefs.set_region_selection(
+            RegionSelection(
+                region_type=data["region_type"].value,
+                country_id=country.id if country is not None else None,
+                province_id=province.id if province is not None else None,
+                city_id=city.id if city is not None else None,
+            )
+        )
+        prefs.set_zoom_mode(data["zoom_mode"].value)
         prefs.save_geometry(self)
 
     # ------------------------------------------------------------------ #

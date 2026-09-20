@@ -14,6 +14,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -53,6 +55,8 @@ from app.geo import (
     GeoJSONError,
     RegionBoundaryMissing,
     RegionType,
+    estimate_size_bytes,
+    format_size,
     geometry_to_bounds,
 )
 from app.geo.region import RegionPreset
@@ -64,9 +68,9 @@ from app.models.map_layer import (
 from app.planning import (
     RegionLevel,
     ZoomRecommendation,
-    ZoomStrategyService,
 )
 from app.regions import RegionService
+from app.ui.region_selection import RegionSelectionController, ZoomMode
 from app.ui.task_actions import TaskAction, UiTaskState, actions_for
 from app.ui.validation import auto_map_name
 
@@ -118,6 +122,17 @@ _COORD_SPIN_MIN_WIDTH = 124
 
 #: 未计算时结果区展示的占位文案
 _RESULT_PLACEHOLDER = "尚未计算"
+
+#: 省份 / 城市下拉里"不限定"的那一项（Spec §1 的「全部/请选择」）。
+#:
+#: 它的 ``itemData`` 是 ``None``：选中它意味着"这一级不参与"，
+#: 于是等级自动落回上一级（只选中国 → COUNTRY，选了省 → PROVINCE）。
+_ANY_PROVINCE_TEXT = "全部（不限定省份）"
+_ANY_CITY_TEXT = "全部（不限定城市）"
+
+#: 省下面确实没有城市级数据时，城市下拉里那一项改成的文案。
+#: 这与"还没选省"是两回事：后者是用户的操作顺序问题，前者是数据问题。
+_NO_CITY_TEXT = "（该省暂无城市级数据）"
 
 #: 未做连通性测试时展示的占位文案
 _CONNECTION_PLACEHOLDER = "尚未测试"
@@ -192,9 +207,21 @@ class DownloadPanel(QGroupBox):
         #: 初始化：``_build_buttons`` 结尾就会调一次 ``apply_task_state``。
         self._task_state: UiTaskState = UiTaskState.IDLE
 
-        #: Zoom 策略服务（Slice 17，Spec §11）。面板只**问建议**，从不改用户输入；
-        #: 策略值与文案都在 app.planning 里，界面这一侧不出现任何 Zoom 区间常量。
-        self._zoom_strategy = ZoomStrategyService()
+        #: 行政区目录服务（Slice 18）。构造时不传参数 → 它跟随
+        #: ``app.geo.region.REGION_RESOURCE_DIR`` 这个全局，验收脚本把资源重定向到
+        #: 临时目录时面板会自动跟着走（与 Slice 16 的行为一致）。
+        self._region_service = RegionService()
+
+        #: 级联选择 + Zoom 模式（Slice 19，Spec §12）。面板只画控件、转发事件、
+        #: 渲染结论；"国家 → 省 → 市"的推导与"等级 → Zoom"的映射都在控制器里
+        #: —— 本类因此**没有一处** Zoom 区间常量，也**没有一处**解析
+        #: ``index.json`` 的代码。
+        self._controller = RegionSelectionController(self._region_service)
+
+        #: 界面正在被程序自己改写（回填下拉、应用推荐值）。
+        #: 没有它的话，"设置下拉项"会立刻回调进来再改一遍下拉项 ——
+        #: 表现为切换省时城市列表被清两次、或者推荐值把用户刚选的东西顶掉。
+        self._syncing: bool = False
 
         self._build_general_form()
         self._build_area_form()
@@ -282,13 +309,6 @@ class DownloadPanel(QGroupBox):
         self._region_document: GeoJSONDocument | None = None
         self._region_error: str = ""
 
-        # --- Slice 18：行政区条目改由目录提供（Spec §15）---
-        # 面板不自己维护"有哪些行政区"：那份名单在 resources/regions/index.json
-        # 里，由 RegionService 读。构造时不传参数 → 它跟随
-        # app.geo.region.REGION_RESOURCE_DIR 这个全局，验收脚本把资源重定向到
-        # 临时目录时面板会自动跟着走（与 Slice 16 的行为一致）。
-        self._region_service = RegionService()
-
         self._region_type_combo = QComboBox(self)
         for candidate in (RegionType.RECTANGLE, RegionType.POLYGON):
             self._region_type_combo.addItem(candidate.display_name, candidate)
@@ -297,11 +317,38 @@ class DownloadPanel(QGroupBox):
             "行政区域：按行政区边界精确裁剪，只下载与区域相交的瓦片"
         )
 
-        self._region_combo = QComboBox(self)
-        self._reload_region_presets()
+        # --- Slice 19：国家 → 省 → 市 三段级联（Spec §1 / §2）---
+        # 三段下拉的条目一律来自 RegionService（控制器负责问），面板不解析
+        # index.json、不扫 GeoJSON、不推导 parent。
+        self._country_combo = QComboBox(self)
+        self._province_combo = QComboBox(self)
+        self._city_combo = QComboBox(self)
+        for combo in (self._country_combo, self._province_combo, self._city_combo):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+        self._province_combo.setToolTip("留空表示不限定省份 —— 这时下载的是整个国家")
+        self._city_combo.setToolTip("留空表示不限定城市 —— 这时下载的是整个省")
+
+        #: 「下载级别」是**推导**出来的（市 → 省 → 国），不是让用户选的第四项。
+        #: 让它可点会与三段下拉互相打架（"选了城市却把级别设成国家级"该怎么算？），
+        #: 而 Spec §2 给的本来就是推导规则。
+        self._level_title = QLabel("下载级别", self)
+        self._level_label = _WrappingLabel("", self)
 
         #: 行政区域模式下代替手工输入的范围提示（只读展示）
         self._bounds_hint_label = _WrappingLabel("", self)
+
+        # --- Slice 19：下载策略（推荐 / 自定义，Spec §1 / §4 / §5 / §6）---
+        self._zoom_mode_title = QLabel("下载策略", self)
+        self._zoom_recommended_radio = QRadioButton(ZoomMode.RECOMMENDED.display_name, self)
+        self._zoom_custom_radio = QRadioButton(ZoomMode.CUSTOM.display_name, self)
+        self._zoom_recommended_radio.setChecked(True)
+        # 两个单选必须互斥。放进 QButtonGroup 而不是靠父子关系：放在同一个
+        # 容器里也能互斥，但那要求它们同父 —— 而这里为了排版它们是分开加到
+        # 一行布局里的，靠 autoExclusive 会时灵时不灵。
+        self._zoom_mode_group = QButtonGroup(self)
+        self._zoom_mode_group.addButton(self._zoom_recommended_radio)
+        self._zoom_mode_group.addButton(self._zoom_custom_radio)
 
         # --- Slice 17：Zoom 建议（Spec §11）---
         # 只在"选了带等级的行政区"时出现。矩形 / 自定义区域不套用等级规则，
@@ -309,52 +356,90 @@ class DownloadPanel(QGroupBox):
         self._zoom_hint_title = QLabel("Zoom 建议", self)
         self._zoom_hint_label = _WrappingLabel("", self)
 
+        #: 推荐说明（Spec §1）。文案取自策略层的 ``description``，界面不抄一份
+        #: —— 否则改了策略表里的说法，界面上还是旧句子。
+        self._zoom_explain_title = QLabel("推荐说明", self)
+        self._zoom_explain_label = _WrappingLabel("", self)
+
+        # 每行的**标题**也要留住引用：QGridLayout 只在"整行控件都隐藏"时才把
+        # 行高压到 0。只藏控件、留着标题的话，矩形模式下会多出「国家」「省份」
+        # 「城市」三个孤零零的标签和三条空白 —— 而 Spec §7 要求矩形模式下界面
+        # 与 Slice ≤18 一模一样。
+        self._country_title = QLabel("国家", self)
+        self._province_title = QLabel("省份", self)
+        self._city_title = QLabel("城市", self)
+
         grid = QGridLayout()
         grid.addWidget(QLabel("区域类型", self), 0, 0)
         grid.addWidget(self._region_type_combo, 0, 1, 1, 3)
 
-        self._region_label = QLabel("区域", self)
-        grid.addWidget(self._region_label, 1, 0)
-        grid.addWidget(self._region_combo, 1, 1, 1, 3)
+        grid.addWidget(self._country_title, 1, 0)
+        grid.addWidget(self._country_combo, 1, 1, 1, 3)
+        grid.addWidget(self._province_title, 2, 0)
+        grid.addWidget(self._province_combo, 2, 1, 1, 3)
+        grid.addWidget(self._city_title, 3, 0)
+        grid.addWidget(self._city_combo, 3, 1, 1, 3)
+        grid.addWidget(self._level_title, 4, 0)
+        grid.addWidget(self._level_label, 4, 1, 1, 3)
 
         self._bounds_hint_title = QLabel("边界范围", self)
-        grid.addWidget(self._bounds_hint_title, 2, 0)
-        grid.addWidget(self._bounds_hint_label, 2, 1, 1, 3)
+        grid.addWidget(self._bounds_hint_title, 5, 0)
+        grid.addWidget(self._bounds_hint_label, 5, 1, 1, 3)
 
-        grid.addWidget(QLabel("West", self), 3, 0)
-        grid.addWidget(self._west_spin, 3, 1)
-        grid.addWidget(QLabel("East", self), 3, 2)
-        grid.addWidget(self._east_spin, 3, 3)
-        grid.addWidget(QLabel("South", self), 4, 0)
-        grid.addWidget(self._south_spin, 4, 1)
-        grid.addWidget(QLabel("North", self), 4, 2)
-        grid.addWidget(self._north_spin, 4, 3)
-        grid.addWidget(QLabel("Min Zoom", self), 5, 0)
-        grid.addWidget(self._min_zoom_spin, 5, 1)
-        grid.addWidget(QLabel("Max Zoom", self), 5, 2)
-        grid.addWidget(self._max_zoom_spin, 5, 3)
-        grid.addWidget(self._zoom_hint_title, 6, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self._zoom_hint_label, 6, 1, 1, 3)
+        grid.addWidget(QLabel("West", self), 6, 0)
+        grid.addWidget(self._west_spin, 6, 1)
+        grid.addWidget(QLabel("East", self), 6, 2)
+        grid.addWidget(self._east_spin, 6, 3)
+        grid.addWidget(QLabel("South", self), 7, 0)
+        grid.addWidget(self._south_spin, 7, 1)
+        grid.addWidget(QLabel("North", self), 7, 2)
+        grid.addWidget(self._north_spin, 7, 3)
+
+        self._zoom_mode_row = QWidget(self)
+        mode_row = QHBoxLayout(self._zoom_mode_row)
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.addWidget(self._zoom_recommended_radio)
+        mode_row.addWidget(self._zoom_custom_radio)
+        mode_row.addStretch(1)
+        grid.addWidget(self._zoom_mode_title, 8, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_mode_row, 8, 1, 1, 3)
+
+        # 顺序照 Spec §1：策略 → 推荐 → Min/Max → 说明
+        grid.addWidget(self._zoom_hint_title, 9, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_hint_label, 9, 1, 1, 3)
+        grid.addWidget(QLabel("Min Zoom", self), 10, 0)
+        grid.addWidget(self._min_zoom_spin, 10, 1)
+        grid.addWidget(QLabel("Max Zoom", self), 10, 2)
+        grid.addWidget(self._max_zoom_spin, 10, 3)
+        grid.addWidget(self._zoom_explain_title, 11, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_explain_label, 11, 1, 1, 3)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
         self._area_group = QGroupBox("下载范围（WGS84 经纬度）", self)
         self._area_group.setLayout(grid)
 
+        # 先填好三段下拉再挂信号：填的过程中会 clear/addItem，那一串
+        # currentIndexChanged 没必要各跑一遍级联逻辑。
+        self._reload_region_cascade()
+
         self._region_type_combo.currentIndexChanged.connect(self._on_region_changed)
-        self._region_combo.currentIndexChanged.connect(self._on_region_changed)
+        self._country_combo.currentIndexChanged.connect(self._on_cascade_changed)
+        self._province_combo.currentIndexChanged.connect(self._on_cascade_changed)
+        self._city_combo.currentIndexChanged.connect(self._on_cascade_changed)
+        self._zoom_recommended_radio.toggled.connect(self._on_zoom_mode_toggled)
         # Zoom 一改就重算建议：用户把 Max Zoom 从 10 拉到 18 的**当下**就该看到
         # 那句提醒，而不是等他点了「计算」才发现。
         self._min_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
         self._max_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
-        # 初始为矩形：行政区域那两行收起，经纬度框可编辑 —— 与 Slice ≤15 一模一样
+        # 初始为矩形：行政区域那几行收起，经纬度框可编辑 —— 与 Slice ≤15 一模一样
         self._apply_region_mode()
 
     # ------------------------------------------------------------------ #
     # 区域（Slice 16，Spec §14 ~ §16）
     # ------------------------------------------------------------------ #
-    def _reload_region_presets(self) -> None:
-        """把行政区条目填进下拉框。
+    def _reload_region_cascade(self) -> None:
+        """把国家 / 省 / 市三段下拉全部重填一遍。
 
         数据来源是 :class:`~app.regions.RegionService`（Slice 18，Spec §15）——
         它背后是 ``resources/regions/index.json`` 那份**目录元数据**，因此将来加
@@ -362,28 +447,112 @@ class DownloadPanel(QGroupBox):
         服务内部会在目录不可用时退回内置预设（并在日志里留一条 ERROR），
         所以这里不必再写兜底分支。
 
-        边界文件缺失的条目**照样列出来**（文案里带"未就绪"标记）：用户需要知道
-        "这个功能存在，只是还缺一份数据"，而不是面对一个空下拉框猜为什么没反应。
-        选中后提示行会说明该往哪个路径放什么文件（Spec §3）。
+        边界文件缺失的条目**照样列出来**（tooltip 里带"未就绪"标记）：用户需要
+        知道"这个功能存在，只是还缺一份数据"，而不是面对一个空下拉框猜为什么
+        没反应。选中后提示行会说明该往哪个路径放什么文件（Spec §3）。
         """
-        self._region_combo.clear()
-        for preset in self._region_service.list_presets():
-            text = preset.name
-            if not preset.available:
-                text = f"{preset.name}（边界文件未就绪）"
-            self._region_combo.addItem(text, preset)
-            index = self._region_combo.count() - 1
-            self._region_combo.setItemData(
-                index, str(preset.geojson_path), Qt.ItemDataRole.ToolTipRole
-            )
+        self._syncing = True
+        try:
+            self._fill_country_combo()
+            self._fill_province_combo()
+            self._fill_city_combo()
+        finally:
+            self._syncing = False
+
+    def _fill_country_combo(self) -> None:
+        """填「国家」下拉并选中当前那一个。"""
+        self._country_combo.clear()
+        countries = self._controller.list_countries()
+        for entry in countries:
+            self._add_entry(self._country_combo, entry)
+        wanted = self._controller.country
+        if wanted is not None:
+            self._select_entry(self._country_combo, wanted.id)
+        elif countries:
+            # 目录里只有一个国家（当前就是这种）时，Qt 默认就选中第 0 项；
+            # 但"默认选中"与"控制器知道选中了它"是两件事 —— 这里显式同步一次，
+            # 免得出现"界面显示中国、控制器却认为什么都没选"。
+            self._controller.select_country(countries[0].id)
+
+    def _fill_province_combo(self) -> None:
+        """填「省份」下拉（首个条目是"全部"，表示不限定省）。"""
+        self._province_combo.clear()
+        if self._controller.country is None:
+            return
+        self._province_combo.addItem(_ANY_PROVINCE_TEXT, None)
+        for entry in self._controller.list_provinces():
+            self._add_entry(self._province_combo, entry)
+        wanted = self._controller.province
+        if wanted is not None and self._select_entry(self._province_combo, wanted.id):
+            return
+        # 省被清掉（换了国家）或目录里没有这个 id → 落回"全部"
+        self._province_combo.setCurrentIndex(0)
+        self._controller.select_province(None)
+
+    def _fill_city_combo(self) -> None:
+        """填「城市」下拉（首个条目是"全部"；省下没有城市时只剩它）。"""
+        self._city_combo.clear()
+        province = self._controller.province
+        if province is None:
+            # 还没选省 → 城市无可选项。留着空下拉而不是禁用：禁用会让用户
+            # 以为"这个功能坏了"，而"先选省份"是能自己推断出来的。
+            self._city_combo.addItem(_ANY_CITY_TEXT, None)
+            self._controller.select_city(None)
+            return
+        self._city_combo.addItem(_ANY_CITY_TEXT, None)
+        for entry in self._controller.list_cities():
+            self._add_entry(self._city_combo, entry)
+        if self._city_combo.count() == 1:
+            # 省下面确实没有城市数据（目录只到省级）：说清楚，别让用户空等
+            self._city_combo.setItemText(0, _NO_CITY_TEXT)
+        wanted = self._controller.city
+        if wanted is not None and self._select_entry(self._city_combo, wanted.id):
+            return
+        self._city_combo.setCurrentIndex(0)
+        self._controller.select_city(None)
+
+    def _add_entry(self, combo: QComboBox, entry) -> None:
+        """往下拉里加一条目录条目。
+
+        "就绪了没有"问的是加载器（``RegionService.boundary_available``），
+        不是条目自己 —— 目录条目只有元数据，文件在不在是磁盘事实（Slice 18）。
+
+        未就绪的条目**照样列出来**，但要把这件事写在字面上与 tooltip 里：
+        用户需要知道"这个功能存在，只是还缺一份数据"，而不是选完发现没反应。
+        """
+        available = self._controller.service.boundary_available(entry.id)
+        text = entry.name if available else f"{entry.name}（边界文件未就绪）"
+        combo.addItem(text, entry)
+        tooltip = str(entry.geojson_path)
+        if not available:
+            tooltip = f"{tooltip}（边界文件未就绪）"
+        combo.setItemData(combo.count() - 1, tooltip, Qt.ItemDataRole.ToolTipRole)
+
+    @staticmethod
+    def _select_entry(combo: QComboBox, region_id: str) -> bool:
+        """在下拉里按 id 选中一项；找不到返回 ``False``。"""
+        for index in range(combo.count()):
+            entry = combo.itemData(index)
+            if entry is not None and entry.id == region_id:
+                combo.setCurrentIndex(index)
+                return True
+        return False
 
     def current_region_type(self) -> RegionType:
         """当前选中的区域类型（下拉框为空时退回矩形）。"""
         return self._region_type_combo.currentData() or RegionType.RECTANGLE
 
     def selected_region_preset(self) -> RegionPreset | None:
-        """当前选中的行政区预设；没有可选时返回 ``None``。"""
-        return self._region_combo.currentData()
+        """当前生效的行政区条目（市 → 省 → 国）；没有选中时返回 ``None``。
+
+        返回的是 Slice 16 的**扁平**预设（``app.geo.region.RegionPreset``）：
+        目录条目 → 扁平预设的转换只有一处（``RegionLoader.to_geo_preset``），
+        是 Slice 18 定下的唯一方向，这里照用。
+        """
+        entry = self._controller.selected
+        if entry is None:
+            return None
+        return self._controller.service.loader.to_geo_preset(entry)
 
     @property
     def region_error(self) -> str:
@@ -429,12 +598,25 @@ class DownloadPanel(QGroupBox):
             if self.current_region_type() is RegionType.RECTANGLE:
                 return DownloadRegion.rectangle("自定义矩形", self.current_bounds())
 
-            preset = self.selected_region_preset()
-            document = self._region_document
-            if preset is None or document is None:
+            # 行政区域一律问控制器 —— 它背后是 RegionService.get_download_region
+            # （Spec §3）。面板不自己拼 DownloadRegion：一旦拼了，"界面上的区域"
+            # 与"目录说的区域"就有了两条构造路径。
+            if self._region_document is None:
                 return None
-            return DownloadRegion.from_preset(
-                preset, bounds=self.current_bounds(), document=document
+            # ``bounds`` 用**四个经纬度框里的值**，不用几何的原始外包矩形。
+            # 这不是偷懒，是三点都指向同一个选择：
+            #
+            # 1. 输入框里显示的就是这个数 —— "界面显示的范围"与"实际下载依据"
+            #    必须是同一个（Slice 16 定的红线）；
+            # 2. 输入框只有 6 位小数，**与写进 MBTiles metadata 的精度一致**。
+            #    拿原始几何（9 位小数）去枚举候选、却把 6 位的值写进 metadata，
+            #    会让 Inspector 从 metadata 反推出来的瓦片范围**多出一圈**
+            #    （边界恰好落在瓦片边上时），于是完整包被判成"缺失 10 张"、
+            #    打包器拒绝出包 —— 一处纯粹由精度不一致造出来的假警报；
+            # 3. Slice ≤18 本来就是这么传的（``bounds=self.current_bounds()``），
+            #    改掉它就是行为变更，而这个 Slice 明确要求既有链路完全兼容。
+            return self._controller.download_region(
+                bounds=self.current_bounds(), document=self._region_document
             )
         except (GeoJSONError, RegionBoundaryMissing, ValueError):
             return None
@@ -454,30 +636,70 @@ class DownloadPanel(QGroupBox):
             except ValueError as exc:
                 return str(exc)
             return ""
-        return self._region_error or "行政区域边界文件未就绪"
+        # 面板自己的加载错误优先（它带着"该把文件放哪"的引导）；否则用控制器
+        # 那一份（"还没选区域"、"目录里没有这个 id"）。
+        return self._region_error or self._controller.error or "行政区域边界文件未就绪"
 
     @Slot()
     def _on_region_changed(self, *_args) -> None:
-        """区域类型 / 行政区变化：切换界面形态并按需加载边界文件。
+        """区域类型变化：切换界面形态并按需加载边界文件。
 
-        参数写成可变参数：两个信号一个带 ``int``（``currentIndexChanged``）
-        一个在这里用不上，签名统一成 ``*_args`` 后不必为它们各写一个槽。
+        参数写成可变参数：``currentIndexChanged`` 带一个 ``int``，而
+        ``reload_region_boundary`` 那一路不带 —— 签名统一成 ``*_args``
+        后不必为它们各写一个槽。
         """
         self._apply_region_mode()
         self.region_changed.emit()
 
+    @Slot()
+    def _on_cascade_changed(self, *_args) -> None:
+        """国家 / 省份 / 城市下拉变化：级联刷新（Spec §2）。
+
+        "选择国家 → 刷新省、清空市；选择省 → 刷新市"这三条规则写在这里而不是
+        三个各自的槽里：它们本来就是一个动作的三个分支，拆开后**换国家却忘了
+        清城市**这种漏改迟早会发生。
+
+        ``_syncing`` 是必须的：下面会 ``clear()`` 再 ``addItem()``，
+        每一次都会触发 ``currentIndexChanged`` 再回到本方法。
+        """
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            country = self._country_combo.currentData()
+            if country is None:
+                self._controller.select_country(None)
+            elif self._controller.country is None or self._controller.country.id != country.id:
+                # 只有"真的换了国家"才重选：否则每次刷新都把省、市清掉一次。
+                self._controller.select_country(country.id)
+            else:
+                # 同一国家内选省：先同步省，再按需同步市
+                self._controller.select_province(
+                    self._entry_id_of(self._province_combo)
+                )
+                if self._controller.province is not None:
+                    self._controller.select_city(self._entry_id_of(self._city_combo))
+            self._fill_province_combo()
+            self._fill_city_combo()
+        finally:
+            self._syncing = False
+        self._apply_region_mode()
+        self.region_changed.emit()
+
+    @staticmethod
+    def _entry_id_of(combo: QComboBox) -> str | None:
+        """取下拉当前项的 id（"全部"这一项返回 ``None``）。"""
+        entry = combo.currentData()
+        return None if entry is None else entry.id
+
     def _apply_region_mode(self) -> None:
-        """按区域类型切换控件可见性与可编辑性（Spec §15）。"""
+        """按区域类型切换控件可见性与可编辑性（Spec §1 / §7）。"""
         is_polygon = self.current_region_type() is RegionType.POLYGON
 
-        for widget in (
-            self._region_label,
-            self._region_combo,
-            self._bounds_hint_title,
-            self._bounds_hint_label,
-        ):
-            # QGridLayout 在整行控件都隐藏时会把这行的高度压到 0，
-            # 所以矩形模式下不会留下空白条。
+        # 行政区域那一整块：矩形模式下全部收起。QGridLayout 在整行控件都隐藏时
+        # 会把这行的高度压到 0，所以不会留下空白条 —— 矩形模式的界面与
+        # Slice ≤18 **逐像素一致**（Spec §7 要求的"旧行为完全兼容"）。
+        for widget in self._polygon_only_widgets():
             widget.setVisible(is_polygon)
 
         # 行政区域模式下经纬度只读：范围由边界文件决定。允许手改会造成
@@ -496,23 +718,65 @@ class DownloadPanel(QGroupBox):
             self._region_document = None
             self._region_error = ""
 
-        # 等级可能刚变（矩形 ↔ 行政区域、换了一个行政区）→ 建议行跟着变
+        # 等级 / 模式可能刚变（矩形 ↔ 行政区域、换了一个行政区）→
+        # 控件可编辑性与建议行都跟着变
+        self._apply_zoom_mode()
         self._refresh_zoom_policy_hint()
 
+    def _polygon_only_widgets(self) -> tuple[QWidget, ...]:
+        """只在「行政区域」模式下出现的控件。
+
+        每次重新拼一份而不是缓存成常量：本方法在 ``__init__`` 里就会被调用，
+        那时部分控件才刚建好 —— 缓存一份"第一次调用时还不完整的列表"是最容易
+        踩的空指针。
+        """
+        return (
+            self._country_title,
+            self._country_combo,
+            self._province_title,
+            self._province_combo,
+            self._city_title,
+            self._city_combo,
+            self._level_title,
+            self._level_label,
+            self._bounds_hint_title,
+            self._bounds_hint_label,
+            self._zoom_mode_title,
+            self._zoom_mode_row,
+            self._zoom_explain_title,
+            self._zoom_explain_label,
+        )
+
     def _load_selected_region(self) -> None:
-        """加载当前选中的行政区边界，缓存几何并回填只读范围（Spec §16）。"""
+        """加载当前生效区域的边界，缓存几何并回填只读范围（Spec §8）。
+
+        范围**一定**来自 GeoJSON 的 ``geometry.bounds``（经
+        ``geometry_to_bounds``）。这里没有任何"顺手填一个 73/3/136/54"的分支：
+        手填范围与真实边界对不上时，候选瓦片数会跟着错，而用户从界面上看不出来。
+        """
         self._region_document = None
         self._region_error = ""
-        preset = self.selected_region_preset()
-        if preset is None:
-            self._region_error = "没有可用的行政区预设"
+        entry = self._controller.selected
+        if entry is None:
+            self._region_error = self._controller.error or "还没有选择行政区域"
             self._bounds_hint_label.set_text(self._region_error)
+            self._level_label.set_text("—")
+            return
+
+        self._level_label.set_text(
+            f"{entry.level.display_name} · {self._controller.path_text}"
+        )
+
+        if not self._controller.boundary_available:
+            # 边界文件缺失是**部署状态**，不是"退化成矩形"的理由。文案来自
+            # 加载器的 missing_message（它写清了放哪、叫什么、要什么授权）。
+            self._region_error = self._controller.missing_message()
+            self._bounds_hint_label.set_text(f"边界不可用：{self._region_error}")
             return
 
         try:
-            document = preset.load_document()
+            document = self._controller.load_document()
         except (GeoJSONError, RegionBoundaryMissing) as exc:
-            # 边界不可用是**明确失败**，不是"退化成矩形"的理由
             self._region_error = str(exc)
             self._bounds_hint_label.set_text(f"边界不可用：{exc}")
             return
@@ -538,7 +802,7 @@ class DownloadPanel(QGroupBox):
 
     def reload_region_boundary(self) -> None:
         """重新加载边界文件（用户刚按提示放好数据后手动刷新用）。"""
-        self._reload_region_presets()
+        self._reload_region_cascade()
         self._apply_region_mode()
         # 边界文件刚补上/刚换过 → 之前基于"边界不可用"下的结论（或更早的矩形
         # 结论）都已经不成立了，同样要作废重来。
@@ -548,52 +812,193 @@ class DownloadPanel(QGroupBox):
     # Zoom 建议（Slice 17，Spec §11）
     # ------------------------------------------------------------------ #
     def current_region_level(self) -> RegionLevel:
-        """当前区域对应的规划等级。
+        """当前区域对应的规划等级（Spec §2）。
 
-        取自**预设**而不是已加载的区域对象：边界文件还没放好时，用户依然应该
-        看到"选中的是哪个区域、它建议多少 Zoom"。矩形模式没有预设 →
-        :attr:`RegionLevel.CUSTOM`（不套用等级规则）。
+        等级来自**目录条目**而不是已加载的区域对象：边界文件还没放好时，用户
+        依然应该看到"选中的是哪个区域、它建议多少 Zoom"。矩形模式没有选中任何
+        行政区域 → :attr:`RegionLevel.CUSTOM`（不套用等级规则，Spec §7）。
         """
         if self.current_region_type() is not RegionType.POLYGON:
             return RegionLevel.CUSTOM
-        preset = self.selected_region_preset()
-        return preset.region_level if preset is not None else RegionLevel.CUSTOM
+        return self._controller.level
 
-    def current_zoom_recommendation(self) -> ZoomRecommendation:
-        """拿界面上的 Zoom 与当前等级比一比（只读，不改控件值）。"""
-        return self._zoom_strategy.evaluate(
-            self.current_region_level(),
-            self._min_zoom_spin.value(),
-            self._max_zoom_spin.value(),
+    def current_region_id(self) -> str | None:
+        """**当前生效**的行政区域 id（Spec §3）；矩形模式下是 ``None``。
+
+        与 :meth:`current_region_level` 同一条规矩：级联下拉里那三个选择在
+        矩形模式下**不参与下载**，所以对外一律报 ``None`` —— 否则任务记录与
+        偏好里会写上一个"看起来在下这个区域"、实际却在下矩形的 id。
+        """
+        if self.current_region_type() is not RegionType.POLYGON:
+            return None
+        return self._controller.selected_region_id
+
+    def current_zoom_recommendation(self) -> ZoomRecommendation | None:
+        """推荐 / 评估结论（只读，不改控件值）。
+
+        推荐模式下比的是**推荐值**（控件里显示的也正是它），自定义模式下比的是
+        用户的值 —— 两种都由控制器按模式决定（Spec §4 / §5）。
+        策略层抛异常时返回 ``None``（原因在 :attr:`region_error` 里那句话上）。
+        """
+        return self._controller.recommendation(
+            self._min_zoom_spin.value(), self._max_zoom_spin.value()
         )
+
+    # ------------------------------------------------------------------ #
+    # 下载策略：推荐 / 自定义（Slice 19，Spec §4 / §5 / §6）
+    # ------------------------------------------------------------------ #
+    @property
+    def zoom_mode(self) -> ZoomMode:
+        """当前下载策略。"""
+        return self._controller.zoom_mode
+
+    def set_zoom_mode(self, mode: object) -> ZoomMode:
+        """切换下载策略并同步控件，返回真正生效的那个。
+
+        恢复界面偏好与验收脚本用。语义与点单选按钮完全一致：
+        切到**推荐**会把当前区域的推荐区间填进 Min/Max（Spec §6），
+        切到**自定义**则一个数字都不动 —— 保留的正是"切过来的那一刻"的值。
+        """
+        self._controller.set_zoom_mode(mode)
+        self._apply_zoom_mode()
+        self._refresh_zoom_policy_hint()
+        return self._controller.zoom_mode
+
+    @Slot(bool)
+    def _on_zoom_mode_toggled(self, _checked: bool) -> None:
+        """用户点了「推荐 Zoom」/「自定义 Zoom」。
+
+        只有**推荐**那个单发的 ``toggled`` 就够了：两个按钮互斥，取消选中
+        自定义必然意味着选中推荐，反之亦然。接两个信号会在一次点击里跑两遍。
+        """
+        if self._syncing:
+            return
+        mode = (
+            ZoomMode.RECOMMENDED
+            if self._zoom_recommended_radio.isChecked()
+            else ZoomMode.CUSTOM
+        )
+        self._controller.set_zoom_mode(mode)
+        self._apply_zoom_mode()
+        self._refresh_zoom_policy_hint()
+
+    def _apply_zoom_mode(self) -> None:
+        """把「下载策略」落到控件上（Spec §4 / §6 / §7）。
+
+        两条规则：
+
+        * **推荐模式下 Min/Max 自动填成推荐值，且只读**。让它们可编辑会造出
+          "界面显示 4~10、实际按别的算"这种对不上的状态；想改就先切到自定义，
+          那是一次明确的动作（Spec §5）。
+        * **没有行政等级时（矩形模式）什么都不做**：矩形不套用国家 / 省 / 市
+          的推荐策略（Spec §7），既不下发推荐值，也不把控件设成只读。
+        """
+        self._syncing = True
+        try:
+            level = self.current_region_level()
+            has_policy = (
+                self.current_region_type() is RegionType.POLYGON
+                and level.is_administrative
+            )
+
+            self._zoom_recommended_radio.setChecked(
+                self._controller.zoom_mode is ZoomMode.RECOMMENDED
+            )
+            self._zoom_custom_radio.setChecked(
+                self._controller.zoom_mode is ZoomMode.CUSTOM
+            )
+
+            if not has_policy:
+                self._min_zoom_spin.setReadOnly(False)
+                self._max_zoom_spin.setReadOnly(False)
+                return
+
+            recommended_mode = self._controller.zoom_mode is ZoomMode.RECOMMENDED
+            self._min_zoom_spin.setReadOnly(recommended_mode)
+            self._max_zoom_spin.setReadOnly(recommended_mode)
+            if recommended_mode:
+                low, high = self._controller.effective_range(
+                    self._min_zoom_spin.value(), self._max_zoom_spin.value()
+                )
+                # 顺序有讲究：先设上界再设下界，避免中间态出现 min > max
+                # （那会让"刷新建议"这一槽拿到一对非法值）。
+                if high < low:
+                    self._max_zoom_spin.setValue(high)
+                    self._min_zoom_spin.setValue(low)
+                else:
+                    self._min_zoom_spin.setValue(low)
+                    self._max_zoom_spin.setValue(high)
+        finally:
+            self._syncing = False
 
     @property
     def zoom_policy_text(self) -> str:
         """Zoom 建议行的当前文本（自定义等级时是空串）。"""
         return self._zoom_hint_label.text()
 
+    @property
+    def zoom_explain_text(self) -> str:
+        """「推荐说明」那一行的文本（Spec §1）。"""
+        return self._zoom_explain_label.text()
+
+    @property
+    def level_text(self) -> str:
+        """「下载级别」那一行的文本（如 ``城市级 · 中国 / 浙江省 / 杭州市``）。"""
+        return self._level_label.text()
+
     @Slot()
     def _refresh_zoom_policy_hint(self, *_args) -> None:
         """刷新 Zoom 建议行（Spec §11）。
 
-        三条约束，都在这里体现：
+        四条约束，都在这里体现：
 
         1. **自定义等级不显示**：矩形 / CUSTOM 区域没有"行政等级建议"可言，
            显示一行恒定的"全范围"只是噪音；
         2. **只给建议，不改用户输入**：本方法只读 spin 的值，没有任何 ``setValue``；
-        3. **不阻塞**：超范围只是一句话，不弹窗、不禁用「计算」与「开始下载」。
+        3. **不阻塞**：超范围只是一句话，不弹窗、不禁用「计算」与「开始下载」；
+        4. **不吞异常**：策略层拒绝这一对 Zoom（例如自定义模式下 Min > Max）时，
+           显示那句人话而不是让异常从 Qt 槽里漏出去被静默吞掉。
         """
-        policy = self._zoom_strategy.get_policy(self.current_region_level())
-        if policy.is_custom:
-            self._zoom_hint_title.setVisible(False)
-            self._zoom_hint_label.setVisible(False)
-            self._zoom_hint_label.set_text("")
+        if self.current_region_type() is not RegionType.POLYGON:
+            self._hide_zoom_hint()
+            return
+        level = self.current_region_level()
+        if level.is_custom:
+            self._hide_zoom_hint()
             return
 
         recommendation = self.current_zoom_recommendation()
+        if recommendation is None:
+            # 策略层拒绝了这一对值 → 说清楚，而不是留着一个空行
+            self._hide_zoom_hint()
+            self._zoom_hint_title.setVisible(True)
+            self._zoom_hint_label.setVisible(True)
+            self._zoom_hint_label.set_text(self._controller.error or "Zoom 不可用")
+            return
+
         self._zoom_hint_title.setVisible(True)
         self._zoom_hint_label.setVisible(True)
         self._zoom_hint_label.set_text("\n".join(recommendation.as_lines()))
+        # 推荐说明只在真的建议时出现；文案来自策略层（界面不抄一份）
+        if recommendation.reason:
+            self._zoom_explain_title.setVisible(True)
+            self._zoom_explain_label.setVisible(True)
+            self._zoom_explain_label.set_text(recommendation.reason)
+        else:  # pragma: no cover - 策略层的 description 不允许为空
+            self._zoom_explain_title.setVisible(False)
+            self._zoom_explain_label.setVisible(False)
+
+    def _hide_zoom_hint(self) -> None:
+        """整行收起建议与说明（矩形 / 自定义等级）。"""
+        for widget in (
+            self._zoom_hint_title,
+            self._zoom_hint_label,
+            self._zoom_explain_title,
+            self._zoom_explain_label,
+        ):
+            widget.setVisible(False)
+        self._zoom_hint_label.set_text("")
+        self._zoom_explain_label.set_text("")
 
     def _build_output_form(self) -> None:
         self._output_edit = QLineEdit(str(DEFAULT_OUTPUT_DIR), self)
@@ -844,6 +1249,14 @@ class DownloadPanel(QGroupBox):
                 region          DownloadRegion | None
                                 下载区域；行政区域模式下边界文件加载失败时为
                                 ``None``（调用方须报错并停止，不得退回矩形）
+                region_id       str | None     当前生效的行政区域 id（市→省→国，
+                                Slice 19）；没选是 ``None``
+                region_level    RegionLevel    当前等级（矩形 / 未选 → CUSTOM）
+                zoom_mode       ZoomMode       下载策略（推荐 / 自定义，Slice 19）
+
+        注意 ``min_zoom`` / ``max_zoom`` 是**实际会拿去下载**的那一对：推荐模式下
+        就是等级建议值（控件里显示的也一样），自定义模式下就是用户的值。调用方
+        不需要再判断模式 —— 拿到什么就下什么。
         """
         return {
             "token": self._token_edit.text().strip(),
@@ -859,6 +1272,9 @@ class DownloadPanel(QGroupBox):
             "map_name": self._map_name_edit.text().strip(),
             "region_type": self.current_region_type(),
             "region": self.current_region(),
+            "region_id": self.current_region_id(),
+            "region_level": self.current_region_level(),
+            "zoom_mode": self._controller.zoom_mode,
         }
 
     @property
@@ -887,13 +1303,22 @@ class DownloadPanel(QGroupBox):
         self._labels_check.setChecked(bool(value))
 
     def set_zoom_range(self, min_zoom: int, max_zoom: int) -> None:
-        """设置缩放区间。
+        """设置缩放区间（**用户的**值），并把下载策略切到「自定义」。
+
+        为什么这里要顺手切模式：本方法是"这就是我要用的两个数"的语义
+        （恢复偏好、恢复任务记录、验收脚本都用它）。留在推荐模式下会造出
+        一个自相矛盾的状态 —— 控件上写着 8~18、模式却声称"按推荐值"，
+        而下一次区域一变，那对数字就会被推荐值**悄悄**顶掉。想按推荐值走
+        就显式调 :meth:`set_zoom_mode`。
 
         传进来的值可能超出控件范围（例如来自旧版本的偏好或任务记录）：
         ``setValue`` 会自动 clamp，不会抛异常。
         """
+        self._controller.set_zoom_mode(ZoomMode.CUSTOM)
         self._min_zoom_spin.setValue(int(min_zoom))
         self._max_zoom_spin.setValue(int(max_zoom))
+        self._apply_zoom_mode()
+        self._refresh_zoom_policy_hint()
 
     def set_output_dir(self, path: str | Path) -> None:
         """设置输出目录。"""
@@ -915,9 +1340,12 @@ class DownloadPanel(QGroupBox):
         return False
 
     def set_region_id(self, region_id: str) -> bool:
-        """按 ``region_id`` 选中行政区（回填任务记录用）。
+        """按 ``region_id`` 选中行政区并**铺满三段级联**（回填任务记录 / 偏好用）。
 
-        找不到对应预设时**保持矩形**并把原因记进 :attr:`region_error`：
+        拆到"国家 / 省 / 市"三段这件事交给控制器（它走目录的祖先链），
+        因此这里不必知道"杭州市挂在浙江省下"。
+
+        找不到对应条目时**保持矩形**并把原因记进 :attr:`region_error`：
         一个本版本不认识的 ``region_id`` 不该让表单卡在半截状态。
 
         Raises:
@@ -927,21 +1355,25 @@ class DownloadPanel(QGroupBox):
         wanted = (region_id or "").strip().lower()
         if not wanted:
             return False
-        for index in range(self._region_combo.count()):
-            preset = self._region_combo.itemData(index)
-            if preset is not None and preset.region_id == wanted:
-                self._region_combo.setCurrentIndex(index)
-                for type_index in range(self._region_type_combo.count()):
-                    if (
-                        self._region_type_combo.itemData(type_index)
-                        is RegionType.POLYGON
-                    ):
-                        self._region_type_combo.setCurrentIndex(type_index)
-                        break
-                self._apply_region_mode()
-                return True
-        self._region_error = f"本版本没有行政区域 {region_id!r} 的边界数据"
-        return False
+        # 先切到「行政区域」再选：反过来的话，切换区域类型那一下会把刚选好的
+        # 级联刷掉一次（`set_region_type` 触发的重绘会重建三段下拉）。
+        if not self.set_region_type(RegionType.POLYGON):
+            return False
+        if not self._controller.select_region(wanted):
+            self._region_error = (
+                self._controller.error
+                or f"本版本没有行政区域 {region_id!r} 的边界数据"
+            )
+            return False
+        self._syncing = True
+        try:
+            self._fill_country_combo()
+            self._fill_province_combo()
+            self._fill_city_combo()
+        finally:
+            self._syncing = False
+        self._apply_region_mode()
+        return True
 
     def set_form_data(self, task) -> None:
         """把一条任务记录回填到表单（Spec §14/§16：双击任务 → 恢复配置）。
@@ -983,6 +1415,12 @@ class DownloadPanel(QGroupBox):
         if RegionType.parse(getattr(task, "region_type", "")) is RegionType.POLYGON:
             if not self.set_region_id(str(getattr(task, "region_id", "") or "")):
                 self.set_region_type(RegionType.RECTANGLE)
+
+        # Zoom 落**最后**（Slice 19）。任务记录里那一对是当时**真的用来下载**的
+        # 值，而恢复一个行政区域会把模式带到「推荐」——推荐模式下控件里是等级
+        # 建议值，上面第 1362 行写进去的就会被顶掉。所以这里再落一次，并借
+        # `set_zoom_range` 把模式切成「自定义」：这正是"我要的就是这两个数"。
+        self.set_zoom_range(int(task.min_zoom), int(task.max_zoom))
 
         map_type = _task_map_type(task)
         if map_type is None:
@@ -1033,11 +1471,29 @@ class DownloadPanel(QGroupBox):
         )
 
         is_polygon = estimate is not None and estimate.is_polygon
+        level = self.current_region_level()
+        recommendation = (
+            self._controller.recommendation(
+                self._min_zoom_spin.value(), self._max_zoom_spin.value()
+            )
+            if level.is_administrative
+            else None
+        )
+
         lines: list[str] = []
         if is_polygon:
             lines.extend(
                 [
                     f"区域：{estimate.region_name}",
+                    # 级别与推荐区间都取自**当前区域**（目录条目 → 策略表），
+                    # 不在结果区里另算一份（Slice 19，Spec §9）。
+                    f"级别：{level.display_name}",
+                ]
+            )
+            if recommendation is not None:
+                lines.append(f"推荐 Zoom：{recommendation.range_text}")
+            lines.extend(
+                [
                     f"候选瓦片：{estimate.candidate_tiles:,}",
                     f"区域内瓦片：{estimate.selected_tiles:,}",
                     f"过滤瓦片：{estimate.filtered_tiles:,}",
@@ -1063,10 +1519,14 @@ class DownloadPanel(QGroupBox):
         if is_polygon and estimate.per_zoom:
             # Spec §17：让用户看到"每一级被裁掉多少"—— 只给一个总数的话，
             # 低 zoom 几乎没被裁、高 zoom 被裁掉九成这件事是看不出来的。
-            lines.append("Zoom 明细（候选 / 选中 / 过滤）：")
+            # Spec §10（Slice 19）再补一列容量：逐级容量用**生产函数**算
+            # （``estimate_size_bytes`` + ``format_size``），不在这里乘一个
+            # 自己的常数 —— 那会变成第二个"每张瓦片多少字节"的真相。
+            lines.append("Zoom 明细（候选 / 选中 / 过滤 / 预计容量）：")
             lines.extend(
                 f"  z{item.zoom}  {item.candidate_tiles:,} / "
-                f"{item.selected_tiles:,} / {item.filtered_tiles:,}"
+                f"{item.selected_tiles:,} / {item.filtered_tiles:,}  "
+                f"{format_size(estimate_size_bytes(item.selected_tiles))}"
                 for item in estimate.per_zoom
             )
         lines.append(
@@ -1103,9 +1563,62 @@ class DownloadPanel(QGroupBox):
         return self._region_type_combo
 
     @property
+    def country_combo(self) -> QComboBox:
+        """暴露「国家」下拉框（Slice 19）。"""
+        return self._country_combo
+
+    @property
+    def province_combo(self) -> QComboBox:
+        """暴露「省份」下拉框（Slice 19；第 0 项是"全部"）。"""
+        return self._province_combo
+
+    @property
+    def city_combo(self) -> QComboBox:
+        """暴露「城市」下拉框（Slice 19；第 0 项是"全部"）。"""
+        return self._city_combo
+
+    @property
     def region_combo(self) -> QComboBox:
-        """暴露「区域」下拉框（行政区条目，Slice 16；Slice 18 起由目录提供）。"""
-        return self._region_combo
+        """暴露「国家」下拉框（Slice 19 起的三段级联中的第一段）。
+
+        Slice 16/18 那个"一条下拉列全部行政区"的控件已经被级联取代：一条下拉
+        里混着国家、省、市，用户看不出哪条挂在谁下面，也就没法做完 Spec §2
+        的级联。名字保留是为了不让已有脚本一起改掉 —— 它现在指向国家那一段。
+        """
+        return self._country_combo
+
+    @property
+    def zoom_mode_buttons(self) -> tuple[QRadioButton, QRadioButton]:
+        """暴露「推荐 Zoom」/「自定义 Zoom」两个单选（Slice 19）。"""
+        return (self._zoom_recommended_radio, self._zoom_custom_radio)
+
+    @property
+    def zoom_explain_label(self) -> QLabel:
+        """暴露「推荐说明」标签（Slice 19，Spec §1）。"""
+        return self._zoom_explain_label
+
+    @property
+    def zoom_spins(self) -> tuple[QSpinBox, QSpinBox]:
+        """暴露 Min / Max Zoom 两个输入框（``(min, max)``）。
+
+        Slice 19 起这两个框会随「推荐 / 自定义」切换只读状态，而"只读"是**控件
+        属性**、不是表单数据 —— ``get_form_data()`` 读不出来。验收脚本要断言
+        "推荐模式下用户改不动"，就得拿得到控件本身。
+        """
+        return (self._min_zoom_spin, self._max_zoom_spin)
+
+    @property
+    def bounds_spins(self) -> tuple[QDoubleSpinBox, ...]:
+        """暴露四个经纬度输入框（西 / 南 / 东 / 北）。
+
+        行政区域模式下它们是只读的（范围由边界文件决定），同样是控件属性。
+        """
+        return (self._west_spin, self._south_spin, self._east_spin, self._north_spin)
+
+    @property
+    def level_label(self) -> QLabel:
+        """暴露「下载级别」标签（Slice 19，Spec §1）。"""
+        return self._level_label
 
     @property
     def region_service(self) -> RegionService:
@@ -1115,6 +1628,15 @@ class DownloadPanel(QGroupBox):
         保证"界面看到的条目"与"目录说的层级"是同一个来源。
         """
         return self._region_service
+
+    @property
+    def region_controller(self) -> RegionSelectionController:
+        """暴露级联选择控制器（Slice 19）。
+
+        验收脚本用它拿到"当前生效区域 / 模式 / 推荐区间"—— 与界面同源，
+        不必从控件上把信息再拼一遍。
+        """
+        return self._controller
 
     @property
     def bounds_hint_label(self) -> QLabel:
