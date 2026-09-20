@@ -1,5 +1,119 @@
 # 天地图离线地图工具
 
+> **一句话**：在 Windows 上把天地图的地图下载成标准的离线地图包，
+> 传到 Android 手机上装进 osmdroid，**拔了网也能看地图**。
+>
+> | 版本 | 值 | 定义处 |
+> | --- | --- | --- |
+> | 工具版本（Windows Tool Version） | **0.1.0** | `app/config/settings.py` → `APP_VERSION` |
+> | 地图包格式版本（Package Format Version） | **1** | `app/config/settings.py` → `PACKAGE_FORMAT_VERSION` |
+> | Android 运行时版本（Android Runtime Version） | **1.0.0-android** | `osmdroid/.../offline/config/MapRuntimeConfig.java` → `OFFLINE_MAP_RUNTIME_VERSION` |
+>
+> 三个版本号**各自只有一个定义处**，别在别的地方再写一遍（会走样）。
+> 两端的一致性由 `tests/test_package_protocol_v1.py`（Windows）与
+> `OfflineMapManifestProtocolV1Test`（Android）跨仓库机械核对。
+
+## 目录
+
+- [这套东西是什么](#这套东西是什么) —— 架构与完整链路
+- [快速开始](#快速开始) —— 五分钟跑通一次
+- [安装](#安装)
+- [用法：下载地图](#用法下载地图)
+- [用法：检查 MBTiles](#用法检查-mbtiles)
+- [用法：生成离线地图包](#用法生成离线地图包)
+- [地图包格式](#地图包格式)
+- [用法：传输到 Android 设备](#用法传输到-android-设备)
+- [Android 端：导入与使用](#android-端导入与使用)
+- [三种底图模式：ONLINE / OFFLINE / AUTO](#三种底图模式online--offline--auto)
+- [测试](#测试)
+- [端到端验收](#端到端验收)
+- [常见问题](#常见问题)
+- [开发记录（按 Slice）](#开发记录按-slice)
+
+---
+
+## 这套东西是什么
+
+完整链路（从按下"下载"到手机上看见地图）：
+
+```text
+                    ┌───────────────────── Windows（本仓库） ─────────────────────┐
+                    │                                                             │
+  天地图 WMTS 服务   │   GeoBounds ──→ Tile Math ──→ TiandituProvider              │
+  （在线，需 Token）  │       │             │                 │                     │
+        │           │       │             │                 ▼                     │
+        └───────────┼───────┼─────────────┼────────→ Downloader（并发/限速/重试）│
+                    │       │             │                 │                     │
+                    │       │             │                 ▼                     │
+                    │       │             └──────→ MBTiles（SQLite 瓦片库）       │
+                    │       │                               │                     │
+                    │       │                               ▼                     │
+                    │       │                      Composer（注记合成，可选）      │
+                    │       │                               │                     │
+                    │       │                               ▼                     │
+                    │       │                        Inspector（结构检查）        │
+                    │       │                               │                     │
+                    │       │                               ▼                     │
+                    │       └──────────────→ Package Builder（manifest + SHA256） │
+                    │                                       │                     │
+                    └───────────────────────────────────────┼─────────────────────┘
+                                                            │
+                          ① USB / adb push     ② U 盘 / 网盘 / 任意方式
+                                                            │
+                                                            ▼
+                    ┌──────────────────── Android（osmdroid 仓库） ────────────────┐
+                    │                                                             │
+                    │  OfflineMapImporter ──→ 校验(size→SHA256→SQLite 结构)        │
+                    │         │                                                   │
+                    │         ▼                                                   │
+                    │  OfflineMapRegistry（扫目录、判可用、清理残留）               │
+                    │         │                                                   │
+                    │         ▼                                                   │
+                    │  MapResourceManager（ONLINE / OFFLINE / AUTO）              │
+                    │         │                                                   │
+                    │         ▼                                                   │
+                    │  osmdroid Provider ──→ MapView（屏幕上看见地图）             │
+                    │                                                             │
+                    └─────────────────────────────────────────────────────────────┘
+```
+
+**关键点**：
+
+- **单向数据流**。`manifest.json` 是两端的契约文件，Windows 只写、Android 只读。
+  格式定义见 [`docs/map_package_v1.md`](docs/map_package_v1.md)。
+- **离线不等于"缓存"**。OS 的 HTTP 缓存会过期，这套流程产出的是**真正的本地瓦片库**，
+  拔网、断网、飞行模式下都能用。
+- **传文件的方式不重要**。`adb push` 只是最方便的一种；拷到 SD 卡、
+  发到网盘再从手机下载，效果完全一样。ADB 不是必需的。
+
+## 快速开始
+
+假设你只想尽快看到效果：
+
+```bash
+# 1. 准备环境（见下面「安装」）
+cd D:/project/MapDownloader
+.venv/Scripts/python.exe -m app.main
+
+# 2. 在界面里填天地图 Token（偏好设置），选一块范围与层级，点下载
+# 3. 下载完点「检查」，通过后点「生成地图包」
+# 4. 把包目录传到手机
+D:/develop/android/sdk/platform-tools/adb.exe push "<包目录>" /sdcard/Download/
+
+# 5. 手机上：离线地图 → 导入 → 选到那个目录 → 切到 OFFLINE
+```
+
+**不想等下载？** 跑一遍离线冒烟测试，几秒内验证整条链路是通的：
+
+```bash
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py
+```
+
+它用 Mock 瓦片源（不访问天地图、不需要 Token），把
+`Tile Math → MBTiles → Inspector → Package → SHA256` 完整跑一遍。
+
+---
+
 ## 项目目标
 
 Windows端生成天地图离线地图包，后续导入Android供osmdroid使用。
@@ -28,6 +142,7 @@ MapType → 两个图层      (Slice 6：MAP_TYPE_LAYERS 是全项目唯一的�
 TiandituProvider       (Slice 2：拼 WMTS URL、判响应合法性)
     ↓
 ExistingTileIndex      (Slice 5：查库里已有瓦片；默认只读坐标三列)
+
     ↓  should_skip_tile（在发 HTTP 之前判定）
 Async Downloader       (Slice 3：并发 / 限速 / 重试 / 暂停取消)
     ↓
@@ -1054,6 +1169,168 @@ ADB_PATH=D:/platform-tools/adb.exe python -m app.main
 | 设备没有 `sha256sum` | 大小对得上就算成功，只给一条 WARNING（Android 版本差异，不是错误） |
 | 空间不够 | 拦下，并写出"需要多少 / 可用多少" |
 | `df` 输出解析不了 | 给一条 WARNING 然后**继续**——为解析失败拦住用户是本末倒置 |
+
+## 地图包格式
+
+一个地图包就是**一个目录**：
+
+```
+<package-id>/
+├── manifest.json      # 契约文件，两端唯一的接口定义
+└── map.mbtiles        # SQLite 瓦片库
+```
+
+`manifest.json` 有 16 个字段（`description` 是唯一的可选字段），
+`formatVersion` 恒为 `1`。**完整定义见
+[`docs/map_package_v1.md`](docs/map_package_v1.md)**，那里写了每个字段的类型、
+取值范围、`bounds` 语义、XYZ/TMS 的关系、以及版本兼容策略。
+
+生成之后**务必核对**这两项（它们是"传到手机能不能装"的唯一凭据）：
+
+```bash
+# 文件实际大小
+(Get-Item map.mbtiles).Length
+# 文件实际哈希
+(Get-FileHash map.mbtiles -Algorithm SHA256).Hash.ToLower()
+```
+
+两个值都必须与 `manifest.json` 里的 `mbtiles.size` / `mbtiles.sha256` 一致。
+
+> **为什么这么强调**：SHA 对不上，手机上必然导入失败。而那时你会怀疑是传输坏了，
+> 于是重复传输好几遍 —— 真正的问题在打包环节就已经存在了。
+
+---
+
+## Android 端：导入与使用
+
+Android 侧在**另一个仓库**：`D:\project\osmdroid`（fork 的 osmdroid，
+业务在 `OpenStreetMapViewer` 模块，applicationId `org.osmdroid.map`）。
+
+**导入流程**：
+
+1. 把包目录传到设备（`adb push`，或拷到 SD 卡 / 网盘，都可以）；
+2. 打开 App →「离线地图」→「导入」→ 选中那个目录；
+3. App 会依次校验：**大小 → SHA256 → SQLite 结构 → zoom 与 manifest 是否一致**；
+4. 全部通过后才搬到正式目录（先写 `.importing`，校验通过才改名，所以
+   **中断不会留下半个能用的包**）；
+5. 列表里出现新的一行，切到 `OFFLINE` 或设为默认地图即可使用。
+
+**导入会拒绝的情况**（界面给中文说明，错误码只在日志里）：
+
+| 情况 | 原因 |
+| --- | --- |
+| `formatVersion > 1` | 包版本高于 App 支持的版本 → 升级 App |
+| 大小不符 | 传输截断了 |
+| SHA256 不符 | 文件内容不对 |
+| SQLite 结构不对 / zoom 冲突 | 包本身有问题 |
+| 空间不足 | 需要包大小的 **2 倍以上**（导入过程两份并存） |
+
+**列表里标"已损坏"是什么意思**：管理页在装配列表时会**真的打开一次**
+`map.mbtiles` 读一张瓦片。能导入但读不出瓦片，就会被标出来。
+
+> 这是刻意不做"装作看不见"：放过它，用户会一路点到"使用"，
+> 然后得到一张空白地图，而且不知道该怪谁。
+
+---
+
+## 三种底图模式：ONLINE / OFFLINE / AUTO
+
+| 模式 | 行为 | 什么时候用 |
+| --- | --- | --- |
+| **ONLINE** | 只用在线瓦片（要联网） | 日常、看实时路况 |
+| **OFFLINE** | 只用指定的那一张本地包 | 明确知道要用哪张包、且要稳定 |
+| **AUTO** | 按当前位置**自动挑**一张覆盖它的包；挑不到就退回在线 | 出门在外、不想手动切 |
+
+**AUTO 的选包规则**（多张包都覆盖时按优先级）：
+
+1. 覆盖当前点；
+2. **范围框更小的优先**（更精确的那张）；
+3. `maxZoom` 更高的优先；
+4. `createdAt` 更新的优先。
+
+**"AUTO 没选中离线地图"通常是正确行为** —— 说明当前位置不在任何包的范围内。
+这时它会**安全退回在线底图**，而不是保持上一张、也不是白屏。
+
+**断网 + AUTO**：有覆盖包 → 用本地包（"飞行模式 + 提前下好地图"的主场景）；
+无覆盖包 → 保持在线（但显示不出瓦片，因为确实断网了）。
+
+---
+
+## 测试
+
+```bash
+# 全部单元测试
+cd D:/project/MapDownloader
+.venv/Scripts/python.exe -m pytest
+
+# 端到端冒烟（离线，不访问天地图，几秒）
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py
+
+# 冒烟 + 保留产物便于人工翻看
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py --work-dir ./smoke_keep
+```
+
+**冒烟测试的 6 项**（失败时非 0 退出，可直接进 CI）：
+
+```text
+[PASS] Tile Math   —— 范围 → 瓦片区间，并与 estimate_tile_count 交叉核对
+[PASS] MBTiles     —— 写入后逐张读回比对（抓 TMS 翻错方向这类问题）
+[PASS] Inspector   —— 结构检查必须 PASS
+[PASS] Package     —— 生成包 + manifest 字段与 MBTiles 对得上
+[PASS] SHA256      —— manifest 声明的哈希 == 文件真实哈希
+[PASS] Validator   —— 从磁盘重新读一遍独立再验一次
+```
+
+**协议兼容测试**（跨仓库）：
+
+```bash
+.venv/Scripts/python.exe -m pytest tests/test_package_protocol_v1.py -q
+```
+
+它会**直接读 osmdroid 仓库的 Java 源码**，抽出 Android 侧所有
+`requireXxx(json, "字段名")` 的键名，与 Windows 的 `MANIFEST_FIELD_ORDER`
+做**双向差集**断言。任何一端单方面改字段，这个测试立刻变红。
+
+---
+
+## 端到端验收
+
+真机验收的完整流程（20 步，A1–A7 / B8–B11 / C12–C20）见
+[`docs/e2e_acceptance_checklist.md`](docs/e2e_acceptance_checklist.md)。
+
+它覆盖了单测覆盖不到的部分：**真窗口、真设备、真的拔网**。
+
+Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
+
+| 脚本 | 覆盖 |
+| --- | --- |
+| `scripts/verify_slice11_offline_import.py` | 导入、目录结构、校验 |
+| `scripts/verify_slice12_offline_runtime.py` | OFFLINE / AUTO / 拔网 |
+| `scripts/verify_slice13_offline_management.py` | 删除、多地图 |
+| `scripts/verify_slice14_offline_stability.py` | 长时间切换、压力 |
+
+---
+
+## 常见问题
+
+**完整版见 [`docs/troubleshooting.md`](docs/troubleshooting.md)**（14 类问题）。
+这里是最常遇到的四条：
+
+| 症状 | 先查这个 |
+| --- | --- |
+| 下载一开始就全失败 | Token（用界面上的「连接检查」，别去日志里找 —— 日志刻意不打 Token） |
+| 工具里没有设备 | ADB 路径（偏好设置填绝对路径）。**这不影响你做地图** |
+| 手机上导入报"校验失败" | 回包目录核对 `mbtiles.size` 与 `sha256` |
+| 切离线后地图空白 | 当前地图页的缩放层级 / 视野位置，是否在包的 zoom 区间与 bounds 内 |
+
+**几条"看起来像 bug 其实是设计如此"**：
+
+- 环境检查里 **ADB 标 `[!]` 而不是 `[✗]`** —— ADB 只影响传输，不影响做地图。
+- `manifest.json` 里**没有 `description`** —— 它是唯一可选字段，为空时不写这个键。
+- AUTO 模式下从北京飞到上海底图变了 —— 正确行为。
+- 删包时弹确认框 —— 删的是用户文件，必须二次确认。
+
+---
 
 ## 后续计划
 

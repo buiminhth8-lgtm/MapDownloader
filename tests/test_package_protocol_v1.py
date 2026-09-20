@@ -1,0 +1,274 @@
+"""Package V1 协议固化测试（Slice 15 §1 / §2 / §4）。
+
+这个文件回答一个**只能靠机械比对**才能诚实回答的问题：
+
+    Windows 的 Builder 与 Android 的 Parser，对 ``manifest.json``
+    的字段定义是不是**逐字一致**？
+
+为什么不能靠"看代码"或"看注释"
+--------------------------------
+
+两端各有一份字段清单（Python 的 ``MANIFEST_FIELD_ORDER`` 与 Java 的
+``requireXxx(json, "...")`` 调用）。注释里都写着"与另一端逐字对齐" ——
+但注释不会在字段改名时变红，只有测试会。
+
+所以这里的做法是：**把 Java 源码当文本读进来**，抽出里面所有
+``requireXxx(json, "键名")`` 的键名，再与 Python 侧的字段清单做集合比对。
+两端任何一边改了字段名、加了必填字段、漏了嵌套路径，这个文件立刻红。
+
+真正的端到端（Android 侧真的解析这份 fixture）由
+``OfflineMapManifestProtocolV1Test`` 承担 —— 那个用例直接读**同一个**
+``tests/fixtures/map_package_v1/manifest.json``，所以"两端读的是同一份样例"
+这件事有实证，而不是靠约定。
+
+为什么键名比对要连**嵌套路径**一起比
+-------------------------------------
+
+``bounds`` 与 ``mbtiles`` 是嵌套对象。如果只比顶层键名，
+"``mbtiles.sha256`` 被改成 ``mbtiles.hash``"这种改动是**看不见的** ——
+而它恰好会让 Android 侧解析失败。所以 Java 侧的键名保留 ``点号路径`` 原样比对。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from app.package.models import (
+    MANIFEST_BOUNDS_FIELDS,
+    MANIFEST_FIELD_ORDER,
+    MANIFEST_MBTILES_FIELDS,
+    MapPackageManifest,
+    UnsupportedFormatVersion,
+    parse_manifest_dict,
+)
+
+# --------------------------------------------------------------------------- #
+# 路径
+# --------------------------------------------------------------------------- #
+#: 本仓库根目录（tests/ 的上一级）。
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+
+#: **两端共用**的那一份 V1 协议样例。
+#:
+#: 这个路径是 Slice 15 §2 的硬性约定：Windows 与 Android 的协议测试读**同一份文件**。
+#: 一旦谁把它复制一份到自己仓库里"方便测试"，两端就又开始各测各的了。
+FIXTURE_PATH = BACKEND_ROOT / "tests" / "fixtures" / "map_package_v1" / "manifest.json"
+
+#: Android 侧解析器的源码路径（**跨仓库**）。
+#:
+#: 这是本文件唯一一处跨仓库依赖，且只在**测试**里出现（生产代码不依赖它）。
+#: 找不到时整个模块 skip，而不是 fail —— 单仓库检出（比如别人只拿了 Windows 侧）
+#: 不应该因为缺兄弟仓库而红。但一旦在能读到它，比对就是强制的。
+ANDROID_ROOT = BACKEND_ROOT.parent / "osmdroid"
+ANDROID_MANIFEST_JAVA = (
+    ANDROID_ROOT
+    / "OpenStreetMapViewer"
+    / "src"
+    / "main"
+    / "java"
+    / "org"
+    / "osmdroid"
+    / "map"
+    / "offline"
+    / "model"
+    / "OfflineMapManifest.java"
+)
+
+#: Java 里读取字段的辅助方法名 → 它们后面那个字符串是 manifest 的键（可带点号）。
+_JAVA_REQUIRE_CALL = re.compile(r"require(?:String|Int|Long|Double|Number|Boolean)\s*\(\s*"
+                                r"json\s*,\s*\"([^\"]+)\"")
+
+
+# --------------------------------------------------------------------------- #
+# 夹具
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="module")
+def v1_manifest_dict() -> dict:
+    """读取那份共用的 V1 样例。"""
+    assert FIXTURE_PATH.is_file(), f"协议样例不存在：{FIXTURE_PATH}"
+    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def _java_required_keys() -> set[str]:
+    """从 Android 解析器源码里抽出所有**必填**键名（保留点号路径）。"""
+    source = ANDROID_MANIFEST_JAVA.read_text(encoding="utf-8")
+    # 去掉行注释，免得把注释里举的例子也当成字段。
+    # 块注释（/** ... */）里有很多形如 `mbtiles.file` 的说明，一定要删干净。
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    source = re.sub(r"//[^\n]*", "", source)
+    return set(_JAVA_REQUIRE_CALL.findall(source))
+
+
+def _python_required_keys() -> set[str]:
+    """Windows 侧的必填键名，嵌套字段展开成点号路径。"""
+    keys: set[str] = set(MANIFEST_FIELD_ORDER)
+    # description 是**可选**的（Slice 9 在 None 时压根不写这个键），
+    # Android 也把它当可选处理 —— 所以两边都不算进"必填"。
+    keys.discard("description")
+    keys.discard("bounds")
+    keys.discard("mbtiles")
+    keys.update(f"bounds.{field}" for field in MANIFEST_BOUNDS_FIELDS)
+    keys.update(f"mbtiles.{field}" for field in MANIFEST_MBTILES_FIELDS)
+    return keys
+
+
+# --------------------------------------------------------------------------- #
+# §1 两端字段一致性
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(
+    not ANDROID_MANIFEST_JAVA.is_file(),
+    reason=f"读不到 Android 解析器（{ANDROID_MANIFEST_JAVA}），跳过跨仓库比对",
+)
+def test_windows_and_android_agree_on_every_required_field() -> None:
+    """两端对"哪些字段是必填的"定义必须完全一致（Slice 15 §1）。
+
+    这是整个 Slice 15 里最重要的一条断言：它守的是"一端改字段、
+    另一端无法导入"这个**只能靠联调发现**的失败模式。
+    """
+    python_keys = _python_required_keys()
+    java_keys = _java_required_keys()
+
+    missing_in_java = sorted(python_keys - java_keys)
+    missing_in_python = sorted(java_keys - python_keys)
+
+    assert not missing_in_java, (
+        f"Windows 写了这些字段，但 Android 解析器不读它们：{missing_in_java}\n"
+        f"（Android 端要么补上，要么显式忽略；不能让它悄悄丢掉）"
+    )
+    assert not missing_in_python, (
+        f"Android 要求这些字段，但 Windows 的字段清单里没有：{missing_in_python}\n"
+        f"（这样产出的包 Android 一定导不进去）"
+    )
+
+
+@pytest.mark.skipif(
+    not ANDROID_MANIFEST_JAVA.is_file(),
+    reason="读不到 Android 解析器，跳过跨仓库比对",
+)
+def test_android_accepts_unknown_extra_fields() -> None:
+    """未来加字段时，Android 必须**忽略**未知键而不是拒收（Slice 15 §1）。
+
+    Android 侧靠 ``optXxx`` 取值、不遍历键，所以天然忽略未知字段。
+    这里用源码做个廉价的守卫：解析器里不应出现"枚举所有 key"的调用
+    （``keys()`` / ``names()``），那才是会因未知字段而失败的写法。
+    """
+    source = ANDROID_MANIFEST_JAVA.read_text(encoding="utf-8")
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    source = re.sub(r"//[^\n]*", "", source)
+    for risky in ("json.keys()", "json.names()", "keys().length"):
+        assert risky not in source, (
+            f"Android 解析器里出现了 {risky} —— 这会因为未知字段而拒收新版本的包"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# §2 协议样例本身
+# --------------------------------------------------------------------------- #
+def test_fixture_is_a_valid_v1_manifest(v1_manifest_dict: dict) -> None:
+    """那份共用样例必须能被 Windows 侧的解析器读成合法 V1 manifest。"""
+    manifest = parse_manifest_dict(v1_manifest_dict)
+    assert isinstance(manifest, MapPackageManifest)
+    assert manifest.format_version == 1
+
+
+def test_fixture_carries_every_required_field(v1_manifest_dict: dict) -> None:
+    """样例里的每个必填字段都得在，且嵌套路径要在正确的父对象下。"""
+    missing: list[str] = []
+    for key in sorted(_python_required_keys()):
+        # 只有带点号的才往下钻一层；顶层字段必须直接落在根对象上。
+        # （曾经的写法用 partition(".") + `if leaf:`，顶层字段的 leaf 是 ""，
+        #   会被误判成"要到父对象里找"，于是 13 个顶层字段全报缺。）
+        if "." in key:
+            parent, _, leaf = key.partition(".")
+            holder = v1_manifest_dict.get(parent)
+            if not isinstance(holder, dict) or leaf not in holder:
+                missing.append(key)
+        elif key not in v1_manifest_dict:
+            missing.append(key)
+    assert not missing, f"协议样例缺少必填字段：{missing}"
+
+
+def test_fixture_field_order_is_canonical(v1_manifest_dict: dict) -> None:
+    """样例的字段顺序要与 ``MANIFEST_FIELD_ORDER`` 一致。
+
+    顺序不是"审美问题"：Slice 9 刻意固定它，为的是同一份数据每次生成出来的
+    字节序稳定（打包脚本做增量比对要靠它）。样例是文档也是测试输入，
+    顺序变了说明 Builder 的字段清单被改过。
+    """
+    expected = [key for key in MANIFEST_FIELD_ORDER if key in v1_manifest_dict]
+    assert list(v1_manifest_dict) == expected, (
+        f"字段顺序与 MANIFEST_FIELD_ORDER 不一致\n"
+        f"  期望：{expected}\n  实际：{list(v1_manifest_dict)}"
+    )
+
+
+def test_fixture_covers_the_variants_the_spec_names(v1_manifest_dict: dict) -> None:
+    """§4 点名要覆盖的变体：vector / labels / merged / bounds / zoom / tileCount。
+
+    样例只有一个，但必须把"有区分度"的那几个取值都取到，
+    否则两端的解析差异测不出来：
+    ``mapType=vector``（对比 image）、``labels=true``、``composition=merged``。
+    """
+    manifest = parse_manifest_dict(v1_manifest_dict)
+    assert manifest.map_type == "vector"
+    assert manifest.labels is True
+    assert manifest.composition == "merged"
+    assert manifest.is_merged is True
+    assert manifest.min_zoom == 11 and manifest.max_zoom == 13
+    assert manifest.tile_count == 12
+    assert manifest.mbtiles_file == "map.mbtiles"
+
+
+def test_fixture_sha256_field_has_the_right_shape(v1_manifest_dict: dict) -> None:
+    """``mbtiles.sha256`` 必须是 64 位 hex —— 两端都按这个长度校验。"""
+    sha = v1_manifest_dict["mbtiles"]["sha256"]
+    assert isinstance(sha, str)
+    assert len(sha) == 64
+    assert all(ch in "0123456789abcdef" for ch in sha)
+
+
+def test_fixture_created_at_carries_a_timezone(v1_manifest_dict: dict) -> None:
+    """``createdAt`` 必须带时区偏移 —— Windows 侧强制，Android 侧原样保留。"""
+    created = v1_manifest_dict["createdAt"]
+    assert re.search(r"(Z|[+-]\d{2}:\d{2})$", created), (
+        f"createdAt 必须带时区偏移，实际为 {created!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# §1 版本兼容
+# --------------------------------------------------------------------------- #
+def test_windows_rejects_format_version_above_supported(v1_manifest_dict: dict) -> None:
+    """``formatVersion > 1`` 时 Windows 侧明确拒绝（Slice 15 §1）。"""
+    bumped = dict(v1_manifest_dict, formatVersion=2)
+    with pytest.raises(UnsupportedFormatVersion):
+        parse_manifest_dict(bumped)
+
+
+def test_windows_rejects_format_version_below_one(v1_manifest_dict: dict) -> None:
+    """``formatVersion < 1`` 同样拒绝（0 和负数都不是合法版本）。"""
+    for bad in (0, -1):
+        with pytest.raises(Exception):
+            parse_manifest_dict(dict(v1_manifest_dict, formatVersion=bad))
+
+
+def test_bumped_version_error_mentions_both_versions(v1_manifest_dict: dict) -> None:
+    """拒绝时的报错要说清"包是几、我支持几" —— 否则用户不知道该怎么办。"""
+    with pytest.raises(UnsupportedFormatVersion) as caught:
+        parse_manifest_dict(dict(v1_manifest_dict, formatVersion=7))
+    text = str(caught.value)
+    assert "7" in text and "1" in text, f"报错没把两个版本都写清楚：{text!r}"
+
+
+def test_fixture_round_trips_through_the_windows_model(v1_manifest_dict: dict) -> None:
+    """样例 → 模型 → dict 必须回到同一份结构（字段不增不减、值不变）。
+
+    这条守的是"模型与协议没有暗中的默认值/派生值"：如果 ``to_dict()`` 多写了
+    一个字段，说明 Windows 会产出样例里没有的东西，Android 那边就没覆盖到。
+    """
+    manifest = parse_manifest_dict(v1_manifest_dict)
+    assert manifest.to_dict() == v1_manifest_dict

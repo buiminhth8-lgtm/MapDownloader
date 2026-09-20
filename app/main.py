@@ -30,6 +30,7 @@ from app.config.settings import (
     LOG_LEVEL,
     ORG_NAME,
 )
+from app.services.environment_check import log_report, run_environment_checks
 from app.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,28 @@ def _report_startup(window: MainWindow) -> None:
         window.log_panel.append_log(message)
 
 
+def _report_environment(window: MainWindow) -> None:
+    """跑一遍启动环境检查，把结论写进日志区（Slice 15 §8）。
+
+    刻意**只报告、不弹窗、不拦截**：环境有问题时用户需要知道，但"弹一个框挡住
+    主界面"会让他在还没来得及看一眼工具长什么样的时候就被推着去修环境 ——
+    而其中有些项（ADB）根本不影响他现在要做的事。
+
+    主流程该被挡住的地方，是用户**点下那个按钮**的时候（例如点「开始下载」时
+    输出目录不可写会直接报错）。启动期的职责只是"把话说在前面"。
+    """
+    try:
+        report = run_environment_checks()
+    except Exception:  # pragma: no cover - 检查本身已有兜底，这里是双保险
+        logger.exception("启动环境检查失败")
+        return
+
+    log_report(report)
+    for line in report.as_lines():
+        window.log_panel.append_log(f"环境检查 {line}")
+    window.log_panel.append_log(f"环境检查结论：{report.summary()}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """程序主入口，返回进程退出码。"""
     setup_logging()
@@ -123,6 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     _report_startup(window)
+    _report_environment(window)
     return app.exec()
 
 

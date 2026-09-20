@@ -23,8 +23,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import shutil
+import struct
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 import httpx
@@ -45,8 +47,53 @@ from app.tasks import TaskService, TaskStore  # noqa: E402
 #: 假 Token（**不是真实密钥**，仅用于拼出合法的 WMTS URL）
 FAKE_TOKEN = "abcdefghijklmn"
 
-#: 与 Slice 2 一致的假瓦片：只要文件头正确就算合法
-FAKE_PNG = PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + b"verify-payload" * 8
+#: 假瓦片的边长。64 够小（省时间），又足够"像个瓦片"。
+TILE_SIZE = 64
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    """拼一个 PNG 数据块：长度 + 类型 + 数据 + CRC32。"""
+    return (
+        struct.pack(">I", len(payload))
+        + tag
+        + payload
+        + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+    )
+
+
+def _make_valid_png(rgb: tuple[int, int, int] = (0x33, 0x66, 0xCC),
+                    size: int = TILE_SIZE) -> bytes:
+    """生成一张**真正能被解码**的单色真彩 PNG。
+
+    为什么不能用"文件头对、正文随便"的老夹具：**校验器会抽样解码**。
+    Slice 8 给 ``MapDownloadValidator`` 加了"抽 20 张试着解码"这一层，
+    于是老夹具（``PNG_SIGNATURE + IHDR + b"verify-payload" * 8``）**必然**
+    把整轮判成失败：瓦片数 195/195、零失败，却报
+    「MBTiles 校验未通过：抽样 20 张中有 20 张图片无法解码：… 文件头对但正文
+    不是有效图片」，任务状态跟着变成 FAILED。
+
+    **判断方向很重要**：真实天地图返回的就是有效 PNG，所以**产品是对的、
+    夹具是假的**。这一类"判据变严导致旧脚本假红"和"产品真的坏了"长得
+    一模一样，只有看 ``outcome.failure_text`` 才分得开 —— 只报一个
+    ``is_success=False`` 的话，看的人会跑去查下载逻辑，方向全错。
+    （同一个坑在 Android 侧也踩过：夹具用 2048 个随机字节冒充 ``map.mbtiles``，
+    加了一层内容探测之后 8 个用例一起红。）
+    """
+    raw = bytearray()
+    for _ in range(size):
+        raw.append(0)                       # filter type 0
+        raw.extend(bytes(rgb) * size)
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)   # 8bit / 真彩
+    return (
+        PNG_SIGNATURE
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+#: 假瓦片。**必须是一张能真解码的 PNG**，见 :func:`_make_valid_png`。
+FAKE_PNG = _make_valid_png()
 
 BOUNDS = GeoBounds(116.0, 39.0, 116.5, 39.5)
 MIN_ZOOM = 13
@@ -121,11 +168,17 @@ class Checks:
     def __init__(self) -> None:
         self.failures: list[str] = []
 
-    def ok(self, condition: bool, label: str) -> None:
+    def ok(self, condition: bool, label: str, detail: str = "") -> None:
+        """``detail`` 只在失败时打印 —— 用来回答"为什么不是期望的那个"。
+
+        这一条不是装饰：``is_success`` 是**四个条件的与**（未取消 + 校验通过 +
+        零失败 + 库里张数达标），只报一个 ``False`` 的话，看的人得回去读产品代码
+        才知道是哪一条挂了。挂的层次不同，修法完全不同（校验口径变了 vs 真的少瓦片）。
+        """
         mark = "OK  " if condition else "FAIL"
-        print(f"  [{mark}] {label}")
+        print(f"  [{mark}] {label}{f' — {detail}' if detail and not condition else ''}")
         if not condition:
-            self.failures.append(label)
+            self.failures.append(label if not detail else f"{label} — {detail}")
 
 
 async def _run(work_dir: Path, checks: Checks) -> None:
@@ -204,13 +257,21 @@ async def _run(work_dir: Path, checks: Checks) -> None:
     checks.ok(len(server.requests) == total - written, "只请求了缺失的那些瓦片")
     checks.ok(second.summary.skipped == written, "已有瓦片全部被跳过")
     checks.ok(second.tile_count == total, "库里张数达到目标")
-    checks.ok(second.is_success, "本轮判定为「已完成」")
+    checks.ok(second.is_success, "本轮判定为「已完成」",
+              f"failure_text={second.failure_text!r} "
+              f"cancelled={second.cancelled} "
+              f"valid={second.validation.valid} "
+              f"errors={list(second.validation.errors)} "
+              f"failed={second.summary.failed} "
+              f"tile_count={second.tile_count}/{second.target_tiles}")
     checks.ok(
-        second.verdict is DownloadTaskStatus.COMPLETED, "任务状态判定为 COMPLETED"
+        second.verdict is DownloadTaskStatus.COMPLETED, "任务状态判定为 COMPLETED",
+        f"verdict={second.verdict}",
     )
     checks.ok(
         task_store.get(task.id).status is DownloadTaskStatus.COMPLETED,
         "任务记录落盘为「已完成」",
+        f"实际 {task_store.get(task.id).status}",
     )
     checks.ok(second.skip_mode is not None, f"跳过策略：{second.skip_mode.display_name}")
     checks.ok(
@@ -244,7 +305,13 @@ async def _run(work_dir: Path, checks: Checks) -> None:
     )
     checks.ok(len(server.requests) == 0, "一张都没重新请求（不浪费天地图配额）")
     checks.ok(third.summary.skipped == total, "全部命中已有瓦片")
-    checks.ok(third.is_success, "仍然判定为「已完成」")
+    checks.ok(third.is_success, "仍然判定为「已完成」",
+              f"failure_text={third.failure_text!r} "
+              f"cancelled={third.cancelled} "
+              f"valid={third.validation.valid} "
+              f"errors={list(third.validation.errors)} "
+              f"failed={third.summary.failed} "
+              f"tile_count={third.tile_count}/{third.target_tiles}")
     checks.ok(
         _db_count(target_path) == total, "库里仍然是目标张数（没有重复行）"
     )

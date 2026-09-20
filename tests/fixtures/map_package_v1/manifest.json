@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "id": "sample_v1_package",
+  "name": "sample_v1_package",
+  "description": "协议样例：北京主城矢量底图（Zoom 11~13）",
+  "provider": "tianditu",
+  "mapType": "vector",
+  "labels": true,
+  "composition": "merged",
+  "tileScheme": "web_mercator",
+  "tileFormat": "png",
+  "minZoom": 11,
+  "maxZoom": 13,
+  "bounds": {
+    "west": 116.2,
+    "south": 39.7,
+    "east": 116.6,
+    "north": 40.1
+  },
+  "tileCount": 12,
+  "mbtiles": {
+    "file": "map.mbtiles",
+    "size": 16384,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "createdAt": "2026-09-18T12:00:00+08:00"
+}
