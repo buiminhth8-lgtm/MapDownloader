@@ -12,7 +12,7 @@
 | 三段级联下拉 + 等级显示 | `app/ui/download_panel.py` |
 | 选择状态 / 等级推导 / Zoom 建议的转发 | `app/ui/region_selection.py`（新） |
 | 推荐 / 自定义策略与持久化 | `app/ui/preferences.py`、`app/ui/main_window.py` |
-| 单元测试 | `tests/test_region_selection_controller.py`（29）、`tests/test_download_panel_region_selection.py`（26） |
+| 单元测试 | `tests/test_region_selection_controller.py`（29）、`tests/test_download_panel_region_selection.py`（27） |
 | 实机验收 | `scripts/verify_slice19_region_ui.py`（90 项，真窗口 + 真关窗 + 真点「计算」） |
 
 ---
