@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "regions": [
+    {
+      "id": "china",
+      "name": "中国",
+      "level": "country",
+      "parentId": null,
+      "geojson": "country/china.geojson",
+      "boundaryVersion": null
+    }
+  ]
+}

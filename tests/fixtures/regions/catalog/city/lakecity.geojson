@@ -1,0 +1,35 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "示例湖市",
+    "id": "lakecity",
+    "boundaryVersion": "2026-09-fixture"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          112.0,
+          30.0
+        ],
+        [
+          113.0,
+          30.0
+        ],
+        [
+          113.0,
+          31.0
+        ],
+        [
+          112.0,
+          31.0
+        ],
+        [
+          112.0,
+          30.0
+        ]
+      ]
+    ]
+  }
+}

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -51,6 +52,10 @@ _HIERARCHY_LEVELS = (
     RegionLevel.CITY,
     RegionLevel.MISSION,
 )
+
+#: 上面那四个的**成员名**（静态守卫按名字匹配 AST 属性节点）。
+#: 从枚举本身推导，不手抄：抄一份的结果是加了等级却没人想起这里。
+_LEVEL_NAMES = frozenset(item.name for item in _HIERARCHY_LEVELS)
 
 
 def _python_sources(*, skip_planning: bool = False) -> list[Path]:
@@ -276,15 +281,43 @@ def test_hierarchy_levels_are_not_hardcoded_outside_the_planning_layer() -> None
 
     只查 COUNTRY / PROVINCE / CITY / MISSION：它们是**等级规则**的锚点。
     ``RegionLevel.CUSTOM`` 是"没有规则"，界面拿它做分支是合理的。
+
+    判据走 **AST** 而不是字符串匹配：注释或文档字符串里写一句"别在这里写
+    ``RegionLevel.COUNTRY``"就会被字符串匹配误判成违规（Slice 14 在
+    ``checksum`` 的守卫上踩过同一个坑）。AST 只看**真的访问了属性**的地方。
     """
-    pattern = re.compile(r"RegionLevel\s*\.\s*(COUNTRY|PROVINCE|CITY|MISSION)\b")
     offenders = []
     for path in _python_sources(skip_planning=True):
         if path in _LEVEL_LITERAL_ALLOWED:
             continue
-        if pattern.search(path.read_text(encoding="utf-8")):
-            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+        found = _hardcoded_hierarchy_levels(path)
+        if found:
+            offenders.append(
+                f"{path.relative_to(REPO_ROOT).as_posix()} :: {sorted(found)}"
+            )
     assert offenders == [], f"这些模块把等级写死了：{offenders}"
+
+
+def _hardcoded_hierarchy_levels(path: Path) -> set[str]:
+    """文件里**真的**访问了哪些 ``RegionLevel.<等级>`` 属性。
+
+    认两种写法：``RegionLevel.COUNTRY``、``planning.RegionLevel.COUNTRY``。
+    字符串与注释不参与判断（这正是与字符串匹配的关键差别）。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr not in _LEVEL_NAMES:
+            continue
+        base = node.value
+        owner = ""
+        if isinstance(base, ast.Name):
+            owner = base.id
+        elif isinstance(base, ast.Attribute):
+            owner = base.attr
+        if owner == "RegionLevel":
+            found.add(node.attr)
+    return found
 
 
 def test_policy_descriptions_live_only_in_the_planning_layer() -> None:

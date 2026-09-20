@@ -38,14 +38,16 @@ UI 的预估、进度条分母、大任务提示都必须用 selected —— 用
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from app.config.settings import (
     CHINA_REGION_FILENAME,
     CHINA_REGION_NAME,
+    CHINA_REGION_RELATIVE_PATH,
     REGION_BOUNDARY_LICENSE_NOTICE,
     REGION_BOUNDARY_MISSING_HINT,
     REGION_RESOURCE_DIR,
@@ -73,6 +75,10 @@ __all__ = [
     "get_region_preset",
     "region_from_task",
     "region_from_metadata",
+    # 资源路径规则（Slice 18 抽成公开函数：目录层与扁平预设共用同一份实现）
+    "normalize_region_relative_path",
+    "is_safe_region_relative_path",
+    "resolve_region_path",
 ]
 
 
@@ -126,13 +132,83 @@ class RegionType(Enum):
 class RegionBoundaryMissing(RuntimeError):
     """行政区边界资源不可用（文件缺失 / 读不出）。
 
-    单独成类（而不是复用 :class:`GeoJSONError`）的理由：UI 需要把"数据没放"
+    单独成类（而不是复用 :class:`GeoJSONError`)的理由：UI 需要把"数据没放"
     与"数据坏了"分成两种提示，前者要告诉用户去哪里放什么文件。
     """
 
     def __init__(self, message: str, *, path: str = "") -> None:
         super().__init__(message)
         self.path = path
+
+
+# --------------------------------------------------------------------------- #
+# 资源路径规则（Slice 16 起沿用，Slice 18 抽成公开函数）
+# --------------------------------------------------------------------------- #
+#: ``C:\x`` / ``C:/x`` 这类盘符前缀。``PurePosixPath("C:/x").is_absolute()``
+#: 是 ``False``，所以必须单独认一下 —— 否则它会被当成"两个普通目录名"。
+_WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def normalize_region_relative_path(value: object) -> str:
+    """把各种写法的资源相对路径归一成 POSIX 形式（``a\\b`` → ``a/b``）。
+
+    只做归一，**不做安全判断**：判断交给 :func:`is_safe_region_relative_path`，
+    好让调用方能分开回答"写成什么样"与"能不能用"。
+    """
+    raw = str(value if value is not None else "").strip().replace("\\", "/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+    return raw
+
+
+def is_safe_region_relative_path(raw: object) -> bool:
+    """这个相对路径能不能安全地拼到资源目录下（Spec §12）。
+
+    拒绝：空串、绝对路径（``/x``、``C:/x``、``//server/share``）、任何 ``..``
+    分段、含 NUL 的字符串。
+
+    这是全项目**唯一**一份资源路径安全规则：``app.geo.region``（扁平预设）与
+    ``app.regions``（层级目录）都调它。安全判断一旦有第二份实现，就一定会有一份
+    是错的，而错的通常是更宽松的那份。
+
+    >>> is_safe_region_relative_path("country/china.geojson")
+    True
+    >>> is_safe_region_relative_path("../etc/passwd")
+    False
+    >>> is_safe_region_relative_path("/etc/passwd")
+    False
+    >>> is_safe_region_relative_path("C:/windows/system32")
+    False
+    """
+    text = normalize_region_relative_path(raw)
+    if not text or "\x00" in text:
+        return False
+    if text.startswith("/") or _WINDOWS_DRIVE_PREFIX.match(text):
+        return False
+    return all(part != ".." for part in PurePosixPath(text).parts)
+
+
+def resolve_region_path(root: Path, raw: object) -> Path:
+    """把相对路径拼到 ``root`` 下，并确认结果**仍在 root 里**。
+
+    两步走（先看写法、再看真实解析结果）：``..`` 已经在写法检查里被拒，但符号
+    链接 / 大小写不敏感的卷仍可能让 ``resolve()`` 跑到外面去，所以这里再验一次
+    "解析后仍在根目录内"。
+
+    Raises:
+        ValueError: 路径写法不安全，或解析后越出了 ``root``。
+    """
+    if not is_safe_region_relative_path(raw):
+        raise ValueError(
+            f"行政区边界路径不安全，必须是资源目录内的相对路径：{raw!r}"
+        )
+    root_resolved = Path(root).resolve()
+    candidate = (root_resolved / normalize_region_relative_path(raw)).resolve()
+    if candidate != root_resolved and root_resolved not in candidate.parents:
+        raise ValueError(
+            f"行政区边界路径越出了资源目录：{candidate} 不在 {root_resolved} 内"
+        )
+    return candidate
 
 
 # --------------------------------------------------------------------------- #
@@ -146,11 +222,17 @@ class RegionPreset:
     ``hangzhou``，只需在 :data:`REGION_PRESETS` 里补一条并放入同名 GeoJSON ——
     本模块其余部分（加载、过滤、预估、Inspector 还原）无需改动。
 
+    Slice 18 之后，"放入同名 GeoJSON" 的位置改成了**按层级分目录**：
+    ``country/china.geojson``、``province/zhejiang.geojson``、
+    ``city/hangzhou.geojson``。因此 :attr:`geojson_filename` 允许写相对子路径，
+    但仍然拒绝绝对路径与 ``..``（Spec §12 的路径安全要求）。
+
     Attributes:
         region_id: 稳定标识，写进任务记录、MBTiles metadata 与 manifest。
         name: 展示名（中文）。
-        geojson_filename: 边界文件在 :data:`~app.config.settings.REGION_RESOURCE_DIR`
-            下的文件名（**只有文件名**：不允许带路径，避免用预设做目录穿越）。
+        geojson_filename: 边界文件在资源目录下的**相对路径**
+            （``country/china.geojson``）。允许子目录，不允许绝对路径 / ``..``
+            / 盘符 —— 预设是配置，配置不该能指向资源目录之外的任何东西。
         default_boundary_version: 边界数据版本。``None`` 表示"以 GeoJSON 里
             ``properties.boundaryVersion`` 为准"——数据自带版本时不该在代码里
             再抄一份，那两者迟早不一致。
@@ -159,6 +241,11 @@ class RegionPreset:
             决定 Zoom 建议，见 :data:`~app.planning.DEFAULT_ZOOM_POLICIES`。
             缺省是 :attr:`~app.planning.RegionLevel.CUSTOM`：**不写就是自定义**，
             这样既有的第三方预设（或测试里的临时预设）保持原行为不变。
+        root: 资源目录。``None``（缺省）表示"每次访问时读模块全局
+            :data:`REGION_RESOURCE_DIR`"——保持 Slice ≤17 的行为（测试与验收
+            脚本靠 monkeypatch 那个全局来重定向资源目录）。Slice 18 的目录层
+            会显式传入自己的 :attr:`~app.regions.RegionCatalog.root`，
+            这样"目录算出来的文件"与"预设算出来的文件"**必然是同一个**。
     """
 
     region_id: str
@@ -167,19 +254,29 @@ class RegionPreset:
     default_boundary_version: str | None = None
     region_type: RegionType = RegionType.POLYGON
     region_level: RegionLevel = RegionLevel.CUSTOM
+    root: Path | None = None
 
     def __post_init__(self) -> None:
-        if "/" in self.geojson_filename or "\\" in self.geojson_filename:
+        raw = normalize_region_relative_path(self.geojson_filename)
+        if not is_safe_region_relative_path(raw):
             raise ValueError(
-                f"geojson_filename 只能是文件名，不允许带路径，实际为 {self.geojson_filename!r}"
+                "geojson_filename 必须是资源目录内的相对路径"
+                f"（不允许绝对路径、盘符或 ..），实际为 {self.geojson_filename!r}"
             )
+        object.__setattr__(self, "geojson_filename", raw)
         # 宽容解析：预设可以写成字符串（"country"），便于从配置文件读入。
         object.__setattr__(self, "region_level", RegionLevel.parse(self.region_level))
+        if self.root is not None:
+            object.__setattr__(self, "root", Path(self.root))
+
+    def resource_root(self) -> Path:
+        """本预设使用的资源目录（显式指定优先，否则读模块全局）。"""
+        return self.root if self.root is not None else REGION_RESOURCE_DIR
 
     @property
     def geojson_path(self) -> Path:
         """边界文件的完整路径（不保证存在）。"""
-        return REGION_RESOURCE_DIR / self.geojson_filename
+        return self.resource_root() / self.geojson_filename
 
     @property
     def available(self) -> bool:
@@ -191,7 +288,7 @@ class RegionPreset:
         return (
             f"{REGION_BOUNDARY_MISSING_HINT.format(path=self.geojson_path)}。"
             f"{REGION_BOUNDARY_LICENSE_NOTICE}，"
-            f"命名为 {self.geojson_filename} 后放入 {REGION_RESOURCE_DIR}"
+            f"放到 {self.resource_root()} 下的 {self.geojson_filename}（相对路径）后重试"
         )
 
     def require_available(self) -> Path:
@@ -227,10 +324,14 @@ class RegionPreset:
 #: ``region_level=COUNTRY``（Slice 17，Spec §8）：选到它时界面会提示
 #: 「推荐 Zoom：Z4~10」，用户仍可设置更高的 Zoom，只是会看到一句非阻塞的代价提醒。
 #: 本 Slice **不**增加省 / 市数据（Spec §8 / §16 禁止事项）。
+#:
+#: 路径走的是分目录布局（Slice 18）：``country/china.geojson``。这与
+#: ``resources/regions/index.json`` 里 ``china`` 那条记录指向同一个文件 ——
+#: 两处共用 :data:`~app.config.settings.CHINA_REGION_RELATIVE_PATH` 这一个字符串。
 CHINA_REGION_PRESET = RegionPreset(
     region_id="china",
     name=CHINA_REGION_NAME,
-    geojson_filename=CHINA_REGION_FILENAME,
+    geojson_filename=CHINA_REGION_RELATIVE_PATH,
     region_level=RegionLevel.COUNTRY,
 )
 

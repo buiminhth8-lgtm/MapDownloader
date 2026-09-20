@@ -54,7 +54,6 @@ from app.geo import (
     RegionBoundaryMissing,
     RegionType,
     geometry_to_bounds,
-    list_region_presets,
 )
 from app.geo.region import RegionPreset
 from app.models.map_layer import (
@@ -67,6 +66,7 @@ from app.planning import (
     ZoomRecommendation,
     ZoomStrategyService,
 )
+from app.regions import RegionService
 from app.ui.task_actions import TaskAction, UiTaskState, actions_for
 from app.ui.validation import auto_map_name
 
@@ -282,6 +282,13 @@ class DownloadPanel(QGroupBox):
         self._region_document: GeoJSONDocument | None = None
         self._region_error: str = ""
 
+        # --- Slice 18：行政区条目改由目录提供（Spec §15）---
+        # 面板不自己维护"有哪些行政区"：那份名单在 resources/regions/index.json
+        # 里，由 RegionService 读。构造时不传参数 → 它跟随
+        # app.geo.region.REGION_RESOURCE_DIR 这个全局，验收脚本把资源重定向到
+        # 临时目录时面板会自动跟着走（与 Slice 16 的行为一致）。
+        self._region_service = RegionService()
+
         self._region_type_combo = QComboBox(self)
         for candidate in (RegionType.RECTANGLE, RegionType.POLYGON):
             self._region_type_combo.addItem(candidate.display_name, candidate)
@@ -347,14 +354,20 @@ class DownloadPanel(QGroupBox):
     # 区域（Slice 16，Spec §14 ~ §16）
     # ------------------------------------------------------------------ #
     def _reload_region_presets(self) -> None:
-        """把内置行政区预设填进下拉框。
+        """把行政区条目填进下拉框。
 
-        边界文件缺失的预设**照样列出来**（文案里带"未就绪"标记）：用户需要知道
+        数据来源是 :class:`~app.regions.RegionService`（Slice 18，Spec §15）——
+        它背后是 ``resources/regions/index.json`` 那份**目录元数据**，因此将来加
+        省份只需要往目录里补记录 + 放文件，界面这一行不用改。
+        服务内部会在目录不可用时退回内置预设（并在日志里留一条 ERROR），
+        所以这里不必再写兜底分支。
+
+        边界文件缺失的条目**照样列出来**（文案里带"未就绪"标记）：用户需要知道
         "这个功能存在，只是还缺一份数据"，而不是面对一个空下拉框猜为什么没反应。
         选中后提示行会说明该往哪个路径放什么文件（Spec §3）。
         """
         self._region_combo.clear()
-        for preset in list_region_presets():
+        for preset in self._region_service.list_presets():
             text = preset.name
             if not preset.available:
                 text = f"{preset.name}（边界文件未就绪）"
@@ -1091,8 +1104,17 @@ class DownloadPanel(QGroupBox):
 
     @property
     def region_combo(self) -> QComboBox:
-        """暴露「区域」下拉框（行政区预设，Slice 16）。"""
+        """暴露「区域」下拉框（行政区条目，Slice 16；Slice 18 起由目录提供）。"""
         return self._region_combo
+
+    @property
+    def region_service(self) -> RegionService:
+        """暴露行政区目录服务（Slice 18）。
+
+        界面本身只用它填下拉框；验收脚本与测试用同一份实例做层级断言，
+        保证"界面看到的条目"与"目录说的层级"是同一个来源。
+        """
+        return self._region_service
 
     @property
     def bounds_hint_label(self) -> QLabel:

@@ -46,6 +46,7 @@ from app.models import (
     composition_for,
     describe_map_type,
 )
+from app.planning import RegionLevel
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import AndroidTransferService, build_output_path
 from app.tasks import TaskService, TaskStore
@@ -3589,3 +3590,80 @@ def test_zoom_hint_row_does_not_overlap_the_zoom_inputs(
         assert not hint.geometry().intersects(spin.geometry())
     assert panel.area_group.contentsRect().contains(hint.geometry())
 
+
+
+# --------------------------------------------------------------------------- #
+# Slice 18：下拉框的数据来源是目录（不是内置常量）
+#
+# 这三条守的是"加一个省 = 改数据，不改代码"：界面上那串行政区名单来自
+# ``resources/regions/index.json``，因此把资源目录指向一棵别的树，界面就应该
+# 跟着换一整套条目 —— 而且**层级要能驱动 Zoom 建议**（Slice 17 的那条线）。
+#
+# 为什么必须有一条用例真的装配窗口：`RegionService` 的目录是**惰性**加载的，
+# 而"惰性 + 跟随模块全局"这套组合只有在真实的构造顺序下才会暴露问题
+# （面板先建好、资源目录后重定向）。纯逻辑用例看不见这一层。
+# --------------------------------------------------------------------------- #
+def _use_region_root(monkeypatch, root: Path) -> None:
+    """把内置资源目录重定向到临时树。
+
+    只改 ``app.geo.region.REGION_RESOURCE_DIR`` 这一个全局：目录服务每次取根
+    目录时都重新读它（见 ``app/regions/catalog.py`` 的模块文档），所以面板不必
+    知道"资源目录换过了"这件事 —— 模拟的正是真实动作链："用户照着提示把数据
+    放好了 → 点刷新"。
+    """
+    from app.geo import region as region_module
+
+    monkeypatch.setattr(region_module, "REGION_RESOURCE_DIR", root)
+
+
+def test_region_combo_is_filled_from_the_catalog(window: MainWindow) -> None:
+    """当前只有中国时，界面与 Slice 16 一模一样（Spec §15）。"""
+    panel = window.download_panel
+
+    assert [preset.region_id for preset in panel.region_service.list_presets()] == ["china"]
+    item = panel.region_combo.itemData(0)
+    assert item.region_id == "china"
+    # 面板不再自己维护名单：条目直接来自目录，连文件路径都是目录算出来的
+    assert panel.region_combo.itemText(0) == "中国（边界文件未就绪）"
+    assert str(item.geojson_path).endswith(str(Path("country") / "china.geojson"))
+
+
+def test_region_combo_follows_a_redirected_catalog(
+    window: MainWindow, monkeypatch, region_root: Path
+) -> None:
+    """把资源目录指向合成树 → 下拉框换成那 6 条，且**不用改任何代码**。"""
+    panel = window.download_panel
+    _use_region_root(monkeypatch, region_root)
+
+    panel.reload_region_boundary()
+
+    assert panel.region_combo.count() == 6
+    ids = [panel.region_combo.itemData(i).region_id for i in range(panel.region_combo.count())]
+    assert ids == ["demoland", "northland", "southland", "rivertown", "hilltown", "lakecity"]
+    assert [panel.region_combo.itemText(i) for i in range(3)] == [
+        "示例国",
+        "示例北省",
+        "示例南省",
+    ], "边界文件就位时不再带「未就绪」后缀"
+
+
+def test_picking_a_city_uses_the_city_zoom_policy(
+    window: MainWindow, monkeypatch, region_root: Path
+) -> None:
+    """层级 → Zoom 这条线在界面上真的通着：选市显示 Z12~16，选省显示 Z9~13。"""
+    panel = window.download_panel
+    _use_region_root(monkeypatch, region_root)
+    panel.reload_region_boundary()
+    panel.set_region_type(RegionType.POLYGON)
+
+    assert panel.set_region_id("rivertown") is True
+    assert panel.current_region_level() is RegionLevel.CITY
+    assert "推荐 Zoom：Z12~16" in panel.zoom_policy_text
+    assert panel.current_region() is not None, "边界文件就在临时树里，应当能加载"
+
+    assert panel.set_region_id("northland") is True
+    assert panel.current_region_level() is RegionLevel.PROVINCE
+    assert "推荐 Zoom：Z9~13" in panel.zoom_policy_text
+
+    # 目录里没有的 id 仍然落回矩形（Slice 16 的既定行为，没有被这次改动破坏）
+    assert panel.set_region_id("hangzhou") is False

@@ -254,17 +254,28 @@ DEFAULT_TASKS_FILE: Path = DEFAULT_TASKS_DIR / TASKS_FILE_NAME
 # --------------------------------------------------------------------------- #
 #: 行政区域边界（GeoJSON）所在目录：``<仓库根>/resources/regions``。
 #:
-#: **本目录默认不含中国边界数据。** 中国国界属于法定地图内容，必须使用带
-#: 审图号的合法授权数据，本仓库既不内置也不伪造；部署方需自行放入
-#: :data:`CHINA_REGION_FILENAME`（见该目录下的 ``README.md``）。
-#: 缺少该文件时，"行政区域"模式会明确报错或把覆盖度标成 UNKNOWN，
-#: 而不是退化成矩形下载 —— 那会静默下载一大片境外瓦片。
+#: 目录结构见 ``resources/regions/README.md``：元数据在 ``index.json``，
+#: 边界文件按层级放 ``country/`` / ``province/`` / ``city/`` 三棵子树
+#: （Slice 18）。**本目录默认不含任何边界数据。** 中国国界属于法定地图内容，
+#: 必须使用带审图号的合法授权数据，本仓库既不内置也不伪造；部署方需自行放入
+#: :data:`CHINA_REGION_RELATIVE_PATH`。缺少该文件时，"行政区域"模式会明确报错
+#: 或把覆盖度标成 UNKNOWN，而不是退化成矩形下载 —— 那会静默下载一大片境外瓦片。
 REGION_RESOURCE_DIR: Path = (
     Path(__file__).resolve().parents[2] / "resources" / "regions"
 )
 
-#: 中国行政区域边界文件的规范文件名（Preset ``china`` 用它）。
+#: 行政区域目录元数据的固定文件名（Slice 18）。它是**元数据**（有哪些区域、
+#: 谁是谁的上级、边界文件在哪），不是边界数据，因此随程序一起进仓库。
+REGION_INDEX_FILENAME: str = "index.json"
+
+#: 中国行政区域边界文件的名字（不含目录）。
 CHINA_REGION_FILENAME: str = "china.geojson"
+
+#: 中国边界文件在 :data:`REGION_RESOURCE_DIR` 下的**相对路径**（Slice 18：
+#: 全国级数据放 ``country/`` 子树）。Slice 16 时它是扁平的 ``china.geojson``，
+#: 迁到子目录后用户需要把文件放到 ``resources/regions/country/`` 下 ——
+#: 两处（目录元数据与内置预设）引用的是同一个字符串常量，不会各说各话。
+CHINA_REGION_RELATIVE_PATH: str = f"country/{CHINA_REGION_FILENAME}"
 
 #: 行政区域 Preset 的展示名。
 CHINA_REGION_NAME: str = "中国"

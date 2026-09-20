@@ -42,9 +42,12 @@ from app.geo.region import (
     RegionPreset,
     RegionType,
     get_region_preset,
+    is_safe_region_relative_path,
     list_region_presets,
+    normalize_region_relative_path,
     region_from_metadata,
     region_from_task,
+    resolve_region_path,
 )
 from app.geo.region_estimator import (
     RegionTileEstimate,
@@ -105,6 +108,10 @@ __all__ = [
     "get_region_preset",
     "region_from_task",
     "region_from_metadata",
+    # 资源路径规则（Slice 18）
+    "normalize_region_relative_path",
+    "is_safe_region_relative_path",
+    "resolve_region_path",
     # geojson_loader（Slice 16）
     "GeoJSONError",
     "GeoJSONNotFoundError",

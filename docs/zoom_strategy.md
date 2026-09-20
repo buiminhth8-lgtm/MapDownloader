@@ -198,12 +198,17 @@ python scripts/verify_slice17_zoom.py --no-shots     # 只跑检查，不落截�
 
 ---
 
-## 9. 将来要加省 / 市预设时
+## 9. 加一个省 / 市预设时
 
-1. 放数据：`resources/regions/<id>.geojson`（**必须**是带审图号的合法授权数据，
-   见 `resources/regions/README.md`）；
-2. 在 `app/geo/region.py` 的 `REGION_PRESETS` 里加一条，写清 `region_level`；
+Slice 18 之后，行政区域的数据源是 `resources/regions/index.json` 那份**目录**，
+不再是一个个往 `REGION_PRESETS` 里加常量：
+
+1. 放数据：`resources/regions/<level>/<id>.geojson`
+   （**必须**是带审图号的合法授权数据，见 `resources/regions/README.md`）；
+2. 在 `index.json` 的 `regions` 里加一条，写清 `id` / `name` / `level` /
+   `parentId` / `geojson`；
 3. 若还需新的等级，加 `RegionLevel` 成员**并同时**在 `DEFAULT_ZOOM_POLICIES`
    里补一条（缺了会被 `ZoomStrategyService` 与测试拦下）。
 
-策略核心、界面提示、预估链路都不需要改动。
+策略核心、界面提示、预估链路、加载器都不需要改动。详见
+[docs/region_catalog.md](region_catalog.md)。

@@ -33,7 +33,11 @@
 import ``app.geo`` 的区域实现。
 """
 
-from app.planning.region_level import RegionLevel
+from app.planning.region_level import (
+    ADMINISTRATIVE_LEVELS,
+    PARENT_LEVEL_RULES,
+    RegionLevel,
+)
 
 # 先导入 region_level 再导入其余模块：`app.geo.region` 依赖它，而
 # `app.planning` 的 __init__ 有可能正是被那条依赖触发的（见 zoom_strategy 文档）。
@@ -58,6 +62,8 @@ from app.planning.zoom_strategy import (
 
 __all__ = [
     "RegionLevel",
+    "PARENT_LEVEL_RULES",
+    "ADMINISTRATIVE_LEVELS",
     "ZoomPolicy",
     "ZoomRecommendation",
     "ZoomPlanEstimate",

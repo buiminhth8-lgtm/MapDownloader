@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "regions": [
+    {
+      "id": "demoland",
+      "name": "示例国",
+      "level": "country",
+      "parentId": null,
+      "geojson": "country/demoland.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    },
+    {
+      "id": "northland",
+      "name": "示例北省",
+      "level": "province",
+      "parentId": "demoland",
+      "geojson": "province/northland.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    },
+    {
+      "id": "southland",
+      "name": "示例南省",
+      "level": "province",
+      "parentId": "demoland",
+      "geojson": "province/southland.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    },
+    {
+      "id": "rivertown",
+      "name": "示例河市",
+      "level": "city",
+      "parentId": "northland",
+      "geojson": "city/rivertown.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    },
+    {
+      "id": "hilltown",
+      "name": "示例山市",
+      "level": "city",
+      "parentId": "northland",
+      "geojson": "city/hilltown.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    },
+    {
+      "id": "lakecity",
+      "name": "示例湖市",
+      "level": "city",
+      "parentId": "southland",
+      "geojson": "city/lakecity.geojson",
+      "boundaryVersion": "2026-09-fixture"
+    }
+  ]
+}

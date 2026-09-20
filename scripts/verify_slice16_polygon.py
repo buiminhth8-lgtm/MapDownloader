@@ -157,8 +157,13 @@ def tile_aligned_polygon(zoom: int) -> list[list[list[float]]]:
 
 
 def write_boundary(directory: Path, filename: str) -> Path:
-    """在 ``directory`` 下写一个合法的边界 GeoJSON（**合成夹具**，不是真实国界）。"""
+    """在 ``directory`` 下写一个合法的边界 GeoJSON（**合成夹具**，不是真实国界）。
+
+    ``filename`` 可以是子路径（``country/china.geojson``）：Slice 18 起边界文件
+    按层级分目录摆放，父目录不存在时这里负责建出来。
+    """
     path = directory / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -180,19 +185,41 @@ def write_boundary(directory: Path, filename: str) -> Path:
     return path
 
 
-def use_temp_region_resources(regions_dir: Path) -> None:
-    """把内置预设的资源目录重定向到临时目录（仓库资源区保持干净）。
+def china_relative_path() -> str:
+    """内置中国预设的边界文件**相对资源目录**的路径（``country/china.geojson``）。
 
-    只改 ``app.geo.region`` 模块里的两个全局：``REGION_RESOURCE_DIR`` 与
-    ``REGION_PRESETS``。``RegionPreset.geojson_path`` / ``get_region_preset`` 都是
-    **调用时**读这两个名字，所以改完立刻生效，不需要重装模块。
+    脚本里所有涉及这个文件的位置都从这里取，不写死字面量：Slice 16 时它是扁平的
+    ``china.geojson``，Slice 18 迁到了 ``country/`` 子树 —— 写死的话，
+    布局再动一次这些断言就会**悄悄地**变成"检查一个不存在的文件"（永远为真）。
     """
+    from app.geo.region import CHINA_REGION_PRESET
+
+    return CHINA_REGION_PRESET.geojson_filename
+
+
+def use_temp_region_resources(regions_dir: Path) -> None:
+    """把行政区资源目录重定向到临时目录（仓库资源区保持干净）。
+
+    两件事：
+
+    1. 改 ``app.geo.region`` 模块里的两个全局 ``REGION_RESOURCE_DIR`` /
+       ``REGION_PRESETS``。``RegionPreset.geojson_path`` / ``get_region_preset``
+       都是**调用时**读这两个名字，所以改完立刻生效，不需要重装模块。
+    2. 把仓库里那份 ``index.json`` **拷**进临时目录 —— Slice 18 起，界面上的
+       行政区名单来自这份目录元数据。用拷的而不是在脚本里手写一份：
+       手写的那份迟早与产品资源不一致，而这条脚本要验的正是产品资源本身。
+       （顺带说明：``RegionService`` 的根目录也是**调用时**读全局的，
+       所以这一改同样立刻生效。）
+    """
+    from app.config.settings import REGION_RESOURCE_DIR as SHIPPED_REGIONS_DIR
     from app.geo import region as region_module
     from app.geo.region import CHINA_REGION_PRESET
+    from app.regions import INDEX_FILENAME
 
     regions_dir.mkdir(parents=True, exist_ok=True)
     region_module.REGION_RESOURCE_DIR = regions_dir
     region_module.REGION_PRESETS = (CHINA_REGION_PRESET,)
+    shutil.copyfile(SHIPPED_REGIONS_DIR / INDEX_FILENAME, regions_dir / INDEX_FILENAME)
 
 
 def _estimate(region) -> object:
@@ -312,7 +339,7 @@ def scene_polygon_missing_boundary(
     from app.geo import RegionType
     from app.ui.download_panel import ACTION_CALCULATE
 
-    boundary = regions_dir / "china.geojson"
+    boundary = regions_dir / china_relative_path()
     checker.check(not boundary.exists(), "前提：边界文件确实不在（临时资源目录是空的）")
 
     panel = window.download_panel
@@ -631,10 +658,16 @@ def scene_static(checker: Checker) -> None:
     checker.section("场景 E：静态守卫")
 
     regions_dir = PROJECT_ROOT / "resources" / "regions"
+    shipped_boundary = regions_dir / china_relative_path()
     checker.check(
-        not (regions_dir / "china.geojson").exists(),
+        not shipped_boundary.exists(),
         "仓库里**没有**内置中国国界数据（Spec §3：法定地图内容必须用授权数据）",
-        str(regions_dir / "china.geojson"),
+        str(shipped_boundary),
+    )
+    checker.check(
+        (regions_dir / "index.json").is_file(),
+        "目录元数据（index.json）随仓库分发 —— 它是元数据，不是边界数据",
+        str(regions_dir / "index.json"),
     )
 
     panel_source = (PROJECT_ROOT / "app" / "ui" / "download_panel.py").read_text(
@@ -740,7 +773,7 @@ def main(argv: list[str] | None = None) -> int:
             dialog.close()
         _pump(app)
 
-        write_boundary(regions_dir, "china.geojson")
+        write_boundary(regions_dir, china_relative_path())
         region = scene_polygon_ready(app, window, checker, shots)
 
         window._exit_confirmed = True

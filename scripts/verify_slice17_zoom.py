@@ -141,8 +141,13 @@ def tile_aligned_polygon(zoom: int) -> list[list[list[float]]]:
 
 
 def write_boundary(directory: Path, filename: str) -> Path:
-    """在 ``directory`` 下写一个合法的边界 GeoJSON（**合成夹具**，不是真实国界）。"""
+    """在 ``directory`` 下写一个合法的边界 GeoJSON（**合成夹具**，不是真实国界）。
+
+    ``filename`` 可以是子路径（``country/china.geojson``）：Slice 18 起边界文件
+    按层级分目录摆放，父目录不存在时这里负责建出来。
+    """
     path = directory / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -164,14 +169,34 @@ def write_boundary(directory: Path, filename: str) -> Path:
     return path
 
 
+def china_relative_path() -> str:
+    """内置中国预设的边界文件**相对资源目录**的路径（``country/china.geojson``）。
+
+    脚本里所有涉及这个文件的位置都从这里取，不写死字面量：Slice 16 时它是扁平的
+    ``china.geojson``，Slice 18 迁到了 ``country/`` 子树 —— 写死的话，
+    布局再动一次这些断言就会**悄悄地**变成"检查一个不存在的文件"（永远为真）。
+    """
+    from app.geo.region import CHINA_REGION_PRESET
+
+    return CHINA_REGION_PRESET.geojson_filename
+
+
 def use_temp_region_resources(regions_dir: Path) -> None:
-    """把内置预设的资源目录重定向到临时目录（仓库资源区保持干净）。"""
+    """把行政区资源目录重定向到临时目录（仓库资源区保持干净）。
+
+    除改两个模块全局外，还要把仓库里那份 ``index.json`` **拷**进临时目录：
+    Slice 18 起界面上的行政区名单来自这份目录元数据，不拷的话面板会走
+    "目录不可用 → 退回内置预设"那条兜底路径，验的就不是产品资源的真实形态了。
+    """
+    from app.config.settings import REGION_RESOURCE_DIR as SHIPPED_REGIONS_DIR
     from app.geo import region as region_module
     from app.geo.region import CHINA_REGION_PRESET
+    from app.regions import INDEX_FILENAME
 
     regions_dir.mkdir(parents=True, exist_ok=True)
     region_module.REGION_RESOURCE_DIR = regions_dir
     region_module.REGION_PRESETS = (CHINA_REGION_PRESET,)
+    shutil.copyfile(SHIPPED_REGIONS_DIR / INDEX_FILENAME, regions_dir / INDEX_FILENAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -630,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         _pump(app)
 
         # 场景 D/E 要真正的几何：把边界文件放好（模拟"用户照提示放好了数据"）
-        write_boundary(regions_dir, "china.geojson")
+        write_boundary(regions_dir, china_relative_path())
         window.download_panel.reload_region_boundary()
         _pump(app)
 

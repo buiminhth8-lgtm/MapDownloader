@@ -18,13 +18,20 @@ Zoom 建议、容量预警、将来的分层下载计划都要问同一个问题
 这个模块**刻意不 import 任何东西**（纯 stdlib）：它是 ``app.geo`` 与
 ``app.planning`` 之间唯一的依赖点（``app.geo.region`` 要往区域模型上挂等级），
 保持零依赖可以让这条边永不构成循环导入。
+
+层级规则（Slice 18）
+--------------------
+
+:data:`PARENT_LEVEL_RULES` 也放在这里：等级枚举与"等级怎么嵌套"是同一个概念的
+两半，分散在两个包里的结果必然是"加了等级忘了改规则"。这条规则被
+``app.regions.validator`` 用来校验目录，但**规则本身只有这一份**。
 """
 
 from __future__ import annotations
 
 from enum import Enum
 
-__all__ = ["RegionLevel"]
+__all__ = ["RegionLevel", "PARENT_LEVEL_RULES", "ADMINISTRATIVE_LEVELS"]
 
 
 class RegionLevel(Enum):
@@ -89,9 +96,52 @@ class RegionLevel(Enum):
         return _DISPLAY_NAMES[self]
 
     @property
+    def is_country(self) -> bool:
+        """是不是全国级（行政层级的根）。"""
+        return self is RegionLevel.COUNTRY
+
+    @property
+    def is_province(self) -> bool:
+        """是不是省级。"""
+        return self is RegionLevel.PROVINCE
+
+    @property
+    def is_city(self) -> bool:
+        """是不是城市级。"""
+        return self is RegionLevel.CITY
+
+    @property
+    def is_administrative(self) -> bool:
+        """是否纳入行政层级规则（全国 / 省 / 市）。
+
+        ``MISSION`` / ``CUSTOM`` 不在其中：它们可以有上级（"某条航线的作业区挂在
+        杭州市下"），但不受"省必须挂在国下"这类约束（Slice 18 Spec §6）。
+        """
+        return self in ADMINISTRATIVE_LEVELS
+
+    @property
     def is_custom(self) -> bool:
         """是否属于"不套用行政等级规则"的自定义层级。"""
         return self is RegionLevel.CUSTOM
+
+
+#: 等级 → 允许的父等级。``None`` 表示"必须是层级的根"。
+#:
+#: 这张表放在**定义等级的这个模块**里（而不是校验器里）：它和枚举是同一个
+#: 概念的两半 —— "有哪些等级"和"这些等级怎么嵌套"。想加"区县"一级时，
+#: 改枚举 + 补一行表就够，校验器、目录查询、界面都不用动。
+#:
+#: ``MISSION`` / ``CUSTOM`` **刻意不在表内**：它们不参与行政层级（Spec §6），
+#: 查不到就表示"没有等级约束"，与"必须是根"是两回事。
+PARENT_LEVEL_RULES: dict["RegionLevel", "RegionLevel | None"] = {
+    RegionLevel.COUNTRY: None,
+    RegionLevel.PROVINCE: RegionLevel.COUNTRY,
+    RegionLevel.CITY: RegionLevel.PROVINCE,
+}
+
+#: 纳入行政层级的等级，**从** :data:`PARENT_LEVEL_RULES` 推导。
+#: 不手写第二份列表：多写一份就一定会有人在加等级时漏掉。
+ADMINISTRATIVE_LEVELS: tuple["RegionLevel", ...] = tuple(PARENT_LEVEL_RULES)
 
 
 #: 等级 → 中文展示名。集中在这里，避免 UI 里出现 ``if level is COUNTRY: "全国"``

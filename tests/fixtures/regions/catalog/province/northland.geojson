@@ -1,0 +1,35 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "示例北省",
+    "id": "northland",
+    "boundaryVersion": "2026-09-fixture"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          110.0,
+          32.0
+        ],
+        [
+          112.0,
+          32.0
+        ],
+        [
+          112.0,
+          34.0
+        ],
+        [
+          110.0,
+          34.0
+        ],
+        [
+          110.0,
+          32.0
+        ]
+      ]
+    ]
+  }
+}

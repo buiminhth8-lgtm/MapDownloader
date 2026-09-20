@@ -100,3 +100,49 @@ def preferences():
     finally:
         settings.clear()
         shutil.rmtree(directory, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# 行政区域目录（Slice 18）
+# --------------------------------------------------------------------------- #
+#: 合成三层目录的**只读**原件：``tests/fixtures/regions/catalog/``。
+#:
+#: 顶层是 ``index.json``，边界文件按 ``country/`` / ``province/`` / ``city/``
+#: 三棵子树摆放 —— 与产品资源目录（``resources/regions/``）结构完全一致。
+#: 里面的多边形是**手写的方块**，不是任何真实行政区边界（Spec §8）。
+REGION_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "regions" / "catalog"
+
+
+@pytest.fixture(scope="session")
+def region_fixture_root() -> Path:
+    """合成目录的只读原件（用例只读它，不往里写东西）。"""
+    return REGION_FIXTURE_ROOT
+
+
+@pytest.fixture
+def region_root(work_dir: Path) -> Path:
+    """合成目录在工作区里的**可写副本**。
+
+    为什么要副本而不是直接用原件：好几条用例需要"把某个边界文件删掉/弄坏"
+    （测缺失与损坏的分支），往仓库里的夹具上动手会污染后续用例，
+    而这类问题只在全量跑、且执行顺序恰好不对时才现形 —— 最难查的一种。
+    """
+    target = work_dir / "regions"
+    shutil.copytree(REGION_FIXTURE_ROOT, target)
+    return target
+
+
+@pytest.fixture
+def region_catalog(region_root: Path):
+    """挂在可写副本上的目录。"""
+    from app.regions import RegionCatalog
+
+    return RegionCatalog.load(root=region_root)
+
+
+@pytest.fixture
+def region_loader(region_catalog):
+    """与 :func:`region_catalog` 配套的加载器。"""
+    from app.regions import RegionLoader
+
+    return RegionLoader(region_catalog)

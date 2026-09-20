@@ -21,6 +21,7 @@
 - [用法：下载地图](#用法下载地图)
 - [用法：按行政区域下载（GeoJSON 多边形）](docs/polygon_region_download.md) —— Slice 16
 - [Zoom 策略：分级推荐区间](docs/zoom_strategy.md) —— Slice 17
+- [行政区域层级模型（中国 → 省 → 市）](docs/region_catalog.md) —— Slice 18
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -227,6 +228,99 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
 
+## Slice 18：行政区域层级模型（中国 → 省 → 市）
+
+Slice 16 给了"按行政区域裁剪"，Slice 17 给了"这一级该下到多少 Zoom"，
+但两者都只覆盖到**全国**这一层：想下浙江省、想下杭州市，界面上没有东西可选。
+
+这一版把"一个中国预设"升级成**可扩展的行政区域目录**。它本身不下载任何东西，
+只提供一份统一的区域数据源，给 Slice 19（分层下载计划）和 Slice 20（区域管理界面）用。
+
+```text
+中国 (COUNTRY)                ← resources/regions/country/china.geojson
+├── 浙江省 (PROVINCE)         ← resources/regions/province/zhejiang.geojson
+│   ├── 杭州市 (CITY)         ← resources/regions/city/hangzhou.geojson
+│   └── 宁波市 (CITY)
+└── 北京市 (PROVINCE，直辖市)  ← 直辖市直接挂国家下，不凭空造一级
+```
+
+层级规则只有一份（在规划层）：`COUNTRY` 无父级、`PROVINCE` 挂 `COUNTRY`、
+`CITY` 挂 `PROVINCE`；`MISSION` / `CUSTOM` 不属于行政层级，怎么挂都不检查。
+坏挂载（国家级带父亲、`A→B→A` 的环）会被校验抓出来。
+
+### 目录元数据进仓库，边界数据不进
+
+```text
+resources/regions/
+├── index.json     ← 随仓库分发：有哪些区域、它们在哪个文件里
+├── README.md
+├── country/       ← 数据（*.geojson，被 .gitignore 忽略）
+├── province/
+└── city/
+```
+
+`index.json` 里**没有 Zoom 字段**，也不允许加：Zoom 建议由 `level` 在运行时查
+Slice 17 那张策略表得到。存一份进目录就是第二个真相，改了策略还要回头改数据。
+`resources/regions/**/*.geojson` 一个都不在仓库里 —— 与 Slice 16 同一条合规要求：
+**法定地图内容必须使用带审图号的授权数据。** 这条有两个静态守卫盯着
+（`scripts/verify_slice18_regions.py` 场景 A）。
+
+### Lazy Load：建目录与查询都不碰边界文件
+
+一个省几 MB 的 GeoJSON 是常态，放 34 个省 + 300 个市就是几百 MB。所以：
+`RegionCatalog` 的构造与**全部查询**（`get` / `list_all` / `list_by_level` /
+`list_children` / `get_parent` / `get_ancestors`）只读 `index.json`（几 KB），
+只有真的要几何时才读盘。用例把 `load_geojson_document` 换成计数探针，
+跑一遍所有查询后断言**计数为 0**。
+
+### 两个 `RegionPreset` 是故意不合并的
+
+| 类 | 是什么 | 有什么 |
+| --- | --- | --- |
+| `app.geo.region.RegionPreset` | Slice 16 的**扁平预设** | 只有文件（相对）名，没有层级 |
+| `app.regions.RegionPreset` | 本 Slice 的**目录条目** | `parent_id` / `code` / 相对路径 |
+
+合并会带来两个后果：`app.geo.region` 去 import `RegionCatalog` 就形成
+`geo → regions → geo` 的环；而 `parent_id` 对"自定义矩形"这类根本不是目录条目的
+预设毫无意义。所以只有**一条**转换方向 ——
+`RegionLoader.to_geo_preset()`（目录 → 扁平），反向刻意不实现。
+
+路径安全的实现也**只有一份**（`app/geo/region.py` 的三个函数），
+`app.regions.models` 转出的是同一个函数对象（用例用 `is` 断言）。
+理由很实际：`index.json` 是**可编辑的数据文件**，`"geojson": "../../../etc/passwd"`
+或 `"C:/Windows/…"` 必须被拒，而且只能在一处被拒 —— 安全判断一旦有第二份实现，
+错的通常是更宽松的那份。**拒绝发生在任何 IO 之前**（深度校验也不会去读越界文件，
+这一条由"诱饵文件"用例守着）。
+
+### 校验分两档
+
+```bash
+.venv/Scripts/python.exe -c "from app.regions import RegionService; print('\n'.join(RegionService().validate().as_lines()))"
+```
+
+| 档 | 做什么 | 能发现 |
+| --- | --- | --- |
+| 快速（默认） | 只 `stat` 文件 | 结构 / 层级 / 路径问题、文件在不在 |
+| 深度（`deep=True`） | 真解析每份 GeoJSON | 上面全部 + 文件坏掉 / 声明的 `bounds` 与实际不符 |
+
+**"缺边界文件"是 WARNING 不是 ERROR**：仓库本来就不带数据，"还没放文件"是正常
+中间态。如果它算错误，`validate()` 在任何一台干净机器上都红，那这个命令就没人看了。
+
+### 界面只改了一处
+
+区域下拉框的**数据来源**从"内置常量"换成 `RegionService.list_presets()`，
+条目类型没变，所以面板其余代码一行没动。于是"把资源目录指到别处"这件事对界面
+同样成立。**没有**做层级下拉、省市选择器、区域管理页 —— 那些是 Slice 19 / 20。
+
+目录读不出来时（文件丢了 / JSON 语法错 / 版本号不认识）**不让界面崩**：
+退回由内置扁平预设合成的目录，`catalog_error` 记下原因、日志留一行 ERROR。
+此时"中国"照常可用，而层级查询返回空 —— 平铺预设没有父子关系，
+凭空编一个出来才是更糟的谎。
+
+详见 [docs/region_catalog.md](docs/region_catalog.md)。
+实机验收：`python scripts/verify_slice18_regions.py`
+（真 windows 平台插件、真窗口、三级目录、路径安全、截图落 `docs/slice18_regions_*.png`）。
+
 ## Slice 17：分级 Zoom 策略
 
 Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
@@ -296,14 +390,15 @@ Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
 
 ### 中国国界数据由你自己提供（README 里说清这一条）
 
-仓库**不内置、不生成、也不套用**任何中国国界数据：`resources/regions/china.geojson`
-默认不存在。**中国国界属于法定地图内容，必须使用带审图号的合法授权 GeoJSON 数据。**
+仓库**不内置、不生成、也不套用**任何中国国界数据：`resources/regions/country/china.geojson`
+默认不存在（Slice 18 起边界文件按层级分目录摆放，路径写在 `resources/regions/index.json` 里）。
+**中国国界属于法定地图内容，必须使用带审图号的合法授权 GeoJSON 数据。**
 程序提供的是"规范路径 + 加载器 + 明确的缺失报错"：
 
 ```text
-计算失败：行政区域不可用：行政区边界文件不可用：…\resources\regions\china.geojson。
+计算失败：行政区域不可用：行政区边界文件不可用：…\resources\regions\country\china.geojson。
 中国国界属于法定地图内容，请使用带审图号的合法授权 GeoJSON 数据，
-命名为 china.geojson 后放入 …\resources\regions
+放到 …\resources\regions 下的 country/china.geojson（相对路径）后重试
 ```
 
 **它不会退回按矩形下载。** 退回去的后果是静默下一大片境外瓦片，而界面上的数字
@@ -809,7 +904,7 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 1579 passed
+python -m pytest                # 1711 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
@@ -821,6 +916,9 @@ python -m pytest tests/test_adb_client.py tests/test_device_manager.py \
                     # 只跑 Slice 10 传输链路（顺序 / 取消 / 覆盖 / 路径安全 / 不重复哈希）
 python -m pytest tests/test_zoom_policy.py tests/test_zoom_strategy.py -q
                     # 只跑 Slice 17 Zoom 策略（数值 / 自洽 / 只提醒不改写 / 复用预估）
+python -m pytest tests/test_region_catalog.py tests/test_region_loader.py \
+                 tests/test_region_hierarchy.py tests/test_region_validation.py -q
+                    # 只跑 Slice 18 行政区域（目录读取 / 层级 / 路径安全 / lazy load / 校验）
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -903,6 +1001,21 @@ python scripts/verify_slice17_zoom.py --no-shots   # 只跑检查，不截图
 `docs/slice17_zoom_warning.png`（中国 + Z8~18：警告出现，而 Zoom 仍是你设的 8~18）。
 脚本最后一段还会**真的跑一次多边形下载**（MockTransport 供瓦片，不触网），
 断言"库里张数 == 区域内张数"，证明策略层没有碰坏 Slice 16 的下载链路。
+
+Slice 18 的三级行政区目录同样有实机留档 —— 下拉框是**新增的数据来源**，
+最容易被"退回内置常量"这种改动悄悄破坏：
+
+```bash
+python scripts/verify_slice18_regions.py              # 真 windows 插件 + 三级目录 + 路径安全 + 70 项检查
+python scripts/verify_slice18_regions.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice18_regions.py --no-shots   # 只跑检查，不截图
+```
+
+截图落在 `docs/slice18_regions_dropdown.png`（下拉项全部来自目录）、
+`docs/slice18_regions_city_zoom.png`（选中市级：建议 Z12~16、默认 8~17 会报警）、
+`docs/slice18_regions_three_levels.png`（按市级区域真的算一次）。
+脚本在临时目录里造的是**合成方块**，不往仓库的 `resources/regions/` 写任何东西 ——
+法定地图内容必须由使用者用授权数据自己放。
 
 Slice 10 的设备区与三个弹窗同样有可重复的实机留档：
 
@@ -1025,7 +1138,9 @@ tianditu-offline-tool/
 │   │                      外加纯逻辑模块：task_actions（按钮矩阵）/ validation（校验）/
 │   │                       preferences（QSettings 偏好）/ widgets（折行标签 + 主题色）/ desktop（打开目录）
 │   ├── providers/         瓦片源 Provider：base.py + tianditu.py（Slice 2 ✅）
-│   ├── geo/               瓦片坐标计算：bounds.py + tile_math.py（Slice 1 ✅）
+│   ├── geo/               瓦片坐标计算：bounds.py + tile_math.py（Slice 1 ✅）+ region.py / region_estimator.py / region_filter.py / geojson_loader.py（Slice 16 ✅）
+│   ├── planning/          Zoom 策略层（Slice 17 ✅）：region_level（等级 + 父级规则，唯一来源）/ models / zoom_policy（唯一权威策略表）/ zoom_strategy（推荐 + 预估）
+│   ├── regions/           行政区域层级（Slice 18 ✅）：models（目录条目）/ catalog（读 index.json + 层级查询）/ loader（路径安全 + GeoJSON + DownloadRegion）/ validator（快速 + 深度）/ service（业务入口）
 │   ├── downloader/        下载引擎：models / retry_policy / rate_limiter / tile_downloader / download_manager / resume / composite_tile_downloader（Slice 3 ✅ + Slice 5 ✅ + Slice 6 ✅）
 │   ├── mbtiles/           MBTiles 读写：models / writer / reader / validator（Slice 4 ✅；Slice 6 增加合成信息读写与自洽性校验）+ diagnostics（Slice 8 ✅：全部判定规则与结论模型）
 │   ├── tasks/             任务持久化：task_store（原子 JSON 读写）/ task_service（状态机 + 启动恢复）（Slice 5 ✅）
@@ -1034,10 +1149,17 @@ tianditu-offline-tool/
 │   ├── package/           离线包打包与校验：models / checksum / package_builder / package_reader / package_validator（Slice 9 ✅）
 │   ├── android/           ADB 设备管理与包传输（Slice 10 ✅）：adb_client（子进程封装）/ device_manager（设备发现 + getprop 补全）/ transfer_models（计划 / 进度 / 结果 / 远端路径安全）/ map_package_transfer（顺序 + 失败分支）
 │   └── workers/           后台线程桥（Slice 10 ✅）：android_transfer_worker（设备刷新 / 包校验 / 传输三个 QThread）
-├── tests/                  pytest 用例（1299 条；android_fakes.py 是 Slice 10 的假 adb 设备，不是测试文件）
+├── tests/                  pytest 用例（1711 条；android_fakes.py 是 Slice 10 的假 adb 设备，不是测试文件）
 ├── data/tasks.json         任务记录（运行时生成，已 gitignore）
-├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png / slice10_*.png）
+├── resources/regions/      行政区目录元数据（Slice 18 ✅）：index.json + README.md 随仓库分发；
+│                           country/ province/ city/ 三个数据目录**只放 .gitkeep**，
+│                           *.geojson 在 .gitignore 里（授权数据不进提交）
+├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png / slice10_*.png /
+│                           slice16_polygon_*.png / slice17_zoom_*.png / slice18_regions_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
+├── scripts/verify_slice18_regions.py Slice 18 行政区域层级验收（真窗口 + 三级目录 + 路径安全 + 70 项检查 + 截图）
+├── scripts/verify_slice17_zoom.py Slice 17 分级 Zoom 策略验收（真窗口 + 真下载 + 51 项检查 + 截图）
+├── scripts/verify_slice16_polygon.py Slice 16 多边形区域下载验收（真窗口 + 真下载 + 70 项检查 + 截图）
 ├── scripts/verify_slice10_android.py Slice 10 实机验收（真 adb 替身 + 真窗口 + 118 项检查 + 截图）
 ├── scripts/verify_slice9_package.py Slice 9 离线地图包实机验收（真窗口 + 75 项检查 + 截图）
 ├── scripts/verify_slice8_inspector.py Slice 8 检查工具实机验收（真窗口 + 52 项检查 + 截图）
@@ -1058,6 +1180,13 @@ Slice 10 的 `app/android` 是同一套思路的延续：**设备面板不 impor
 `app.downloader.resume` 通过**结构化 Protocol**（`TileProbe`）判断"库里有没有这张瓦片"，
 所以它能接收 `MBTilesWriter` / `MBTilesReader` 而**不必 import `app.mbtiles`**——依赖保持无环，
 这条约束有专门的测试守着。
+Slice 17 / 18 的依赖边同理，且方向是**单向**的：
+`app.regions → app.geo` / `app.planning`，而 `app.geo.region` **不 import `app.regions`**
+（否则就是 `geo → regions → geo` 的环）。等级与父级规则只在 `app.planning` 里定义
+（`app.regions` 转出的是**同一个对象**），路径安全只在 `app.geo.region` 里实现
+（同样转出同一个函数）—— 两条都有静态守卫。
+`app/planning/zoom_strategy.py` 里的 `RegionTileEstimator` 是**函数内 import**：
+挪到模块顶层，就会在"从 `app.geo` 那一侧发起导入"时撞上半初始化的 `app.geo.region`。
 
 `app.ui` 里这几个模块刻意**不 import Qt 之外的任何东西**，因此可以脱离窗口单测：
 `task_actions`（连 Qt 都不 import）、`validation`、`preferences`（只依赖 `QSettings`）。
@@ -1508,6 +1637,7 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 | 工具里没有设备 | ADB 路径（偏好设置填绝对路径）。**这不影响你做地图** |
 | 手机上导入报"校验失败" | 回包目录核对 `mbtiles.size` 与 `sha256` |
 | 切离线后地图空白 | 当前地图页的缩放层级 / 视野位置，是否在包的 zoom 区间与 bounds 内 |
+| 行政区下拉里没有自己加的省 | `resources/regions/index.json` 里补了记录没有；路径写成绝对路径或带 `..` 的条目会被**整条丢弃**并在日志里留一条 `unsafe_path` |
 
 **几条"看起来像 bug 其实是设计如此"**：
 
@@ -1515,11 +1645,22 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 - `manifest.json` 里**没有 `description`** —— 它是唯一可选字段，为空时不写这个键。
 - AUTO 模式下从北京飞到上海底图变了 —— 正确行为。
 - 删包时弹确认框 —— 删的是用户文件，必须二次确认。
+- **行政区目录里"缺边界文件"只是提醒，不是错误** —— 仓库本来就不带边界数据，
+  "还没放文件"是正常中间态；把它算错误，`validate()` 在任何一台干净机器上都会红。
+- **`index.json` 的版本号不认识也不会让目录不可用** —— 那是前向兼容信号，
+  已有字段照读，问题只在校验报告里出现。
+- **只选中一个省、界面只显示一个范围** —— Slice 18 提供的是**数据源**，
+  组合下载计划（全国 + 重点省）是 Slice 19 的事。
 
 ---
 
 ## 后续计划
 
+- **Slice 19：分层下载计划** —— 拿 Slice 18 的目录做"全国 Z4~10 + 重点省 Z9~13"这种
+  多区域组合计划：拆成若干子任务、合并估算总容量、给出磁盘占用与依赖顺序。
+  Slice 18 只提供**数据源**（目录 + 层级 + 等级 → Zoom 建议），一行下载编排都没写。
+- **Slice 20：区域管理界面** —— 层级下拉 / 省市选择器 / 区域增删改查。
+  Slice 18 在界面侧只改了"下拉框的数据来源"这一处。
 - **Slice 11：Android 端导入** —— 端侧读 `<导入区>/<id>/manifest.json`、校验 SHA256、
   把 `map.mbtiles` 交给 osmdroid 加载。Slice 10 只负责把文件**搬到设备上并证明搬对了**，
   端侧怎么导入是下一 Slice 的事（`manifest.json` 最后传就是给它当"包齐了"的信号用的）
@@ -1528,10 +1669,13 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 
 > 以上**尚未排期**，不再用 Slice 号承诺时间。已经交付的是：Slice 8 = MBTiles 检查与
 > 诊断工具，Slice 9 = 离线地图包构建与校验（manifest + 流式 SHA256 + 篡改检测），
-> Slice 10 = ADB 设备管理与离线地图包传输（Windows → Android）。
+> Slice 10 = ADB 设备管理与离线地图包传输（Windows → Android），
+> Slice 16 = GeoJSON 区域下载与中国行政区域预设，Slice 17 = 分级 Zoom 策略，
+> Slice 18 = 行政区域层级模型（中国 → 省 → 市）。
 > 每个 Slice 的 Spec 都会明确禁止"顺手做下一个"——Slice 10 的 Spec 就点名不许在这一
 > 个里实现 Android 端导入、不许碰 App 私有目录、不许 `adb install` / `root` / `remount`、
-> 不许压缩、不许改 MBTiles。所以端侧导入是**下一个** Slice 的事，不是这一个的。
+> 不许压缩、不许改 MBTiles；Slice 18 的 Spec 同样点名不许实现分层下载计划（Slice 19）
+> 与区域管理界面（Slice 20）。所以那些是**下一个** Slice 的事，不是这一个的。
 
 ## 说明与注意事项
 

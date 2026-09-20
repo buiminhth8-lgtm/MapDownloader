@@ -1,0 +1,2 @@
+# 这个目录放全国级的边界文件（country/china.geojson）。
+# 边界文件不进仓库（见仓库根的 .gitignore）；这里放一个占位文件把目录留在 git 里。

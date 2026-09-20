@@ -67,13 +67,16 @@ Zoom 明细（候选 / 选中 / 过滤）：
 
 ### 边界文件不在时
 
-行政区域模式下如果 `resources/regions/china.geojson` 不存在，会**明确失败**：
+行政区域模式下如果 `resources/regions/country/china.geojson` 不存在，会**明确失败**：
 
 ```text
-计算失败：行政区域不可用：行政区边界文件不可用：…\resources\regions\china.geojson。
+计算失败：行政区域不可用：行政区边界文件不可用：…\resources\regions\country\china.geojson。
 中国国界属于法定地图内容，请使用带审图号的合法授权 GeoJSON 数据，
-命名为 china.geojson 后放入 …\resources\regions
+放到 …\resources\regions 下的 country/china.geojson（相对路径）后重试
 ```
+
+（文件的相对路径由 `resources/regions/index.json` 里那条记录决定，
+见 [region_catalog.md](region_catalog.md)。）
 
 **它不会退回按矩形下载。** 退回去的后果是静默下一大片境外瓦片，而用户在界面上
 只会看到一个"正常"的数字。宁可停下来问，也不要悄悄多下。
@@ -135,7 +138,7 @@ Zoom 明细（候选 / 选中 / 过滤）：
 | 4 | 切到「行政区域」（边界文件没放） | 四个框变只读；提示区显示"边界不可用…" |
 | 5 | 看结果区 | 上一轮矩形算出的数字**立刻消失**，退回占位 |
 | 6 | 点「计算」 | 明确失败：文件叫什么、放哪、要授权数据 |
-| 7 | 按提示放好 `china.geojson`，切走再切回 | 候选范围框自动填上外包矩形 |
+| 7 | 按提示放好 `country/china.geojson`，切走再切回 | 候选范围框自动填上外包矩形 |
 | 8 | 点「计算」 | 候选 / 区域内 / 过滤 / 占比 / 请求量 / 容量都给全 |
 | 9 | 核对「区域内」== 进度条分母 | 用候选数当分母是本 Slice 最典型的缺陷 |
 | 10 | 开始下载 | 区域外的瓦片**一张都不请求**；失败与跳过都是 0 |
