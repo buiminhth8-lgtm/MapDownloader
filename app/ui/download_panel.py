@@ -62,6 +62,11 @@ from app.models.map_layer import (
     MapType,
     describe_map_type,
 )
+from app.planning import (
+    RegionLevel,
+    ZoomRecommendation,
+    ZoomStrategyService,
+)
 from app.ui.task_actions import TaskAction, UiTaskState, actions_for
 from app.ui.validation import auto_map_name
 
@@ -187,6 +192,10 @@ class DownloadPanel(QGroupBox):
         #: 初始化：``_build_buttons`` 结尾就会调一次 ``apply_task_state``。
         self._task_state: UiTaskState = UiTaskState.IDLE
 
+        #: Zoom 策略服务（Slice 17，Spec §11）。面板只**问建议**，从不改用户输入；
+        #: 策略值与文案都在 app.planning 里，界面这一侧不出现任何 Zoom 区间常量。
+        self._zoom_strategy = ZoomStrategyService()
+
         self._build_general_form()
         self._build_area_form()
         self._build_output_form()
@@ -287,6 +296,12 @@ class DownloadPanel(QGroupBox):
         #: 行政区域模式下代替手工输入的范围提示（只读展示）
         self._bounds_hint_label = _WrappingLabel("", self)
 
+        # --- Slice 17：Zoom 建议（Spec §11）---
+        # 只在"选了带等级的行政区"时出现。矩形 / 自定义区域不套用等级规则，
+        # 那一行会整行隐藏（QGridLayout 会把高度压到 0，不留空白）。
+        self._zoom_hint_title = QLabel("Zoom 建议", self)
+        self._zoom_hint_label = _WrappingLabel("", self)
+
         grid = QGridLayout()
         grid.addWidget(QLabel("区域类型", self), 0, 0)
         grid.addWidget(self._region_type_combo, 0, 1, 1, 3)
@@ -311,6 +326,8 @@ class DownloadPanel(QGroupBox):
         grid.addWidget(self._min_zoom_spin, 5, 1)
         grid.addWidget(QLabel("Max Zoom", self), 5, 2)
         grid.addWidget(self._max_zoom_spin, 5, 3)
+        grid.addWidget(self._zoom_hint_title, 6, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_hint_label, 6, 1, 1, 3)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
@@ -319,6 +336,10 @@ class DownloadPanel(QGroupBox):
 
         self._region_type_combo.currentIndexChanged.connect(self._on_region_changed)
         self._region_combo.currentIndexChanged.connect(self._on_region_changed)
+        # Zoom 一改就重算建议：用户把 Max Zoom 从 10 拉到 18 的**当下**就该看到
+        # 那句提醒，而不是等他点了「计算」才发现。
+        self._min_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
+        self._max_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
         # 初始为矩形：行政区域那两行收起，经纬度框可编辑 —— 与 Slice ≤15 一模一样
         self._apply_region_mode()
 
@@ -462,6 +483,9 @@ class DownloadPanel(QGroupBox):
             self._region_document = None
             self._region_error = ""
 
+        # 等级可能刚变（矩形 ↔ 行政区域、换了一个行政区）→ 建议行跟着变
+        self._refresh_zoom_policy_hint()
+
     def _load_selected_region(self) -> None:
         """加载当前选中的行政区边界，缓存几何并回填只读范围（Spec §16）。"""
         self._region_document = None
@@ -506,6 +530,57 @@ class DownloadPanel(QGroupBox):
         # 边界文件刚补上/刚换过 → 之前基于"边界不可用"下的结论（或更早的矩形
         # 结论）都已经不成立了，同样要作废重来。
         self.region_changed.emit()
+
+    # ------------------------------------------------------------------ #
+    # Zoom 建议（Slice 17，Spec §11）
+    # ------------------------------------------------------------------ #
+    def current_region_level(self) -> RegionLevel:
+        """当前区域对应的规划等级。
+
+        取自**预设**而不是已加载的区域对象：边界文件还没放好时，用户依然应该
+        看到"选中的是哪个区域、它建议多少 Zoom"。矩形模式没有预设 →
+        :attr:`RegionLevel.CUSTOM`（不套用等级规则）。
+        """
+        if self.current_region_type() is not RegionType.POLYGON:
+            return RegionLevel.CUSTOM
+        preset = self.selected_region_preset()
+        return preset.region_level if preset is not None else RegionLevel.CUSTOM
+
+    def current_zoom_recommendation(self) -> ZoomRecommendation:
+        """拿界面上的 Zoom 与当前等级比一比（只读，不改控件值）。"""
+        return self._zoom_strategy.evaluate(
+            self.current_region_level(),
+            self._min_zoom_spin.value(),
+            self._max_zoom_spin.value(),
+        )
+
+    @property
+    def zoom_policy_text(self) -> str:
+        """Zoom 建议行的当前文本（自定义等级时是空串）。"""
+        return self._zoom_hint_label.text()
+
+    @Slot()
+    def _refresh_zoom_policy_hint(self, *_args) -> None:
+        """刷新 Zoom 建议行（Spec §11）。
+
+        三条约束，都在这里体现：
+
+        1. **自定义等级不显示**：矩形 / CUSTOM 区域没有"行政等级建议"可言，
+           显示一行恒定的"全范围"只是噪音；
+        2. **只给建议，不改用户输入**：本方法只读 spin 的值，没有任何 ``setValue``；
+        3. **不阻塞**：超范围只是一句话，不弹窗、不禁用「计算」与「开始下载」。
+        """
+        policy = self._zoom_strategy.get_policy(self.current_region_level())
+        if policy.is_custom:
+            self._zoom_hint_title.setVisible(False)
+            self._zoom_hint_label.setVisible(False)
+            self._zoom_hint_label.set_text("")
+            return
+
+        recommendation = self.current_zoom_recommendation()
+        self._zoom_hint_title.setVisible(True)
+        self._zoom_hint_label.setVisible(True)
+        self._zoom_hint_label.set_text("\n".join(recommendation.as_lines()))
 
     def _build_output_form(self) -> None:
         self._output_edit = QLineEdit(str(DEFAULT_OUTPUT_DIR), self)
@@ -1028,6 +1103,16 @@ class DownloadPanel(QGroupBox):
     def area_group(self) -> QGroupBox:
         """暴露「下载范围」分组（Slice 16：几何断言用）。"""
         return self._area_group
+
+    @property
+    def zoom_hint_label(self) -> QLabel:
+        """暴露「Zoom 建议」标签（Slice 17：断言可见性与文案用）。"""
+        return self._zoom_hint_label
+
+    @property
+    def zoom_hint_title(self) -> QLabel:
+        """暴露「Zoom 建议」行标题（自定义等级时与标签一起隐藏）。"""
+        return self._zoom_hint_title
 
     @property
     def layer_plan_label(self) -> QLabel:

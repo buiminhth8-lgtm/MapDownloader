@@ -1,0 +1,331 @@
+"""Zoom 策略表（Slice 17，Spec §3 / §12）。
+
+这组用例守两件事：
+
+1. **四个等级的数值就是 Spec 写的那四个区间**，改一个数字必须有人改测试；
+2. **策略值与推荐文案只有一个来源**（``app/planning/``）。第 16 节那三条
+   静态守卫不是洁癖：一旦有人在 DownloadPanel 里写一句
+   ``if region_id == "china": return "Z4~10"``，策略就分家了 —— 而分家的代价
+   要等到"新增一个省级预设"时才显形，那时往往已经有三四处抄本。
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from app.config.settings import (
+    MAX_SUPPORTED_ZOOM,
+    MIN_SUPPORTED_ZOOM,
+    TILE_MATH_MAX_ZOOM,
+    TILE_MATH_MIN_ZOOM,
+)
+from app.planning import (
+    DEFAULT_ZOOM_POLICIES,
+    RegionLevel,
+    ZoomPolicy,
+    get_zoom_policy,
+    list_zoom_policies,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = REPO_ROOT / "app"
+PLANNING_DIR = APP_DIR / "planning"
+
+#: 允许出现"等级 → Zoom 区间"耦合的地方。
+#:
+#: ``app/geo/region.py`` 是**数据**（中国预设有等级）而不是**规则**：
+#: 它只说"中国是全国级"，从不说"全国该用到 Z10"。规则只在 app/planning 里。
+_LEVEL_LITERAL_ALLOWED = {
+    APP_DIR / "geo" / "region.py",
+}
+
+#: Spec §3 点名的四个层级（顺序即文档顺序）。
+_HIERARCHY_LEVELS = (
+    RegionLevel.COUNTRY,
+    RegionLevel.PROVINCE,
+    RegionLevel.CITY,
+    RegionLevel.MISSION,
+)
+
+
+def _python_sources(*, skip_planning: bool = False) -> list[Path]:
+    """``app/`` 下全部 .py（可选跳过规划层自己）。"""
+    files = sorted(APP_DIR.rglob("*.py"))
+    if skip_planning:
+        files = [item for item in files if PLANNING_DIR not in item.parents]
+    return files
+
+
+# --------------------------------------------------------------------------- #
+# RegionLevel
+# --------------------------------------------------------------------------- #
+def test_region_level_values_are_the_persisted_contract() -> None:
+    """``value`` 是契约（会出现在日志与将来的 Android 侧），改名等于打断下游。"""
+    assert {item.name: item.value for item in RegionLevel} == {
+        "COUNTRY": "country",
+        "PROVINCE": "province",
+        "CITY": "city",
+        "MISSION": "mission",
+        "CUSTOM": "custom",
+    }
+
+
+def test_region_level_display_names_are_present_and_unique() -> None:
+    names = [item.display_name for item in RegionLevel]
+    assert all(name.strip() for name in names)
+    assert len(set(names)) == len(names)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, RegionLevel.CUSTOM),
+        ("", RegionLevel.CUSTOM),
+        ("country", RegionLevel.COUNTRY),
+        ("COUNTRY", RegionLevel.COUNTRY),
+        ("  Province  ", RegionLevel.PROVINCE),
+        (RegionLevel.CITY, RegionLevel.CITY),
+        # 认不出来 → CUSTOM（读历史数据的宽容路径）
+        ("全国", RegionLevel.CUSTOM),
+        ("county", RegionLevel.CUSTOM),
+        (7, RegionLevel.CUSTOM),
+    ],
+)
+def test_parse_is_lenient_and_falls_back_to_custom(
+    value: object, expected: RegionLevel
+) -> None:
+    assert RegionLevel.parse(value) is expected
+
+
+def test_custom_is_the_only_level_without_hierarchy_rules() -> None:
+    assert RegionLevel.CUSTOM.is_custom is True
+    assert all(item.is_custom is False for item in _HIERARCHY_LEVELS)
+
+
+# --------------------------------------------------------------------------- #
+# 策略表本身
+# --------------------------------------------------------------------------- #
+def test_every_region_level_has_a_policy() -> None:
+    assert set(DEFAULT_ZOOM_POLICIES) == set(RegionLevel)
+
+
+@pytest.mark.parametrize(
+    ("level", "low", "high", "warning"),
+    [
+        (RegionLevel.COUNTRY, 4, 10, 10),
+        (RegionLevel.PROVINCE, 9, 13, 14),
+        (RegionLevel.CITY, 12, 16, 16),
+        (RegionLevel.MISSION, 15, 18, 18),
+    ],
+)
+def test_default_policy_numbers_match_the_spec(
+    level: RegionLevel, low: int, high: int, warning: int
+) -> None:
+    """Spec §3 的四个区间，逐个数钉死。"""
+    policy = get_zoom_policy(level)
+    assert policy.level is level
+    assert policy.recommended_min_zoom == low
+    assert policy.recommended_max_zoom == high
+    assert policy.warning_max_zoom == warning
+    assert policy.recommended_range_text == f"Z{low}~{high}"
+    assert policy.recommended_text == f"推荐 Zoom：Z{low}~{high}"
+
+
+def test_custom_policy_spans_the_supported_zoom_range() -> None:
+    """自定义等级：建议区间 = 界面允许的全范围，且**不对合法 Zoom 报警**。"""
+    policy = get_zoom_policy(RegionLevel.CUSTOM)
+    assert policy.recommended_min_zoom == MIN_SUPPORTED_ZOOM
+    assert policy.recommended_max_zoom == MAX_SUPPORTED_ZOOM
+    assert policy.is_custom is True
+    for zoom in range(TILE_MATH_MIN_ZOOM, TILE_MATH_MAX_ZOOM + 1):
+        assert policy.should_warn(zoom) is False, f"自定义等级不该对 Z{zoom} 报警"
+
+
+@pytest.mark.parametrize("policy", list_zoom_policies(), ids=lambda p: p.level.value)
+def test_policy_invariants(policy: ZoomPolicy) -> None:
+    """区间顺序自洽，且全部落在 Tile Math 支持范围内。"""
+    assert TILE_MATH_MIN_ZOOM <= policy.recommended_min_zoom
+    assert policy.recommended_min_zoom <= policy.recommended_max_zoom
+    assert policy.recommended_max_zoom <= policy.warning_max_zoom
+    assert policy.warning_max_zoom <= TILE_MATH_MAX_ZOOM
+    assert policy.description.strip()
+
+
+def test_recommended_ranges_overlap_between_neighbouring_levels() -> None:
+    """相邻层级**刻意**留重叠带（Spec §15 要在文档里解释的那件事）。
+
+    这条断言是给将来"顺手把区间改整齐"的人看的：全国 Z4~10 与省级 Z9~13
+    重叠 Z9~10 是有意的，省级与城市级重叠 Z12~13、城市级与任务区重叠 Z15~16
+    同理。把它们接成不重叠的阶梯会让"全国概览 + 重点省"无法用同一套级别拼。
+    """
+    ordered = [get_zoom_policy(item) for item in _HIERARCHY_LEVELS]
+    for lower, upper in zip(ordered, ordered[1:], strict=False):
+        assert lower.recommended_max_zoom >= upper.recommended_min_zoom, (
+            f"{lower.level.value} 与 {upper.level.value} 之间没有重叠："
+            f"{lower.recommended_range_text} / {upper.recommended_range_text}"
+        )
+
+
+def test_policy_descriptions_are_the_spec_sentences() -> None:
+    assert get_zoom_policy(RegionLevel.COUNTRY).description == (
+        "全国级地图建议用于大范围概览，高 Zoom 应按省、市或任务区域下载。"
+    )
+    assert get_zoom_policy(RegionLevel.PROVINCE).description == (
+        "省级地图适合省域浏览和城市定位。"
+    )
+    assert get_zoom_policy(RegionLevel.CITY).description == (
+        "城市级地图适合城市范围任务规划。"
+    )
+    assert get_zoom_policy(RegionLevel.MISSION).description == (
+        "任务区适合高精度 Zoom，仅建议用于有限作业区域。"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# get_zoom_policy：严格
+# --------------------------------------------------------------------------- #
+def test_get_zoom_policy_returns_the_registry_object() -> None:
+    """取到的是表里那**同一个**对象（不是副本）：策略是共享的不可变值。"""
+    assert get_zoom_policy(RegionLevel.COUNTRY) is DEFAULT_ZOOM_POLICIES[
+        RegionLevel.COUNTRY
+    ]
+
+
+@pytest.mark.parametrize("bad", ["country", "", None, 4, object()])
+def test_get_zoom_policy_rejects_anything_but_region_level(bad: object) -> None:
+    """策略服务这一侧**不宽容**：拼错的等级必须立刻炸，而不是悄悄变 CUSTOM。"""
+    with pytest.raises(ValueError, match="RegionLevel"):
+        get_zoom_policy(bad)
+
+
+def test_list_zoom_policies_follows_the_enum_declaration_order() -> None:
+    assert [item.level for item in list_zoom_policies()] == list(RegionLevel)
+
+
+# --------------------------------------------------------------------------- #
+# ZoomPolicy 自身的校验
+# --------------------------------------------------------------------------- #
+def _policy(**overrides: object) -> ZoomPolicy:
+    base: dict[str, object] = {
+        "level": RegionLevel.CITY,
+        "recommended_min_zoom": 12,
+        "recommended_max_zoom": 16,
+        "warning_max_zoom": 16,
+        "description": "城市级地图适合城市范围任务规划。",
+    }
+    base.update(overrides)
+    return ZoomPolicy(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"recommended_min_zoom": 17, "warning_max_zoom": 18}, "recommended_min_zoom"),
+        ({"warning_max_zoom": 15}, "warning_max_zoom"),
+        ({"description": "   "}, "description"),
+        ({"recommended_min_zoom": TILE_MATH_MAX_ZOOM + 1}, "zoom"),
+        ({"warning_max_zoom": TILE_MATH_MAX_ZOOM + 1}, "zoom"),
+        ({"level": "city"}, "RegionLevel"),
+    ],
+)
+def test_invalid_policy_is_rejected(overrides: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _policy(**overrides)
+
+
+def test_covers_only_accepts_ranges_inside_the_recommendation() -> None:
+    policy = get_zoom_policy(RegionLevel.PROVINCE)  # Z9~13，警告阈值 14
+    assert policy.covers(9, 13) is True
+    assert policy.covers(10, 12) is True
+    assert policy.covers(8, 13) is False  # 下界更低 → 超出
+    assert policy.covers(9, 14) is False  # 上界更高 → 超出
+    # Z14 是"超出建议但不警告"的过渡带：两件事必须分开
+    assert policy.covers(9, 14) is False
+    assert policy.should_warn(14) is False
+    assert policy.should_warn(15) is True
+
+
+def test_should_warn_ignores_the_low_end() -> None:
+    """低 Zoom 只是少下一点，没有要提醒的代价。"""
+    policy = get_zoom_policy(RegionLevel.CITY)  # Z12~16
+    assert policy.should_warn(1) is False
+    assert policy.should_warn(16) is False
+    assert policy.should_warn(17) is True
+
+
+# --------------------------------------------------------------------------- #
+# 单一权威来源（Spec §12）
+# --------------------------------------------------------------------------- #
+def test_zoom_policy_is_constructed_only_in_the_planning_layer() -> None:
+    """``ZoomPolicy(...)`` 只允许出现在规划层：策略表就是那一张。"""
+    offenders = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in _python_sources(skip_planning=True)
+        if "ZoomPolicy(" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], f"这些模块自己造了 ZoomPolicy：{offenders}"
+
+
+def test_hierarchy_levels_are_not_hardcoded_outside_the_planning_layer() -> None:
+    """``RegionLevel.COUNTRY`` 这类耦合只允许出现在规划层（+ 中国预设的数据定义）。
+
+    只查 COUNTRY / PROVINCE / CITY / MISSION：它们是**等级规则**的锚点。
+    ``RegionLevel.CUSTOM`` 是"没有规则"，界面拿它做分支是合理的。
+    """
+    pattern = re.compile(r"RegionLevel\s*\.\s*(COUNTRY|PROVINCE|CITY|MISSION)\b")
+    offenders = []
+    for path in _python_sources(skip_planning=True):
+        if path in _LEVEL_LITERAL_ALLOWED:
+            continue
+        if pattern.search(path.read_text(encoding="utf-8")):
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+    assert offenders == [], f"这些模块把等级写死了：{offenders}"
+
+
+def test_policy_descriptions_live_only_in_the_planning_layer() -> None:
+    """推荐文案不许抄进 UI / Downloader（Spec §6：文案不许散落）。"""
+    sentences = [item.description for item in list_zoom_policies()]
+    offenders: list[str] = []
+    for path in _python_sources(skip_planning=True):
+        text = path.read_text(encoding="utf-8")
+        for sentence in sentences:
+            if sentence in text:
+                offenders.append(f"{path.relative_to(REPO_ROOT).as_posix()} :: {sentence}")
+    assert offenders == [], f"这些模块抄了推荐文案：{offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# 导入顺序（子进程：in-process 已经被别的 import 污染，测不出循环）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import app.geo",
+        "import app.planning",
+        # 最容易踩的那条：先 geo 后 planning（geo.region 要在导入期拿 RegionLevel）
+        "import app.geo; import app.planning",
+        "import app.services",
+        "import app.package",
+    ],
+)
+def test_import_order_never_hits_a_partial_module(statement: str) -> None:
+    """``app.geo.region`` ↔ ``app.planning`` 之间只有一条依赖边，不能成环。
+
+    真跑子进程而不是 ``importlib.reload``：只有全新解释器才能保证"第一次导入
+    是从哪一侧发起的"这个前提，而循环导入恰恰只在特定顺序下才会暴露。
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", statement],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, (
+        f"`{statement}` 失败：\n{completed.stdout}\n{completed.stderr}"
+    )

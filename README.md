@@ -20,6 +20,7 @@
 - [安装](#安装)
 - [用法：下载地图](#用法下载地图)
 - [用法：按行政区域下载（GeoJSON 多边形）](docs/polygon_region_download.md) —— Slice 16
+- [Zoom 策略：分级推荐区间](docs/zoom_strategy.md) —— Slice 17
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -121,13 +122,15 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 16：GeoJSON 区域下载与中国行政区域预设（把"下哪一块地"从**矩形**扩展到
-**任意多边形**：外包矩形只用来缩小搜索面，真正要下的是"与区域几何相交"的那些瓦片；
-内置「中国」预设，但**不内置国界数据** —— 法定地图内容必须用带审图号的授权 GeoJSON）
+Slice 17：分级 Zoom 策略（把"该下到多少级"从散落的经验值收敛成**一张策略表**：
+全国级 Z4~10 / 省级 Z9~13 / 城市级 Z12~16 / 任务区 Z15~18；选中中国预设时界面给出
+推荐区间，超出只给**非阻塞警告**，绝不动你设置的 Zoom。只做策略核心 + 测试 + 最小
+提示，不实现省市数据、分层下载计划与 Mission 航线）
 
-上一个 Slice（Windows 侧）：Slice 10 —— ADB 设备管理与离线地图包传输（发现设备 →
-看设备信息 → 选设备 → 校验本地包 → 建远端目录 → push `map.mbtiles` + `manifest.json`
-→ 进度 → 远端校验，为 Slice 11 的端侧导入铺路）
+上一个 Slice（Windows 侧）：Slice 16 —— GeoJSON 区域下载与中国行政区域预设（把
+"下哪一块地"从**矩形**扩展到**任意多边形**：外包矩形只用来缩小搜索面，真正要下的是
+"与区域几何相交"的那些瓦片；内置「中国」预设，但**不内置国界数据** —— 法定地图内容
+必须用带审图号的授权 GeoJSON）
 
 完整链路：
 
@@ -223,6 +226,48 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 17：分级 Zoom 策略
+
+Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
+
+在此之前，Zoom 只是两个输入框（默认 8~17），选中国还是选一个作业区用的是同一套数字。
+但"全国 + Z18"和"作业区 + Z18"根本不是一件事：同一块 0.5° 见方的地，Z4~10 是
+**17 张 / 510 KB**，Z12~18 是 **100,981 张 / 2.89 GB** —— 差三个数量级，而这还只是
+一块巴掌大的地方。规则散在界面里，用户就只能靠猜。
+
+策略表（唯一权威来源：`app/planning/zoom_policy.py`）：
+
+| 等级 | 推荐 Zoom | 警告阈值 | 场景 |
+| --- | --- | --- | --- |
+| 全国级 `COUNTRY` | **Z4 ~ Z10** | > Z10 | 大范围概览 |
+| 省级 `PROVINCE` | **Z9 ~ Z13** | > Z14 | 省域浏览、城市定位 |
+| 城市级 `CITY` | **Z12 ~ Z16** | > Z16 | 城市范围任务规划 |
+| 任务区 `MISSION` | **Z15 ~ Z18** | > Z18 | 高精度作业区 |
+| 自定义 `CUSTOM` | 全支持范围 | 不警告 | 自定义矩形 / 老任务 |
+
+三条设计要点：
+
+- **只是推荐，绝不改写你的输入。** 选中国、设成 Z8~18，界面上会出现一句非阻塞的
+  `警告：超出全国级推荐范围（当前 Z8~18），建议使用 Z4~10。…`，然后**照样按 8~18
+  算、照样按 8~18 下**。偷偷替你改成 4~10 的后果比多下 2.89 GB 更糟：你会以为程序
+  漏下了 9 万张。（`ZoomStrategyService` 里干脆没有 `clamp()` / `enforce()` 这类方法。）
+- **相邻层级刻意重叠**（全国 Z10 与省级 Z9 交叠）。真实边界不会落在瓦片级别上，
+  重叠让"全国概览 + 几个重点省"能用同一套级别拼起来而不出现糊一层清一层。
+- **等级不落盘。** `tasks.json` 与 manifest 里都没有 `region_level`，它由 `region_id`
+  反查预设得到；老 Region / 老任务没有这个字段，一律读作 `CUSTOM`（不套用任何行政
+  等级规则），行为与 Slice ≤16 逐位一致。
+
+界面只做了最小接入：选中中国预设时显示「推荐 Zoom：Z4~10」，Zoom 一改就刷新，
+自定义等级时整行收起。**界面里没有任何 Zoom 区间常量，也没有一句推荐文案的副本**
+（三条静态守卫盯着这件事：`ZoomPolicy(` 只能在规划层构造、四个等级不许在别处写死、
+推荐文案不许被抄走）。
+
+容量预估走的是 Slice 16 那条**真实**链路（`RegionTileEstimator`，多边形逐张判相交），
+策略层只负责把推荐区间递进去，不重新实现一遍多边形统计。
+
+详见 [docs/zoom_strategy.md](docs/zoom_strategy.md)。实机验收：
+`python scripts/verify_slice17_zoom.py`（51 项检查，截图落 `docs/slice17_zoom_*.png`）。
 
 ## Slice 16：GeoJSON 区域下载与中国行政区域预设
 
@@ -764,7 +809,7 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 1299 passed
+python -m pytest                # 1579 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
@@ -774,6 +819,8 @@ python -m pytest tests/test_checksum.py tests/test_package_builder.py \
 python -m pytest tests/test_adb_client.py tests/test_device_manager.py \
                  tests/test_map_package_transfer.py tests/test_android_transfer_service.py -q
                     # 只跑 Slice 10 传输链路（顺序 / 取消 / 覆盖 / 路径安全 / 不重复哈希）
+python -m pytest tests/test_zoom_policy.py tests/test_zoom_strategy.py -q
+                    # 只跑 Slice 17 Zoom 策略（数值 / 自洽 / 只提醒不改写 / 复用预估）
 ```
 
 与续传 / 合成 / GUI 交互相关的用例分散在这些文件里：
@@ -802,6 +849,14 @@ python -m pytest tests/test_adb_client.py tests/test_device_manager.py \
 | `tests/test_device_manager.py` | **Slice 10** 真实 `adb devices -l` 输出解析、未授权 / 离线都显示、单个 `getprop` 失败不影响整台设备、没 adb 时不炸 |
 | `tests/test_map_package_transfer.py` | **Slice 10** 顺序（mkdir < push(.part) < mv < push(manifest)）、`.part` 一定被清掉、取消只删自己的文件、覆盖前先问、远端大小 / SHA256 不一致要 FAIL、设备不支持 sha256 只是 WARNING、危险 id 拼不进路径 |
 | `tests/test_android_transfer_service.py` | **Slice 10** 编排层：刚校验过就不再重复哈希、目录一变缓存立刻作废、所有方法都不抛异常、adb 不存在 / 设备未授权都给出人话 |
+| `tests/test_geojson_loader.py` | **Slice 16** GeoJSON 四种顶层形态、坏数据逐类报错、自交几何只能显式修复、跨 180° 拒绝、UTF-8 要求 |
+| `tests/test_tile_region_filter.py` | **Slice 16** `prepared + intersects`：压边瓦片必须命中、只碰一个角也算、洞要真被挖掉、prepared 只构造一次、空几何拒绝 |
+| `tests/test_region_estimator.py` | **Slice 16** 候选 / 区域内 / 过滤三级统计、矩形 selected==candidate、逐 zoom 求和自洽、容量与请求量取自 selected |
+| `tests/test_polygon_download.py` | **Slice 16** 端到端下载：候选 100 / 命中 60 → 库里 60；区域外的瓦片**一次请求都不发**；被裁掉的不进 failed/skipped |
+| `tests/test_polygon_resume.py` | **Slice 16** 续传：只跳过区域内已有的那 40 张、tasks.json 里不出现几何、边界文件没了就拒绝续传、老任务读作矩形 |
+| `tests/test_polygon_inspection.py` | **Slice 16** Inspector：多边形按几何算期望值；边界不可用标 UNKNOWN + WARNING，**不许**按外包矩形误报"缺失 N 张" |
+| `tests/test_zoom_policy.py` | **Slice 17** 四级区间逐个数钉死、策略自洽与重叠带、CUSTOM 不警告、单一来源三条静态守卫、`app.geo` ↔ `app.planning` 导入顺序（子进程） |
+| `tests/test_zoom_strategy.py` | **Slice 17** 推荐 / 评估（超范围只 warning、**不改写**用户 Zoom）、非法输入逐条拒绝、`recommend_with_estimate` 与直接调 `RegionTileEstimator` 逐字段一致 |
 
 `tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
 （`test_dismissing_complete_dialog_then_closing_window_is_safe` /
@@ -834,6 +889,20 @@ python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
 `--with-tasks` 会预置几条不同状态的任务记录，用于留档 Slice 5 的「下载任务」面板
 （见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
+
+Slice 17 的「Zoom 建议」行同样有实机留档 —— 那一行是**新增控件**，最容易被挤扁：
+
+```bash
+python scripts/verify_slice17_zoom.py              # 真 windows 插件 + 真窗口 + 真按钮 + 51 项检查
+python scripts/verify_slice17_zoom.py --offscreen  # 无显示环境（CI）
+python scripts/verify_slice17_zoom.py --no-shots   # 只跑检查，不截图
+```
+
+截图落在 `docs/slice17_zoom_rectangle_baseline.png`（自定义矩形：整行收起）、
+`docs/slice17_zoom_recommended.png`（中国 + Z4~10：只有推荐与当前）、
+`docs/slice17_zoom_warning.png`（中国 + Z8~18：警告出现，而 Zoom 仍是你设的 8~18）。
+脚本最后一段还会**真的跑一次多边形下载**（MockTransport 供瓦片，不触网），
+断言"库里张数 == 区域内张数"，证明策略层没有碰坏 Slice 16 的下载链路。
 
 Slice 10 的设备区与三个弹窗同样有可重复的实机留档：
 

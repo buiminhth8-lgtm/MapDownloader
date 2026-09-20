@@ -3480,3 +3480,112 @@ def test_polygon_without_boundary_reports_where_to_put_the_file(
     assert panel.current_region_error()
     # 对话框里也要有同一句话（用户可能只看弹窗）
     assert calls and "china.geojson" in calls[0][1]
+
+
+# --------------------------------------------------------------------------- #
+# Slice 17：Zoom 建议行（Spec §11）
+#
+# 这一组的重点是那句**非阻塞**提醒：超范围要被看见，但缩放级别本身
+# 一个字符都不许被改（Spec §10 / §16）。所以每条"看到警告"的用例都配一条
+# "用户输入没被改"的断言 —— 只测前者，把 `set_zoom_range(4, 10)` 写进提示逻辑
+# 里也能全绿。
+# --------------------------------------------------------------------------- #
+def test_zoom_hint_is_hidden_for_a_custom_rectangle(window: MainWindow) -> None:
+    """自定义矩形没有行政等级可言 → 整行收起，不是显示一句空话。"""
+    panel = window.download_panel
+    assert panel.current_region_level().value == "custom"
+    assert panel.zoom_hint_title.isHidden() is True
+    assert panel.zoom_hint_label.isHidden() is True
+    assert panel.zoom_policy_text == ""
+
+
+def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
+    """选中中国 Preset → 第一行就是「推荐 Zoom：Z4~10」。
+
+    注意这里**不需要**边界文件就位：等级来自预设，用户应该能看到"选中的是哪个
+    区域、它建议多少 Zoom"，而不是等他把文件放好了才知道。
+    """
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+
+    assert panel.current_region_level().value == "country"
+    assert panel.zoom_hint_label.isHidden() is False
+    assert panel.zoom_policy_text.splitlines()[0] == "推荐 Zoom：Z4~10"
+
+
+def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> None:
+    """Z8~18（Spec §10 的例子）：给警告，且**不改**用户的 8 与 18。"""
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_zoom_range(8, 18)
+
+    text = panel.zoom_policy_text
+    assert "推荐 Zoom：Z4~10" in text
+    assert "当前 Zoom：Z8~18" in text
+    assert "警告：" in text and "超出全国级推荐范围" in text
+
+    form = panel.get_form_data()
+    assert (form["min_zoom"], form["max_zoom"]) == (8, 18)
+    assert (panel._min_zoom_spin.value(), panel._max_zoom_spin.value()) == (8, 18)
+
+
+def test_zoom_hint_is_quiet_inside_the_recommendation(window: MainWindow) -> None:
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_zoom_range(4, 10)
+
+    assert panel.zoom_policy_text.splitlines() == [
+        "推荐 Zoom：Z4~10",
+        "当前 Zoom：Z4~10",
+    ]
+
+
+def test_zoom_hint_follows_the_region_switch(window: MainWindow) -> None:
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+    assert panel.zoom_hint_label.isHidden() is False
+
+    panel.set_region_type(RegionType.RECTANGLE)
+    assert panel.zoom_hint_label.isHidden() is True
+    assert panel.zoom_hint_title.isHidden() is True
+    assert panel.zoom_policy_text == ""
+
+
+def test_zoom_warning_does_not_block_calculation(
+    window: MainWindow, error_dialogs: list[tuple[str, str]]
+) -> None:
+    """警告不阻塞：点「计算」照样走原流程，缩放级别与提示行都原样留着。"""
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_zoom_range(8, 18)
+
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    # 这次计算确实失败了，但失败原因是**边界文件**，不是"Zoom 超范围"
+    assert "计算失败" in panel.result_label.text()
+    assert "Zoom" not in panel.result_label.text().split("计算失败")[1]
+    assert error_dialogs and "china.geojson" in error_dialogs[0][1]
+    # 提示行还在（没有被计算流程清掉），Zoom 也没被改
+    assert "警告：" in panel.zoom_policy_text
+    assert (panel._min_zoom_spin.value(), panel._max_zoom_spin.value()) == (8, 18)
+
+
+def test_zoom_hint_row_does_not_overlap_the_zoom_inputs(
+    window: MainWindow, qapp
+) -> None:
+    """布局断言走几何量，不看截图（Spec §11 只加了一行，不能挤到别人的位置）。
+
+    截图缩图 + 抗锯齿会把"两行贴在一起"看得很正常；``geometry()`` 不会。
+    """
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+    window.show()  # 让 isVisible / geometry 有意义（offscreen 下默认不显示）
+    for _ in range(4):
+        qapp.processEvents()
+
+    hint = panel.zoom_hint_label
+    assert hint.isVisible() is True
+    for spin in (panel._min_zoom_spin, panel._max_zoom_spin):
+        assert not hint.geometry().intersects(spin.geometry())
+    assert panel.area_group.contentsRect().contains(hint.geometry())
+

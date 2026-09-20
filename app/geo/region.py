@@ -26,6 +26,14 @@ UI 的预估、进度条分母、大任务提示都必须用 selected —— 用
 - :meth:`RegionPreset.require_available` 在缺失时抛 :class:`RegionBoundaryMissing`，
   文案里直接给出应放的位置与授权要求；
 - 绝不在缺文件时退化成矩形下载 —— 那会静默下一大片境外瓦片。
+
+规划等级（Slice 17）
+--------------------
+
+每个区域还带一个 :attr:`~app.planning.RegionLevel`（全国 / 省 / 市 / 任务区 /
+自定义），用来查 Zoom 建议。它**不进 tasks.json、不进 manifest**：从
+``region_id`` 反查预设就能得到，多存一份只会多一处不同步的地方。老数据没有这个
+字段，一律落到 ``CUSTOM``，行为与 Slice ≤16 完全一致。
 """
 
 from __future__ import annotations
@@ -49,6 +57,10 @@ from app.geo.geojson_loader import (
     geometry_to_bounds,
     load_geojson_document,
 )
+# 唯一一处「geo → planning」的依赖：区域模型要挂一个规划等级（Slice 17，Spec §7）。
+# region_level 是零依赖模块（纯 enum），因此这条边不构成循环 —— 详见
+# app/planning/zoom_strategy.py 的模块文档。
+from app.planning.region_level import RegionLevel
 
 __all__ = [
     "RegionType",
@@ -142,6 +154,11 @@ class RegionPreset:
         default_boundary_version: 边界数据版本。``None`` 表示"以 GeoJSON 里
             ``properties.boundaryVersion`` 为准"——数据自带版本时不该在代码里
             再抄一份，那两者迟早不一致。
+        region_type: 几何类型（矩形 / 多边形）。
+        region_level: 规划等级（Slice 17，Spec §7）。全国 / 省 / 市 / 任务区
+            决定 Zoom 建议，见 :data:`~app.planning.DEFAULT_ZOOM_POLICIES`。
+            缺省是 :attr:`~app.planning.RegionLevel.CUSTOM`：**不写就是自定义**，
+            这样既有的第三方预设（或测试里的临时预设）保持原行为不变。
     """
 
     region_id: str
@@ -149,12 +166,15 @@ class RegionPreset:
     geojson_filename: str = CHINA_REGION_FILENAME
     default_boundary_version: str | None = None
     region_type: RegionType = RegionType.POLYGON
+    region_level: RegionLevel = RegionLevel.CUSTOM
 
     def __post_init__(self) -> None:
         if "/" in self.geojson_filename or "\\" in self.geojson_filename:
             raise ValueError(
                 f"geojson_filename 只能是文件名，不允许带路径，实际为 {self.geojson_filename!r}"
             )
+        # 宽容解析：预设可以写成字符串（"country"），便于从配置文件读入。
+        object.__setattr__(self, "region_level", RegionLevel.parse(self.region_level))
 
     @property
     def geojson_path(self) -> Path:
@@ -203,10 +223,15 @@ class RegionPreset:
 
 
 #: 内置预设：中国（Spec §14 点名的那一条）。
+#:
+#: ``region_level=COUNTRY``（Slice 17，Spec §8）：选到它时界面会提示
+#: 「推荐 Zoom：Z4~10」，用户仍可设置更高的 Zoom，只是会看到一句非阻塞的代价提醒。
+#: 本 Slice **不**增加省 / 市数据（Spec §8 / §16 禁止事项）。
 CHINA_REGION_PRESET = RegionPreset(
     region_id="china",
     name=CHINA_REGION_NAME,
     geojson_filename=CHINA_REGION_FILENAME,
+    region_level=RegionLevel.COUNTRY,
 )
 
 #: 全部内置预设，顺序即 UI 下拉框顺序。
@@ -249,6 +274,11 @@ class DownloadRegion:
         region_id: 行政区标识（``china``）；自定义矩形为 ``None``。
         boundary_version: 边界数据版本（可追溯"这批瓦片是按哪版边界裁的"）。
         geojson_path: 边界文件路径（字符串，便于写进任务记录）。
+        region_level: 规划等级（Slice 17，Spec §7）。缺省
+            :attr:`~app.planning.RegionLevel.CUSTOM` —— 老任务记录、老 manifest
+            与自定义矩形都落在这里，因此它们的行为与 Slice ≤16 逐位一致。
+            **不写进 tasks.json / manifest**：它由 ``region_id`` 反查预设即可得到
+            （见 :func:`region_from_task`），多存一份就多一处会不同步的地方。
 
     Raises:
         ValueError: 名称为空；或多边形模式缺 :attr:`geojson_path`
@@ -261,6 +291,7 @@ class DownloadRegion:
     region_id: str | None = None
     boundary_version: str | None = None
     geojson_path: str | None = None
+    region_level: RegionLevel = RegionLevel.CUSTOM
 
     def __post_init__(self) -> None:
         region_type = RegionType.parse(self.region_type)
@@ -268,6 +299,7 @@ class DownloadRegion:
         object.__setattr__(self, "name", str(self.name).strip())
         if not self.name:
             raise ValueError("DownloadRegion.name 不能为空")
+        object.__setattr__(self, "region_level", RegionLevel.parse(self.region_level))
 
         path = (self.geojson_path or "").strip()
         if region_type is RegionType.POLYGON and not path:
@@ -323,6 +355,7 @@ class DownloadRegion:
             region_id=preset.region_id,
             boundary_version=version or None,
             geojson_path=str(preset.geojson_path),
+            region_level=preset.region_level,
         )
 
     # ------------------------------------------------------------------ #
@@ -436,6 +469,8 @@ def region_from_task(task: object) -> DownloadRegion | None:
         region_id=preset.region_id,
         boundary_version=version or preset.boundary_version or None,
         geojson_path=str(preset.geojson_path),
+        # 等级不落盘，续传时按 region_id 回到预设取回来（Spec §7）
+        region_level=preset.region_level,
     )
 
 
@@ -477,6 +512,8 @@ def region_from_metadata(
             or preset.boundary_version
             or None,
             geojson_path=str(preset.geojson_path),
+            # 等级从预设取：老包里没有等级字段时也能拿到正确建议（Spec §7）
+            region_level=preset.region_level,
         ),
         "",
     )
