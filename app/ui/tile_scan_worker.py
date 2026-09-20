@@ -30,7 +30,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.services import count_existing_tiles
+from app.geo import DownloadRegion, RegionType
+from app.services import count_existing_region_tiles, count_existing_tiles
 
 __all__ = ["ExistingTileScan", "ExistingTileScanWorker"]
 
@@ -43,9 +44,11 @@ class ExistingTileScan:
         output_path: 被扫描的 ``.mbtiles`` 路径。
         exists: 扫描时文件是否存在。
         tiles: 该文件在目标 zoom 区间里的瓦片数（不存在时为 0）。
+            行政区域任务下是**区域内**的张数（Spec §12）。
         zooms: 参与统计的缩放级别，用于日志与断言。
         error: 扫描本身失败的原因；``None`` 表示没出问题。
             注意"文件不存在"**不算**错误（那是正常情况：全新下载）。
+        in_region_only: 本次统计是否只算了区域内的瓦片。
     """
 
     output_path: Path
@@ -53,6 +56,7 @@ class ExistingTileScan:
     tiles: int = 0
     zooms: tuple[int, ...] = ()
     error: str | None = None
+    in_region_only: bool = False
 
 
 class ExistingTileScanWorker(QThread):
@@ -66,16 +70,23 @@ class ExistingTileScanWorker(QThread):
         output_path: str | Path,
         zooms: list[int] | tuple[int, ...],
         parent: QObject | None = None,
+        *,
+        region: DownloadRegion | None = None,
     ) -> None:
         """
         Args:
             output_path: 目标 ``.mbtiles``；不存在也没关系。
             zooms: 要统计的缩放级别（通常即任务的 zoom 区间）。
             parent: Qt 父对象。
+            region: 下载区域（Slice 16）。传多边形区域时**只数区域内的瓦片**
+                —— 文件里混着区域外的瓦片（例如它的前身是个矩形任务）时，
+                全量计数会让"已有"偏大、"还要下"偏小，用户面对的是一个
+                永远补不平的缺口（Spec §12）。
         """
         super().__init__(parent)
         self._output_path = Path(output_path)
         self._zooms = tuple(sorted({int(zoom) for zoom in zooms}))
+        self._region = region
         #: 用户放弃本次下载时置位：结果照常发出去，但带上"已被放弃"的标记
         self._abandoned = False
 
@@ -91,6 +102,16 @@ class ExistingTileScanWorker(QThread):
     def zooms(self) -> tuple[int, ...]:
         """参与统计的缩放级别。"""
         return self._zooms
+
+    @property
+    def region(self) -> DownloadRegion | None:
+        """本次统计限定的区域；``None`` 表示全量统计。"""
+        return self._region
+
+    @property
+    def in_region_only(self) -> bool:
+        """是否只统计区域内的瓦片。"""
+        return self._region is not None and self._region.region_type is RegionType.POLYGON
 
     @property
     def abandoned(self) -> bool:
@@ -117,10 +138,16 @@ class ExistingTileScanWorker(QThread):
         exists = False
         tiles = 0
         error: str | None = None
+        in_region_only = self.in_region_only
         try:
             exists = self._output_path.is_file()
             if exists:
-                tiles = count_existing_tiles(self._output_path, self._zooms)
+                if in_region_only:
+                    tiles = count_existing_region_tiles(
+                        self._output_path, self._zooms, self._region
+                    )
+                else:
+                    tiles = count_existing_tiles(self._output_path, self._zooms)
         except Exception as exc:  # noqa: BLE001 - 绝不让异常冒泡进 Qt 事件循环
             # 扫描失败不该阻断下载：调用方会拿到 tiles=0，效果等于"当作没有已有
             # 瓦片"，最多多下几张（写库是 INSERT OR REPLACE，重复写是安全的）。
@@ -132,5 +159,6 @@ class ExistingTileScanWorker(QThread):
                 tiles=tiles,
                 zooms=self._zooms,
                 error=error,
+                in_region_only=in_region_only,
             )
         )

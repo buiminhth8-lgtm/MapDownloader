@@ -29,6 +29,7 @@ from app.config import settings
 from app.downloader import RateLimiter, RetryPolicy
 from app.geo import (
     GeoBounds,
+    RegionType,
     calculate_tile_ranges,
     estimate_size_bytes,
     estimate_tile_count,
@@ -360,6 +361,9 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
         "max_zoom",
         "output_dir",
         "map_name",
+        # Slice 16：区域类型（矩形 / 行政区域）与据此构造的下载区域
+        "region_type",
+        "region",
     }
     assert data["token"] == ""
     # Slice 6 起下拉框放的是"地图类型"（矢量 / 影像），底图图层由它派生
@@ -371,6 +375,13 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
     assert data["map_name"] == settings.DEFAULT_MAP_NAME
     assert data["west"] < data["east"]
     assert data["south"] < data["north"]
+    # 默认是矩形：行为与 Slice ≤15 完全一致
+    assert data["region_type"] is RegionType.RECTANGLE
+    assert data["region"] is not None
+    assert data["region"].region_type is RegionType.RECTANGLE
+    assert data["region"].bounds == GeoBounds(
+        west=data["west"], south=data["south"], east=data["east"], north=data["north"]
+    )
 
 
 def test_form_data_reflects_edits(window: MainWindow) -> None:
@@ -3382,3 +3393,90 @@ def test_package_dialog_has_no_qt_main_thread_sql_and_uses_workers() -> None:
     assert "progress_changed" in source
     assert "package_completed" in source
     assert "validation_completed" in source
+
+
+# --------------------------------------------------------------------------- #
+# Slice 16：切换下载区域必须作废上一次的预估结论
+#
+# 这一组用例针对的是一类**在 offscreen 下也能稳定复现、但没人写就永远发现不了**
+# 的缺陷：一次「计算」的结果属于当时那个区域，可界面并不会自动把它作废。
+# 后果有两条，都属于 Spec §16/§32 明令禁止的"静默退回矩形"：
+#
+# 1. 从「自定义矩形」切到「行政区域」而边界文件不可用时，结果区里那句
+#    "预计 56 张"还在 —— 看起来就是"行政区域也算出了 56 张"；
+# 2. 接着只要动一下输出目录（`output_config_changed`）或勾一下注记
+#    （`layer_plan_changed`），`_refresh_output_preview` 就会用**缓存里的旧结论**
+#    把"计算失败"的提示盖回去，用户以为算成功了。
+# --------------------------------------------------------------------------- #
+def _rect_estimate_text(window: MainWindow) -> str:
+    """点一次「计算」并返回结果区文本（默认是矩形模式）。"""
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    return window.download_panel.result_label.text()
+
+
+def test_switching_region_type_invalidates_the_previous_estimate(
+    window: MainWindow,
+) -> None:
+    panel = window.download_panel
+    assert panel.current_region_type() is RegionType.RECTANGLE
+
+    first = _rect_estimate_text(window)
+    assert "预计瓦片：" in first
+    assert window._last_calculation is not None
+    tiles_text = window._status_values["tile_total"].text()
+    assert tiles_text != "0"
+
+    # --- 切到「行政区域」：旧的矩形结论必须立刻消失 ---
+    panel.set_region_type(RegionType.POLYGON)
+
+    assert window._last_calculation is None, "旧的预估结论必须被作废"
+    assert "预计瓦片" not in panel.result_label.text()
+    assert window._status_values["tile_total"].text() == "0"
+    assert "已作废" in window.log_panel.to_text()
+
+
+def test_output_edit_cannot_resurrect_a_stale_estimate(
+    window: MainWindow, monkeypatch
+) -> None:
+    """改输出目录 / 勾注记触发的那次重绘，不许把旧结论（或错误提示）盖回来。"""
+    monkeypatch.setattr(window, "_show_error_dialog", lambda *a, **k: None)
+    panel = window.download_panel
+    _rect_estimate_text(window)
+    stale_tiles = window._status_values["tile_total"].text()
+
+    panel.set_region_type(RegionType.POLYGON)
+    # 用户在行政区域模式下点「计算」但边界文件不可用 → 结果区是人话错误
+    panel.action_buttons[ACTION_CALCULATE].click()
+    assert "计算失败" in panel.result_label.text()
+
+    # 现在动一下输出目录（真实用户每天都会做的事）
+    panel.set_output_dir(Path(panel.get_form_data()["output_dir"]) / "sub")
+    panel.output_config_changed.emit()
+
+    text = panel.result_label.text()
+    assert "预计瓦片" not in text, "旧结论不许复活"
+    assert stale_tiles not in text, f"{stale_tiles} 是矩形算出来的，不该留在行政区域模式下"
+
+
+def test_polygon_without_boundary_reports_where_to_put_the_file(
+    window: MainWindow, monkeypatch
+) -> None:
+    """边界文件缺失是**明确失败**：说清放哪，绝不退化成矩形。"""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window, "_show_error_dialog", lambda title, message: calls.append((title, message))
+    )
+    panel = window.download_panel
+    panel.set_region_type(RegionType.POLYGON)
+
+    panel.action_buttons[ACTION_CALCULATE].click()
+
+    text = panel.result_label.text()
+    assert "计算失败" in text
+    assert "china.geojson" in text, "要告诉用户该把文件叫什么名字"
+    assert "行政区域不可用" in text
+    # 边界不可用时 `current_region()` 必须是 None —— 上层据此拒绝开工
+    assert panel.current_region() is None
+    assert panel.current_region_error()
+    # 对话框里也要有同一句话（用户可能只看弹窗）
+    assert calls and "china.geojson" in calls[0][1]

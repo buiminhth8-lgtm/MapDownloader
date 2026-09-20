@@ -1,0 +1,5 @@
+{
+  "type": "Feature",
+  "properties": { "name": "只有一个点" },
+  "geometry": { "type": "Point", "coordinates": [116.5, 39.5] }
+}

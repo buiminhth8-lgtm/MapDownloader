@@ -49,6 +49,9 @@ __all__ = [
     "TileRange",
     "lon_to_tile_x",
     "lat_to_tile_y",
+    "tile_x_to_lon",
+    "tile_y_to_lat",
+    "tile_bounds",
     "calculate_tile_range",
     "calculate_tile_ranges",
     "estimate_tile_count",
@@ -136,6 +139,40 @@ def _clamp(value: int, low: int, high: int) -> int:
     return min(max(value, low), high)
 
 
+#: 正变换的"整数吸附"窗口，单位是**格**（不是度）。
+#:
+#: 见 :func:`_snap_to_integer` 的说明。取 1e-6 格，依据是实测：
+#:
+#: - 最坏的正反变换复合误差出现在 **z22 的极区行**（``y=11``，纬度 85.05°）——
+#:   那里 ``d(行号)/d(纬度)`` 高达约 1.3e5 行/度，纬度上 1.9e-14 度的表示误差
+#:   就会被放大成 **2.8e-9 行**（实测 2.79e-9）。1e-9 挡不住它，会漏掉整整一行。
+#:   1e-6 相对这个上界还有 350 倍余量。
+#: - 同时它远小于任何有意义的坐标分辨率：z22 下 1e-6 行 ≈ 7.5e-9 度，
+#:   比"数据保留 6 位小数"（≈ 1e-6 度）小两个数量级以上。
+#:
+#: 一句话：这个窗口只用来吸收浮点噪声，不可能吃掉真实坐标差。
+_TILE_INDEX_EPSILON = 1e-6
+
+
+def _snap_to_integer(value: float) -> float:
+    """把因浮点误差而"差一点点"的整数值吸附回去。
+
+    正变换（经纬度 → 瓦片号）与反变换（:func:`tile_y_to_lat` /
+    :func:`tile_x_to_lon`）是互逆的一对公式，但分两次计算会累积约 1e-16 的
+    相对误差。当输入**正好**落在瓦片边界上时（行政区边界数据里很常见——数据源
+    常把坐标四舍五入到 6 位小数），正向算出的值会是 ``3.9999999999999996``
+    这种形态，``int()`` 截断后整张瓦片偏移一格。
+
+    这不是吹毛求疵：外包围盒多算/少算一整行，"预期瓦片数"就跟着偏，而它是
+    覆盖度、进度分母、大任务阈值共同依赖的基准 —— 一处偏了处处对不上，
+    且看起来像"产品算错了"。
+    """
+    rounded = round(value)
+    if abs(value - rounded) < _TILE_INDEX_EPSILON:
+        return float(rounded)
+    return value
+
+
 def validate_tile_axis(name: str, value: int, zoom: int) -> int:
     """校验瓦片的某个轴编号落在 ``[0, 2**zoom - 1]``，返回规范化后的 int。
 
@@ -197,7 +234,7 @@ def lon_to_tile_x(lon: float, zoom: int) -> int:
             f"lon 必须在 [{MIN_LONGITUDE}, {MAX_LONGITUDE}] 度之间，实际为 {longitude}"
         )
 
-    x = int((longitude + 180.0) / 360.0 * tiles)
+    x = int(_snap_to_integer((longitude + 180.0) / 360.0 * tiles))
     # lon=180 会算出 x=n，钳到 n-1；浮点误差产生的 -1 同理钳回 0
     return _clamp(x, 0, tiles - 1)
 
@@ -223,8 +260,135 @@ def lat_to_tile_y(lat: float, zoom: int) -> int:
     latitude = max(-WEB_MERCATOR_MAX_LAT, min(WEB_MERCATOR_MAX_LAT, latitude))
 
     lat_rad = math.radians(latitude)
-    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * tiles)
+    raw = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * tiles
+    y = int(_snap_to_integer(raw))
     return _clamp(y, 0, tiles - 1)
+
+
+# --------------------------------------------------------------------------- #
+# XYZ 瓦片 -> 经纬度（反向换算）
+# --------------------------------------------------------------------------- #
+#: 瓦片轴编号允许的上界类型：``0 <= v <= 2**zoom``。
+#:
+#: 与 :func:`validate_tile_axis` 的 ``[0, 2**zoom)`` **故意不同**：那里校验的是
+#: "存不存在这张瓦片"，而这里算的是**边界**。``x == 2**zoom`` 是最后一张瓦片的
+#: 东边界（经度 180），``y == 2**zoom`` 是最下一张瓦片的南边界 —— 它们不是合法
+#: 瓦片编号，但是合法的边界值，缺了它们 :func:`tile_bounds` 就取不到 east / south。
+def _check_tile_edge(name: str, value: int, zoom: int) -> int:
+    """校验"边界用"的瓦片轴编号落在 ``[0, 2**zoom]``（含右上界）。"""
+    limit = _tiles_per_axis(zoom)
+    try:
+        number = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} 必须是整数，实际为 {value!r}") from exc
+    if not 0 <= number <= limit:
+        raise ValueError(
+            f"{name} 必须在 [0, {limit}] 之间（zoom={zoom}），实际为 {number}"
+        )
+    return number
+
+
+def tile_x_to_lon(x: int, zoom: int) -> float:
+    """XYZ 列号 → 该列**西边界**的经度。
+
+    这是 :func:`lon_to_tile_x` 的逆运算（在"取整数格"的意义上）：对任何合法
+    列号 ``x``，``lon_to_tile_x(tile_x_to_lon(x, z), z) == x``。
+
+    本函数**只在这里实现一次**墨卡托经度反变换，:func:`tile_bounds` 复用它 ——
+    任何地方需要"某张瓦片盖到哪条经线"，都必须调这里，不许再写一遍
+    ``x / 2**z * 360 - 180``（两份公式迟早会有一份忘记处理浮点边界）。
+
+    Args:
+        x: 列号，``0 <= x <= 2**zoom``。``2**zoom`` 表示最东侧的边界值 180°。
+        zoom: 缩放级别，``0 ~ 22``。
+
+    Returns:
+        经度（度），范围 ``[-180, 180]``。
+
+    Raises:
+        ValueError: zoom 非法，或 ``x`` 超出 ``[0, 2**zoom]``。
+
+    >>> tile_x_to_lon(0, 0)
+    -180.0
+    >>> tile_x_to_lon(1, 0)
+    180.0
+    >>> tile_x_to_lon(0, 1)
+    -180.0
+    >>> tile_x_to_lon(1, 1)
+    0.0
+    """
+    tiles = _tiles_per_axis(zoom)
+    column = _check_tile_edge("x", x, zoom)
+    return column / tiles * 360.0 - 180.0
+
+
+def tile_y_to_lat(y: int, zoom: int) -> float:
+    """XYZ 行号 → 该行**北边界**的纬度。
+
+    与 :func:`lat_to_tile_y` 互逆：``lat_to_tile_y(tile_y_to_lat(y, z), z) == y``。
+    墨卡托纬度反变换为 ``atan(sinh(pi * (1 - 2y/n)))``，与正向的
+    ``asinh(tan(phi))`` 是一对（两者都由同一个投影关系导出，见模块 docstring）。
+
+    Args:
+        y: 行号（XYZ，自北向南），``0 <= y <= 2**zoom``。
+            ``2**zoom`` 表示最南侧的边界值 -85.05112878°。
+        zoom: 缩放级别，``0 ~ 22``。
+
+    Returns:
+        纬度（度），``y=0`` 时为 +85.05112878°，``y=2**zoom`` 时为 -85.05112878°。
+
+    Raises:
+        ValueError: zoom 非法，或 ``y`` 超出 ``[0, 2**zoom]``。
+
+    >>> round(tile_y_to_lat(0, 0), 6)
+    85.051129
+    >>> round(tile_y_to_lat(1, 0), 6)
+    -85.051129
+    >>> round(tile_y_to_lat(1, 1), 6)
+    0.0
+    """
+    tiles = _tiles_per_axis(zoom)
+    row = _check_tile_edge("y", y, zoom)
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * row / tiles)))
+    latitude = math.degrees(lat_rad)
+    # 浮点误差可能让 y=0 / y=2**z 得到 85.05112877980659 这类值，
+    # 钳一下以严格满足 GeoBounds 的 ±WEB_MERCATOR_MAX_LAT 约束。
+    return max(-WEB_MERCATOR_MAX_LAT, min(WEB_MERCATOR_MAX_LAT, latitude))
+
+
+def tile_bounds(zoom: int, x: int, y: int) -> GeoBounds:
+    """一张 XYZ 瓦片覆盖的经纬度矩形。
+
+    返回值的取整方向与 :func:`calculate_tile_range` **严格一致**：同一个
+    ``bounds`` 算出的 ``TileRange`` 里，每一张瓦片的 :func:`tile_bounds`
+    都落在原 ``bounds`` 之内（这正是 Polygon 过滤"不漏块"的前提）。
+
+    Args:
+        zoom: 缩放级别，``0 ~ 22``。
+        x: 列号，``0 <= x < 2**zoom``。
+        y: 行号（XYZ，自北向南），``0 <= y < 2**zoom``。
+
+    Returns:
+        ``GeoBounds(west, south, east, north)``：瓦片左/下/右/上四条边的坐标。
+
+    Raises:
+        ValueError: zoom 非法，或 ``x`` / ``y`` 不是合法瓦片编号。
+
+    >>> bounds = tile_bounds(1, 1, 0)
+    >>> (round(bounds.west, 3), round(bounds.south, 3))
+    (0.0, 0.0)
+    >>> (round(bounds.east, 3), round(bounds.north, 3))
+    (180.0, 85.051)
+    """
+    validate_zoom(zoom)
+    column = validate_tile_axis("x", x, zoom)
+    row = validate_tile_axis("y", y, zoom)
+    return GeoBounds(
+        west=tile_x_to_lon(column, zoom),
+        south=tile_y_to_lat(row + 1, zoom),
+        east=tile_x_to_lon(column + 1, zoom),
+        north=tile_y_to_lat(row, zoom),
+    )
 
 
 # --------------------------------------------------------------------------- #

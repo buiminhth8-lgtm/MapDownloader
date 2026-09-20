@@ -193,10 +193,13 @@ async def test_metadata_matches_requested_range(work_dir: Path) -> None:
     assert metadata["minzoom"] == "12"
     assert metadata["maxzoom"] == "12"
     assert metadata["bounds"] == "116.000000,39.000000,116.100000,39.100000"
+    # Spec §19（Slice 16）：矩形下载也要**显式**记下区域类型，
+    # Inspector 才能区分"这是个矩形包"与"这是个老包、根本没记录区域"。
+    assert metadata["region_type"] == "rectangle"
 
     # 用 Builder 也能重建出同一份元数据（元数据是纯函数式派生的）
     rebuilt = MBTilesMetadata.for_bounds(
-        SMALL_BOUNDS, 12, 12, name="meta", description="集成测试"
+        SMALL_BOUNDS, 12, 12, name="meta", description="集成测试", region_type="rectangle"
     )
     assert rebuilt.as_dict() == metadata
 

@@ -19,6 +19,7 @@
 - [快速开始](#快速开始) —— 五分钟跑通一次
 - [安装](#安装)
 - [用法：下载地图](#用法下载地图)
+- [用法：按行政区域下载（GeoJSON 多边形）](docs/polygon_region_download.md) —— Slice 16
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -120,9 +121,13 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 10：ADB 设备管理与离线地图包传输（Windows → Android：发现设备 → 看设备信息 →
-选设备 → 校验本地包 → 建远端目录 → push `map.mbtiles` + `manifest.json` → 进度 →
-远端校验，为 Slice 11 的端侧导入铺路）
+Slice 16：GeoJSON 区域下载与中国行政区域预设（把"下哪一块地"从**矩形**扩展到
+**任意多边形**：外包矩形只用来缩小搜索面，真正要下的是"与区域几何相交"的那些瓦片；
+内置「中国」预设，但**不内置国界数据** —— 法定地图内容必须用带审图号的授权 GeoJSON）
+
+上一个 Slice（Windows 侧）：Slice 10 —— ADB 设备管理与离线地图包传输（发现设备 →
+看设备信息 → 选设备 → 校验本地包 → 建远端目录 → push `map.mbtiles` + `manifest.json`
+→ 进度 → 远端校验，为 Slice 11 的端侧导入铺路）
 
 完整链路：
 
@@ -131,18 +136,24 @@ BoundingBox            (Slice 1：范围与合法性校验)
     ↓
 validate_form          (Slice 7：唯一的下载前校验入口，一次报出全部问题)
     ↓
+GeoJSON / Preset       (Slice 16：行政区域边界加载；缺文件就明确报错，绝不退回矩形)
+    ↓
 Tile Math              (Slice 1：算出瓦片编号区间)
     ↓
-DownloadTask           (Slice 5：任务记录，落盘到 data/tasks.json；Slice 6 增加 map_type / with_labels)
-    ↓
-ExistingTileScanWorker (Slice 7：后台线程数"已有多少张"——SQLite 不许碰主线程)
-    ↓
+RegionTileEstimator    (Slice 16：候选 = 外包矩形；区域内 = 与区域相交的那些。
+    ↓                   进度分母 / 大任务提示 / 容量预估**全部只用「区域内」**)
+DownloadTask           (Slice 5：任务记录，落盘到 data/tasks.json；Slice 6 增加 map_type / with_labels；
+    ↓                   Slice 16 增加 region_type / region_id / boundary_version ——**不写 GeoJSON**)
+ExistingTileScanWorker (Slice 7：后台线程数"已有多少张"——SQLite 不许碰主线程；
+    ↓                   Slice 16：多边形任务只数"区域内"那些)
 MapType → 两个图层      (Slice 6：MAP_TYPE_LAYERS 是全项目唯一的那张映射表)
     ↓
 TiandituProvider       (Slice 2：拼 WMTS URL、判响应合法性)
     ↓
 ExistingTileIndex      (Slice 5：查库里已有瓦片；默认只读坐标三列)
 
+    ↓  region_filter.intersects_tile（Slice 16：区域外的瓦片在**发 HTTP 之前**丢掉，
+    ↓                                不算失败、也不算跳过）
     ↓  should_skip_tile（在发 HTTP 之前判定）
 Async Downloader       (Slice 3：并发 / 限速 / 重试 / 暂停取消)
     ↓
@@ -150,8 +161,8 @@ CompositeTileDownloader (Slice 6：底图 + 注记各请求一次 → TileCompos
     ↓  on_tile 回调
 MBTilesTileSink        (Slice 4：有界写队列 + 单消费者)
     ↓
-MBTilesWriter          (Slice 4：批量事务写 SQLite，INSERT OR REPLACE)
-    ↓
+MBTilesWriter          (Slice 4：批量事务写 SQLite，INSERT OR REPLACE；
+    ↓                   Slice 16：metadata 里留下 region_type / region_id / boundary_version)
 map.mbtiles
     ↓
 Validator              (Slice 4：结构 + 抽样数据校验；Slice 6 增加合成信息自洽性)
@@ -160,8 +171,8 @@ TaskService            (Slice 5：状态判定 + 落盘；启动时 DOWNLOADING 
     ↓
 UiTaskState 矩阵        (Slice 7：把"状态"翻译成"哪几个按钮能点"，逐格可断言)
     ↓
-MBTilesInspectionService (Slice 8：同一个检查工具，下载收尾时自动跑一次"快速"档)
-    ↓
+MBTilesInspectionService (Slice 8：同一个检查工具，下载收尾时自动跑一次"快速"档；
+    ↓                   Slice 16：多边形包按**几何**算期望值，边界不可用就标 UNKNOWN)
 MBTilesInspectorDialog (Slice 8：手动打开的独立检查窗口，可快速 / 深度 / 导出报告)
     ↓
 MapPackageService      (Slice 9：打包编排——输出目录命名、复用源检查结论、进度、结果)
@@ -186,7 +197,7 @@ MapPackageTransfer     (Slice 10：mkdir → push map.mbtiles.part → mv → pu
 <设备>/sdcard/Download/TiandituOfflineMap/import/<manifest.id>/
                        { manifest.json, map.mbtiles }
     ↓
-Android App 导入        (Slice 11，未开始)
+Android App 导入        (Slice 11，在 osmdroid 仓库)
 ```
 
 **离线包的形状**（`formatVersion = 1`，这是给 Android 那侧看的契约）：
@@ -200,7 +211,8 @@ Android App 导入        (Slice 11，未开始)
 `manifest.json` 里有：`formatVersion` / `id` / `name` / `provider` / `mapType` /
 `labels` / `composition` / `tileScheme` / `tileFormat` / `minZoom` / `maxZoom` /
 `bounds { west, south, east, north }` / `tileCount` / `mbtiles { file, size, sha256 }` /
-`createdAt`。三条硬约束：
+`createdAt`，以及**可选**的 `region { type, id, boundaryVersion }`（Slice 16：
+多边形包带上"按哪块区域、哪版边界裁的"；老包没有这个键，读作矩形）。三条硬约束：
 
 - **不许出现绝对路径**——`mbtiles.file` 永远是 `map.mbtiles`，包换个盘符、换台机器
   都得能用；
@@ -211,6 +223,111 @@ Android App 导入        (Slice 11，未开始)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 16：GeoJSON 区域下载与中国行政区域预设
+
+在此之前，"要下哪一块地"只有一种表达方式：**一个矩形**。而矩形与行政区从来不是
+一回事 —— 北京主城的外包矩形会把固安、三河、涿州和出海口一起框进来，按矩形下出来的
+"北京市"离线包，瓦片数比实际需要多四成，多出来的全是不该下的。多下不是"浪费一点
+点"：它花天地图配额、占手机存储、拖长下载时间，而且**在界面上完全看不出来**。
+
+这一版把"下哪一块地"统一成一个模型（`DownloadRegion`）：
+
+| 名字 | 含义 | 谁用它 |
+| --- | --- | --- |
+| **候选瓦片**（candidate） | 外包矩形覆盖的瓦片数，**只是搜索面** | 只用来给用户做对照 |
+| **区域内瓦片**（selected） | 候选里真正与区域几何相交的那些 | 进度分母 / 大任务提示 / 容量预估 / 任务记录 / 续传 / 地图包 |
+
+矩形模式下两者恒等（**逐位不变**，Spec §7）；多边形模式下 selected 是 candidate 的
+子集。**所有下游计算只认「区域内」**：拿候选数当分母，你会得到一个永远走不满的
+进度条，以及一个虚高的容量预估。
+
+### 判"相交"而不是判"中心点在不在里面"
+
+用几何库预编译的 prepared geometry 做 `intersects`，**不是**"瓦片中心点是否落在
+区域内"。按中心点判，边界上的瓦片会被整片丢掉 —— 地图边缘出现一圈锯齿状空洞。
+按相交判，只要瓦片与区域有重叠就留下：**多留一张无害，少留一张是用户看不见的数据
+缺失**，两者代价不对称。
+
+### 中国国界数据由你自己提供（README 里说清这一条）
+
+仓库**不内置、不生成、也不套用**任何中国国界数据：`resources/regions/china.geojson`
+默认不存在。**中国国界属于法定地图内容，必须使用带审图号的合法授权 GeoJSON 数据。**
+程序提供的是"规范路径 + 加载器 + 明确的缺失报错"：
+
+```text
+计算失败：行政区域不可用：行政区边界文件不可用：…\resources\regions\china.geojson。
+中国国界属于法定地图内容，请使用带审图号的合法授权 GeoJSON 数据，
+命名为 china.geojson 后放入 …\resources\regions
+```
+
+**它不会退回按矩形下载。** 退回去的后果是静默下一大片境外瓦片，而界面上的数字
+看起来一切正常。宁可停下来问，也不要悄悄多下。文件格式与授权要求见
+[`resources/regions/README.md`](resources/regions/README.md)。
+
+### 界面（Spec §15 / §17）
+
+「区域类型」下拉两个选项：**自定义矩形** / **行政区域**。选行政区域后，行政区下拉
+（当前只有「中国」）出现，四个经纬度框**自动填上外包矩形并变成只读** —— 范围由数据
+文件决定，手改会让"界面显示的范围"与"实际裁剪依据"对不上，而用户看不出这一点。
+
+点「计算」给出六个数字：候选 / 区域内 / 过滤 / 占比 / 预计请求量 / 预计容量，
+外加逐级明细。**运行日志里是同一份文案**（`estimate.as_lines()` 一份产出两处用），
+避免"界面写 3 行、日志写 4 行、数字还不一样"。
+
+### 这一 Slice 抓出来的缺陷：旧结论会赖在界面上
+
+本地实测抓到一条真缺陷，`pytest` 全绿也发现不了（没有用例会去切区域类型再看结果区）：
+
+1. 先在「自定义矩形」下算一次 → 结果区写着 `预计瓦片：56`；
+2. 切到「行政区域」，而 `china.geojson` 不在 → **结果区那句"预计瓦片 56"还在**，
+   看起来就像是"行政区域也算出了 56 张"；
+3. 再点「计算」会给出人话错误，但只要动一下输出目录（`output_config_changed`）
+   或勾一下注记（`layer_plan_changed`），`_refresh_output_preview` 就会拿**缓存里的
+   旧结论**把错误提示盖回去 —— 用户以为算成功了。
+
+修复：区域变更时**作废预估缓存**（`DownloadPanel.region_changed` →
+`MainWindow._on_region_changed`：清缓存、清结果区、状态栏退回占位、日志留一行）。
+回归用例 3 条，见 `tests/test_ui_smoke.py` 末尾。
+
+### 续传与兼容（Spec §13 / §19 / §21）
+
+- `tasks.json` 只写 `region_type` / `region_id` / `boundary_version` 三个字段，
+  **不写 GeoJSON 本身** —— 一份省级边界有几 MB，塞进任务记录会让每次进度落盘都
+  变成一次大写入；恢复时按 `region_id` 回预设取路径即可；
+- **多边形任务续传时，"已有瓦片"只数区域内的那些**：`_execute` 原本用
+  `sum(counts_by_zoom)` 把区域外的也算了进去，会让"已有 70 张"这种数字出现，
+  于是任务永远差着几十张。这同样是本次抓出来并修掉的缺陷；
+- 边界版本对不上会给一条 WARNING：同一块地按 2026-03 与 2026-09 两版边界裁出来的
+  瓦片集合可能不同，硬续会在区域边缘留下一圈"哪版都不算"的瓦片；
+- 老任务记录（没有 `region_type`）读出来就是矩形，行为与 Slice ≤15 一致；
+- 地图包 manifest 新增**可选** `region` 子对象（`{"type","id","boundaryVersion"}`），
+  位置紧跟 `bounds`。**老文件打出来的包与以前逐字节一致** —— 这条有专用用例钉着。
+
+### Inspector：多边形包的"期望值"按几何算（Spec §20）
+
+按外包矩形算一个完整的中国包，会得出"缺了 35 张"的结论（期望 81 / 实际 46），
+而那个包是**完整**的。所以：边界可用时按几何算期望值；边界不可用时把覆盖度标成
+**未知（UNKNOWN）** 并说明原因，**绝不退回矩形口径**。误报比"不知道"糟糕得多 ——
+用户会照着去重下几万张。
+
+### 验收
+
+```bash
+.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe scripts/verify_slice16_polygon.py   # 真窗口 + 真链路 + 截图
+```
+
+验收脚本走五个场景（矩形基线 / 边界缺失 / 边界就位 / 下载→Inspector→打包 / 静态守卫），
+截图落在 `docs/slice16_*.png`。完整说明与 13 步手工清单见
+[`docs/polygon_region_download.md`](docs/polygon_region_download.md)。
+
+### 这一 Slice 明确**不做**的事
+
+- 不支持跨 180° 经线的几何（拒绝，而不是悄悄裁一半）；
+- 不内置任何国界数据，也不做拼音/名称猜测（只内置「中国」一个预设）；
+- 不做"按区域自动切分大任务"；
+- 不动矩形路径的任何既有行为。
 
 ## Slice 10：ADB 设备管理与离线地图包传输
 

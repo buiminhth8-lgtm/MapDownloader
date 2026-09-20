@@ -45,7 +45,7 @@ from app.config.settings import (
     DEFAULT_TASK_SAVE_TILE_INTERVAL,
     DEFAULT_TASKS_FILE,
 )
-from app.geo import GeoBounds
+from app.geo import DownloadRegion, GeoBounds
 from app.models.download_task import DownloadTask, DownloadTaskStatus, new_task_id
 from app.models.map_layer import MapLayerType
 from app.tasks.task_store import TaskStore
@@ -115,6 +115,7 @@ class TaskService:
         output_path: str | Path,
         total_tiles: int = 0,
         with_labels: bool = False,
+        region: DownloadRegion | None = None,
         task_id: str | None = None,
     ) -> DownloadTask:
         """建一条新任务并**立即落盘**。
@@ -129,6 +130,8 @@ class TaskService:
             with_labels: 本次是否把中文注记合成进瓦片（Slice 6）。
                 必须落盘：续传时要靠它比对已有 MBTiles 的 ``composition``，
                 否则"合成任务续到一个纯底图文件上"会被静默放行。
+            region: 下载区域（Slice 16）。**只落盘标识**（类型 / id / 版本），
+                边界 GeoJSON 本身不进 ``tasks.json``；续传时按 id 回预设表找文件。
             task_id: 指定 id（测试用；正常不传）。
 
         Returns:
@@ -158,6 +161,9 @@ class TaskService:
             output_path=Path(output_path),
             total_tiles=max(0, int(total_tiles)),
             with_labels=bool(with_labels),
+            region_type=region.region_type.value if region else "",
+            region_id=(region.region_id or "") if region else "",
+            boundary_version=(region.boundary_version or "") if region else "",
         )
         self._store.save(task)
         self._mark_saved(task)

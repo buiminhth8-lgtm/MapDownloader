@@ -70,6 +70,10 @@ class TaskStoreError(RuntimeError):
 
 
 #: 允许出现在 payload 里的键。**白名单**：只有这里列出的字段会被写盘。
+#:
+#: 注意 ``region_type`` / ``region_id`` / ``boundary_version``（Slice 16）：
+#: 它们只是**标识**，不是数据 —— 行政区边界的 GeoJSON 本身绝不写进这里
+#: （一份省级边界好几 MB，会让每次进度落盘都变成一次大写入，Spec §13）。
 _TASK_FIELDS: tuple[str, ...] = (
     "id",
     "name",
@@ -77,6 +81,9 @@ _TASK_FIELDS: tuple[str, ...] = (
     "map_layer",
     "map_type",
     "with_labels",
+    "region_type",
+    "region_id",
+    "boundary_version",
     "west",
     "south",
     "east",
@@ -120,6 +127,9 @@ def task_to_payload(task: DownloadTask) -> dict[str, Any]:
         "map_layer": task.map_layer,
         "map_type": task.map_type,
         "with_labels": bool(task.with_labels),
+        "region_type": str(getattr(task, "region_type", "") or ""),
+        "region_id": str(getattr(task, "region_id", "") or ""),
+        "boundary_version": str(getattr(task, "boundary_version", "") or ""),
         "west": float(task.west),
         "south": float(task.south),
         "east": float(task.east),
@@ -170,6 +180,12 @@ def task_from_payload(payload: dict[str, Any]) -> DownloadTask:
     task.map_type = str(payload.get("map_type") or "")
     # 缺这个键的老记录 = Slice 5 时代的单层任务，False 正是当时的真实情况
     task.with_labels = _as_bool(payload.get("with_labels", False), "with_labels", task_id)
+
+    # 区域信息（Slice 16）：老记录没有这三个键 → 空串，由上层按矩形处理
+    # （那正是它们当初的下载行为，Spec §21/§29 要求的旧记录兼容）。
+    task.region_type = str(payload.get("region_type") or "").strip().lower()
+    task.region_id = str(payload.get("region_id") or "").strip()
+    task.boundary_version = str(payload.get("boundary_version") or "").strip()
 
     task.west = _as_float(payload.get("west"), "west", task_id)
     task.south = _as_float(payload.get("south"), "south", task_id)

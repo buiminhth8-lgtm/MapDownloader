@@ -46,7 +46,7 @@ from app.config.settings import (
     PROGRESS_EMIT_INTERVAL_SECONDS,
 )
 from app.downloader import DownloadProgress, RateLimiter, ResumePolicy, RetryPolicy
-from app.geo import GeoBounds
+from app.geo import DownloadRegion, GeoBounds
 from app.mbtiles import MBTilesWriteError
 from app.models.download_task import DownloadTask
 from app.models.map_layer import MapLayerType, MapType
@@ -91,6 +91,7 @@ class DownloadWorker(QThread):
         transport: httpx.AsyncBaseTransport | None = None,
         resume_policy: ResumePolicy | None = None,
         resume_task: DownloadTask | None = None,
+        region: DownloadRegion | None = None,
         token: str = "",
         task: DownloadTask | None = None,
         task_service=None,
@@ -122,6 +123,10 @@ class DownloadWorker(QThread):
             resume_task: **续传模式**的任务记录。非 ``None`` 时走
                 ``service.resume_task``，此时 ``bounds/zoom/layer`` 只是
                 冗余信息（服务层会以任务记录为准重新校验）。
+            region: 下载区域（Slice 16）。行政区域模式下区域内的瓦片才下，
+                区域外的**不进任务总数、不计失败/跳过**。``None`` 或矩形时
+                行为与 Slice ≤15 完全一致。续传模式下以任务记录里的区域为准，
+                这里传什么都会被忽略。
             token: 续传时用的 Token（任务记录里不存 Token，Spec §9）。
             task: 用于**持续落盘进度**的任务记录（全新下载时由 UI 先创建）。
             task_service: 任务服务，与 ``task`` 成对出现。
@@ -147,6 +152,7 @@ class DownloadWorker(QThread):
         self._transport = transport
         self._resume_policy = resume_policy
         self._resume_task = resume_task
+        self._region = region
         self._token = token
         self._task = task
         self._task_service = task_service
@@ -189,6 +195,11 @@ class DownloadWorker(QThread):
     def is_resume(self) -> bool:
         """本次是否是"继续已有任务"。"""
         return self._resume_task is not None
+
+    @property
+    def region(self) -> DownloadRegion | None:
+        """本次下载的区域（Slice 16）；``None`` 表示纯矩形范围。"""
+        return self._region
 
     @property
     def pause_requested(self) -> bool:
@@ -276,6 +287,7 @@ class DownloadWorker(QThread):
                     resume_policy=self._resume_policy,
                     task=self._task,
                     task_service=self._task_service,
+                    region=self._region,
                 )
         finally:
             self._service = None

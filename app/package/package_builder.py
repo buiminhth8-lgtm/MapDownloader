@@ -106,6 +106,7 @@ from app.package.models import (
     MapPackageManifest,
     PackageAborted,
     PackageBuildResult,
+    PackageRegion,
     PackageProgress,
     PackageValidationResult,
     now_iso,
@@ -207,6 +208,31 @@ class SourceFacts:
     east: float
     north: float
     tile_count: int
+    #: 区域信息（Slice 16）：来自 MBTiles metadata，缺省 ``None``
+    #: （Slice ≤15 生成的文件没有这几项）→ manifest 里不写 ``region``。
+    region: "PackageRegion | None" = None
+
+
+def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
+    """从 MBTiles ``metadata`` 里读区域信息（Spec §21）。
+
+    三项**都空**时返回 ``None``，manifest 里就不写 ``region`` 子对象 ——
+    这样 Slice ≤15 时代的老文件打出来的包与以前**逐字节一致**，
+    "旧包兼容"才不只是口头承诺（协议样例的往返用例会守住这一点）。
+
+    同时，同一条规则也让"新工具打老包"和"老工具打新包"两个方向都安全：
+    前者不凭空多出一个字段，后者只是多读到一个不认识的键（Android 侧忽略）。
+    """
+    region_type = str(metadata.get("region_type") or "").strip().lower()
+    region_id = str(metadata.get("region_id") or "").strip()
+    version = str(metadata.get("boundary_version") or "").strip()
+    if not (region_type or region_id or version):
+        return None
+    return PackageRegion(
+        region_type=region_type or "rectangle",
+        region_id=region_id or None,
+        boundary_version=version or None,
+    )
 
 
 class MapPackageBuilder:
@@ -586,6 +612,9 @@ class MapPackageBuilder:
             east=float(east),
             north=float(north),
             tile_count=int(diagnostics.tile_count),
+            # 区域信息（Slice 16）：原样透传 MBTiles metadata 里的三项。
+            # 老文件三项都空 → 不写 region 子对象，manifest 与 Slice 15 逐字节一致。
+            region=_region_from_metadata(metadata),
         )
         return facts, errors, warnings
 
@@ -671,9 +700,10 @@ class MapPackageBuilder:
             mbtiles_file=PACKAGE_MBTILES_FILENAME,
             mbtiles_size=target.stat().st_size,
             mbtiles_sha256=digest,
-            created_at=created_at,
-            description=facts.description,
-        )
+        created_at=created_at,
+        description=facts.description,
+        region=facts.region,
+    )
         _write_text_atomic(
             target.parent / PACKAGE_MANIFEST_FILENAME, render_manifest_json(manifest)
         )

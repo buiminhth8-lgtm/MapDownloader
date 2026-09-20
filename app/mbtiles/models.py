@@ -47,6 +47,7 @@ __all__ = [
     "MBTilesValidationResult",
     "SUPPORTED_TILE_FORMATS",
     "SUPPORTED_MAP_TYPES",
+    "SUPPORTED_REGION_TYPES",
     "METADATA_KEY_ORDER",
 ]
 
@@ -69,9 +70,10 @@ SUPPORTED_MAP_TYPES: frozenset[str] = frozenset(item.value for item in MapType)
 #: 固定顺序不是为了好看：它让"同一份配置生成的 metadata"逐字节可比，
 #: 测试与人工 diff 才有意义。
 #:
-#: 前 8 个是 MBTiles 标准字段；后 4 个是 Slice 6 增加的本工具自有字段，
-#: 它们回答"这个包是怎么来的、能不能接着往里写"（Spec §10 / §12）。
-#: 不是每个文件都有后 4 个 —— Slice 4/5 生成的文件没有，
+#: 前 8 个是 MBTiles 标准字段；中间 4 个是 Slice 6 增加的本工具自有字段，
+#: 它们回答"这个包是怎么来的、能不能接着往里写"（Spec §10 / §12）；
+#: 最后 3 个是 Slice 16 的区域信息（Spec §19）。
+#: 不是每个文件都有后几项 —— Slice 4/5 生成的文件没有，
 #: 因此 :meth:`MBTilesMetadata.as_rows` 会跳过取值为空的那几个。
 METADATA_KEY_ORDER: tuple[str, ...] = (
     "name",
@@ -86,7 +88,18 @@ METADATA_KEY_ORDER: tuple[str, ...] = (
     "map_type",
     "labels",
     "composition",
+    "region_type",
+    "region_id",
+    "boundary_version",
 )
+
+#: ``metadata.region_type`` 允许的取值（Spec §19）。
+#:
+#: 刻意写成一份独立常量而不是 import ``app.geo.RegionType``：本模块（以及整个
+#: ``app.mbtiles``）的单元测试不该为了一个枚举把 Shapely 拉进来。两者取值必须
+#: 一致这件事由 ``tests/test_mbtiles_region_metadata.py`` 里的同步断言守住 ——
+#: 靠测试发现漂移，比靠"记得同时改两处"可靠。
+SUPPORTED_REGION_TYPES: frozenset[str] = frozenset({"rectangle", "polygon"})
 
 
 @dataclass
@@ -130,6 +143,14 @@ class MBTilesMetadata:
     source_map_type: str = ""
     with_labels: bool | None = None
     composition: str = ""
+    # --- Slice 16：区域信息（Spec §19）---
+    #: ``rectangle`` / ``polygon``；空串表示"这个文件没有记录区域信息"
+    #: （Slice ≤15 生成的包读回来就是 ``""``，Inspector 据此按矩形处理）。
+    region_type: str = ""
+    #: 行政区标识（``china``）；矩形或老文件为空串。
+    region_id: str = ""
+    #: 边界数据版本，用于追溯"这批瓦片是按哪一版边界裁的"。
+    boundary_version: str = ""
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -168,6 +189,16 @@ class MBTilesMetadata:
             )
         if self.with_labels is not None:
             self.with_labels = bool(self.with_labels)
+
+        # --- Slice 16：区域信息（空值表示"本文件不记录这一项"）---
+        self.region_type = str(self.region_type).strip().lower()
+        if self.region_type and self.region_type not in SUPPORTED_REGION_TYPES:
+            raise ValueError(
+                f"region_type 必须是 {sorted(SUPPORTED_REGION_TYPES)} 之一，"
+                f"实际为 {self.region_type!r}"
+            )
+        self.region_id = str(self.region_id).strip()
+        self.boundary_version = str(self.boundary_version).strip()
 
         try:
             min_zoom = operator.index(self.min_zoom)
@@ -260,6 +291,12 @@ class MBTilesMetadata:
             values["labels"] = self.labels_text
         if self.composition:
             values["composition"] = self.composition
+        if self.region_type:
+            values["region_type"] = self.region_type
+        if self.region_id:
+            values["region_id"] = self.region_id
+        if self.boundary_version:
+            values["boundary_version"] = self.boundary_version
         return values
 
     def as_rows(self) -> list[tuple[str, str]]:
@@ -283,6 +320,9 @@ class MBTilesMetadata:
         source_map_type: str = MapType.VECTOR.value,
         with_labels: bool = False,
         composition: str = COMPOSITION_SINGLE,
+        region_type: str = "",
+        region_id: str = "",
+        boundary_version: str = "",
     ) -> "MBTilesMetadata":
         """便捷构造：直接用 :class:`~app.geo.GeoBounds` 建元数据。
 
@@ -309,6 +349,9 @@ class MBTilesMetadata:
             source_map_type=source_map_type,
             with_labels=with_labels,
             composition=composition,
+            region_type=region_type,
+            region_id=region_id,
+            boundary_version=boundary_version,
         )
 
 

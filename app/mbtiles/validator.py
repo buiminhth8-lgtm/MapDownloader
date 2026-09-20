@@ -33,6 +33,7 @@ from app.config.settings import (
 from app.geo import format_size
 from app.mbtiles.models import (
     SUPPORTED_MAP_TYPES,
+    SUPPORTED_REGION_TYPES,
     MBTilesValidationResult,
 )
 from app.mbtiles.reader import MBTilesReader
@@ -228,6 +229,36 @@ def _check_metadata(reader: MBTilesReader, result: MBTilesValidationResult) -> N
         )
 
     _check_composition(metadata, result)
+    _check_region(metadata, result)
+
+
+def _check_region(metadata: dict[str, str], result: MBTilesValidationResult) -> None:
+    """Slice 16 的区域字段（Spec §19）：**存在时**校验取值可识别。
+
+    与 :func:`_check_composition` 同一个态度：没有这几个键是**完全正常**的
+    （Slice ≤15 生成的文件、别的工具生成的文件都没有），因此不产生任何提示；
+    只有键存在却写着认不出来的值时，才记一条 warning。
+
+    这里刻意只给 warning 而不是 error：``region_type`` 是**本工具的自有扩展**，
+    别的工具（或未来版本）写了个 ``multipolygon`` 并不代表这个文件不可用 ——
+    瓦片照样能加载，只是我们没法用它做覆盖度推断。
+    """
+    region_type = str(metadata.get("region_type", "") or "").strip().lower()
+    if not region_type:
+        return
+    if region_type not in SUPPORTED_REGION_TYPES:
+        result.warnings.append(
+            f"metadata.region_type 取值无法识别：{region_type!r}"
+            f"（本版本支持 {sorted(SUPPORTED_REGION_TYPES)}），"
+            "覆盖完整性将按矩形范围估算"
+        )
+    elif region_type == "polygon" and not str(metadata.get("region_id", "") or "").strip():
+        # 多边形但没有 id：无法还原边界文件，Inspector 只能给 UNKNOWN。
+        # 不是错误（包本身完好），但要说明为什么覆盖度算不出来。
+        result.warnings.append(
+            "metadata.region_type=polygon 但缺少 region_id，"
+            "无法定位行政区边界文件，覆盖完整性将标记为未知"
+        )
 
 
 def parse_bool(value: str) -> bool | None:

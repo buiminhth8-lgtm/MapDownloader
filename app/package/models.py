@@ -49,6 +49,7 @@ from app.mbtiles import SUPPORTED_TILE_FORMATS
 
 __all__ = [
     "MapPackageManifest",
+    "PackageRegion",
     "PackageBuildResult",
     "PackageValidationResult",
     "PackageProgress",
@@ -60,6 +61,7 @@ __all__ = [
     "MANIFEST_FIELD_ORDER",
     "MANIFEST_BOUNDS_FIELDS",
     "MANIFEST_MBTILES_FIELDS",
+    "MANIFEST_REGION_FIELDS",
     "parse_manifest_dict",
     "render_manifest_json",
     "now_iso",
@@ -123,10 +125,18 @@ MANIFEST_FIELD_ORDER: tuple[str, ...] = (
     "minZoom",
     "maxZoom",
     "bounds",
+    "region",
     "tileCount",
     "mbtiles",
     "createdAt",
 )
+
+#: ``region`` 子对象的字段顺序（Slice 16）。
+#:
+#: 与 ``description`` 同属**可选**字段：旧包没有它，读到 ``None`` 时按矩形处理
+#: （Spec §21/§29）。因此它虽然进了 :data:`MANIFEST_FIELD_ORDER`（决定书写位置），
+#: 却**不**是必填项 —— 判定"哪些字段必填"的表在协议测试里，那边把它排除掉。
+MANIFEST_REGION_FIELDS: tuple[str, ...] = ("type", "id", "boundaryVersion")
 
 #: ``bounds`` 子对象的字段顺序（west, south, east, north —— 与 MBTiles 的
 #: ``bounds`` 字符串同序，避免两处顺序不一致时靠人眼核对）
@@ -157,6 +167,80 @@ def now_iso() -> str:
     人和 Android 看，缺时区的时间戳在跨时区场景下就是个谜。
     """
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+# --------------------------------------------------------------------------- #
+# 区域信息（Slice 16，Spec §21）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class PackageRegion:
+    """manifest 里**可选**的 ``region`` 子对象。
+
+    它记录"这个包是按哪块区域裁出来的"，让下游不必打开 MBTiles 就能知道
+    "为什么实际覆盖范围比 ``bounds`` 小"。
+
+    "可选"是硬要求：旧包（Slice ≤15）没有这个字段，读到时是 ``None``，
+    按矩形处理 —— 那时候的包本来就是按 bounding box 下的。
+
+    Attributes:
+        region_type: ``rectangle`` / ``polygon``。
+        region_id: 行政区标识（``china``）；矩形为 ``None``。
+        boundary_version: 边界数据版本；未知为 ``None``。
+
+    取值刻意**不做白名单校验**（只做归一化）：manifest 由本工具生成，
+    但也会被别的工具/未来版本读。一个写着 ``multipolygon`` 的包仍然是
+    可以加载的包 —— 拒收它属于"因为一个附加信息不认识就否掉整个交付物"，
+    正是 Spec §22 要求避免的。
+    """
+
+    region_type: str = "rectangle"
+    region_id: str | None = None
+    boundary_version: str | None = None
+
+    def __post_init__(self) -> None:
+        # 空串 / 空白都落回 rectangle：连 ``{"region": {}}`` 这种残缺写法
+        # 也按最保守的解释处理（矩形 = 只多下、不少下）。
+        normalized = str(self.region_type or "").strip().lower() or "rectangle"
+        object.__setattr__(self, "region_type", normalized)
+        region_id = str(self.region_id).strip() if self.region_id else ""
+        object.__setattr__(self, "region_id", region_id or None)
+        version = str(self.boundary_version).strip() if self.boundary_version else ""
+        object.__setattr__(self, "boundary_version", version or None)
+
+    def to_dict(self) -> dict[str, str]:
+        """转成 JSON 结构（``type`` / ``id`` / ``boundaryVersion``）。
+
+        空字段**不写**：``"id": null`` 与"没有 id"在 Android 侧是两种语义
+        （前者可能被反序列化成字符串 ``"null"``），与 ``description`` 同一处理。
+        """
+        data: dict[str, str] = {"type": self.region_type}
+        if self.region_id:
+            data["id"] = self.region_id
+        if self.boundary_version:
+            data["boundaryVersion"] = self.boundary_version
+        return {key: data[key] for key in MANIFEST_REGION_FIELDS if key in data}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PackageRegion":
+        """从 JSON 结构还原。
+
+        Raises:
+            ManifestError: ``region`` 不是 JSON 对象。
+        """
+        if not isinstance(data, Mapping):
+            raise ManifestError(
+                f"manifest.region 必须是 JSON 对象，实际为 {type(data).__name__}"
+            )
+        return cls(
+            region_type=str(data.get("type", "") or ""),
+            region_id=data.get("id"),
+            boundary_version=data.get("boundaryVersion"),
+        )
+
+    @classmethod
+    def for_rectangle(cls) -> "PackageRegion":
+        """矩形包的区域记录（Spec §21：矩形也要显式写出来）。"""
+        return cls(region_type="rectangle")
 
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +307,12 @@ class MapPackageManifest:
 
     description: str | None = None
 
+    #: 区域信息（Slice 16，Spec §21）。``None`` = "不写这个字段"
+    #: （与 :attr:`description` 同一约定）；**旧包没有它，读到 ``None``
+    #: 时一律按矩形处理**。直接构造函数时也可以传 dict，``__post_init__``
+    #: 会转成 :class:`PackageRegion`。
+    region: PackageRegion | None = None
+
     # ------------------------------------------------------------------ #
     # 校验
     # ------------------------------------------------------------------ #
@@ -286,6 +376,11 @@ class MapPackageManifest:
 
         if self.description is not None:
             self.description = str(self.description)
+
+        # 区域信息（Slice 16）：允许直接传 dict（便于从 JSON 构造），
+        # 归一化成 PackageRegion；``None`` 保持为 ``None``（= 不写这个字段）。
+        if self.region is not None and not isinstance(self.region, PackageRegion):
+            self.region = PackageRegion.from_dict(self.region)
 
     # ------------------------------------------------------------------ #
     # 派生信息
@@ -364,6 +459,9 @@ class MapPackageManifest:
         }
         if self.description is not None:
             data["description"] = self.description
+        if self.region is not None:
+            # 与 description 同一约定：没有就不写这个键，而不是写 null。
+            data["region"] = self.region.to_dict()
         # 按固定顺序重排：``dict`` 保序，但**必须**显式排一遍，
         # 否则以后往上面塞新键时会不小心写到末尾，破坏"同一份数据字节稳定"。
         return {key: data[key] for key in MANIFEST_FIELD_ORDER if key in data}
@@ -396,6 +494,15 @@ class MapPackageManifest:
         if description is not None:
             description = str(description)
 
+        # 区域信息（Slice 16）：**旧包没有这个键** → ``None``，上层按矩形处理
+        # （Spec §21/§29：不破坏 Slice 15 已固化的旧包兼容性）。
+        region_payload = data.get("region")
+        region = (
+            PackageRegion.from_dict(region_payload)
+            if region_payload is not None
+            else None
+        )
+
         return cls(
             format_version=version,
             id=_require_text(_require_key(data, "id"), "id"),
@@ -420,6 +527,7 @@ class MapPackageManifest:
             mbtiles_sha256=_require_text(_require_key(mbtiles, "sha256"), "mbtiles.sha256"),
             created_at=_require_text(_require_key(data, "createdAt"), "createdAt"),
             description=description,
+            region=region,
         )
 
 

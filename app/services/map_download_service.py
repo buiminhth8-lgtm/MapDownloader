@@ -82,7 +82,15 @@ from app.downloader import (
     describe_existing_tiles,
     make_skip_predicate,
 )
-from app.geo import GeoBounds, estimate_tile_count, format_size
+from app.geo import (
+    DownloadRegion,
+    GeoBounds,
+    RegionTileEstimator,
+    build_region_filter,
+    estimate_tile_count,
+    format_size,
+    region_from_task,
+)
 from app.mbtiles import (
     MBTilesDiagnosticsResult,
     MBTilesMetadata,
@@ -114,6 +122,9 @@ __all__ = [
     "ResumeCompatibility",
     "check_resume_compatibility",
     "build_output_path",
+    "count_existing_region_tiles",
+    "count_existing_tiles",
+    "region_target_tiles",
     "sanitize_map_name",
 ]
 
@@ -273,8 +284,54 @@ def check_resume_compatibility(
             "（底图与合成瓦片不能混在同一个地图包里）"
         )
 
+    # --- 区域（Slice 16，Spec §12）---
+    _check_region_compatibility(task, metadata, result)
+
     result.compatible = not result.problems
     return result
+
+
+def _check_region_compatibility(
+    task: DownloadTask,
+    metadata: MBTilesMetadata,
+    result: ResumeCompatibility,
+) -> None:
+    """比对区域标识（Slice 16，Spec §12）。
+
+    三条规则，都遵守同一个原则：**只在两边都说得清时才比对**（与 ``map_type``
+    一致）。Slice ≤15 生成的文件根本没有 ``region_id`` / ``boundary_version``，
+    拿空串去比会给每一个老文件都判一次"不一致"—— 那是误报，不是保护。
+
+    1. 两边都有 ``region_id`` 且不同 → **硬拦**。用户要的是 A 省，文件里是
+       B 省的瓦片，继续往里写得到的既不是 A 也不是 B。
+    2. 任务是行政区域、而文件**明确**记录着 ``region_type=rectangle`` →
+       仅提示。文件里的矩形瓦片仍然有效，续传也不会删它们；但用户该知道
+       "这个包里混着区域外的瓦片"。
+    3. 两边都有 ``boundary_version`` 且不同 → 仅提示。边界数据换版本意味着
+       区域形状可能变了：续传会把新的补齐，但**不会**清掉按旧边界下的那些。
+    """
+    task_region_id = str(getattr(task, "region_id", "") or "").strip()
+    file_region_id = (metadata.region_id or "").strip()
+    if task_region_id and file_region_id and task_region_id != file_region_id:
+        result.problems.append(
+            f"行政区域不一致：任务 {task_region_id}，文件 {file_region_id}"
+            "（不同区域的瓦片不能混在同一个地图包里）"
+        )
+
+    file_region_type = (metadata.region_type or "").strip().lower()
+    if task_region_id and file_region_type == "rectangle":
+        result.warnings.append(
+            "文件是按矩形范围下载的，里面含有区域外的瓦片；"
+            "本次续传不会删除它们"
+        )
+
+    task_version = str(getattr(task, "boundary_version", "") or "").strip()
+    file_version = (metadata.boundary_version or "").strip()
+    if task_version and file_version and task_version != file_version:
+        result.warnings.append(
+            f"边界版本不同：任务 {task_version}，文件 {file_version}"
+            "（按旧边界下载的瓦片不会被删除，必要时请重新下载）"
+        )
 
 
 def _task_map_type(task) -> str:
@@ -798,6 +855,7 @@ class MapDownloadService:
         resume_policy: ResumePolicy | None = None,
         task: DownloadTask | None = None,
         task_service=None,
+        region: DownloadRegion | None = None,
     ) -> MapDownloadOutcome:
         """下载给定范围并写成 MBTiles，返回最终结果。
 
@@ -820,6 +878,9 @@ class MapDownloadService:
             task: 关联的任务记录（可选）。给了就会随进度落盘，
                 使"程序被强杀"最多只丢 1 秒的进度。
             task_service: 任务服务（与 ``task`` 成对出现）。
+            region: 下载区域（Slice 16）。``None`` 表示"按 ``bounds`` 这个矩形下"
+                ——行为与 Slice 0~15 逐位一致；传多边形区域时，只有与行政区域
+                **相交**的瓦片会被下载，且进度分母是 selected 而不是候选数。
 
         Returns:
             :class:`MapDownloadOutcome`
@@ -827,6 +888,8 @@ class MapDownloadService:
         Raises:
             MBTilesWriteError: **写库阶段**失败（磁盘满、库损坏等）。
                 这种错误无法继续，必须让用户看见，因此不作降级处理。
+            GeoJSONError: 多边形区域的边界文件不可读 / 不合法。
+                **不会**退化成矩形下载：那会静默下一大片区域外瓦片。
             ValueError: 参数非法（含"注记层没有对应的地图类型"）。
         """
         return await self._execute(
@@ -845,6 +908,7 @@ class MapDownloadService:
             task=task,
             task_service=task_service,
             resumed=False,
+            region=region,
         )
 
     # ------------------------------------------------------------------ #
@@ -914,6 +978,16 @@ class MapDownloadService:
         # --- 1b. 下载目标：具体图层 / 地图类型 + 是否合成（Slice 6） ---
         target, with_labels = _resolve_task_target(task)
 
+        # --- 1c. 区域（Slice 16）：老任务没有这三个字段 → 矩形，行为与以前一致 ---
+        region = region_from_task(task)
+        if region is None:
+            # 任务记录说是多边形、但本版本找不到对应预设：**不能猜**。
+            # 按矩形续传会把区域外的瓦片也下下来，等于悄悄改变了这个任务的定义。
+            raise MapResumeError(
+                f"任务 {task.id} 记录的区域（region_id={task.region_id!r}）"
+                "在本版本找不到对应的行政区边界，无法安全续传"
+            )
+
         path = Path(task.output_path)
         _logger.info("Resume task: %s", task.id)
 
@@ -940,11 +1014,17 @@ class MapDownloadService:
             _logger.warning("目标文件不存在，按全新下载处理：%s", path)
 
         # --- 4. 完整 Tile Range 与"已有 / 待下载" ---
-        total = estimate_tile_count(bounds, task.min_zoom, task.max_zoom)
+        # 分母必须是"这次任务真正该有多少张"：多边形区域下它是 selected，
+        # 用矩形的候选数会让续传永远显示"还差 N 张"却再也下不动（Spec §12）。
+        total = region_target_tiles(region, bounds, task.min_zoom, task.max_zoom)
         zooms = list(range(int(task.min_zoom), int(task.max_zoom) + 1))
-        existing = count_existing_tiles(path, zooms) if path.is_file() else 0
+        existing = count_existing_region_tiles(path, zooms, region)
         task.total_tiles = total
         task.skipped_tiles = 0
+        # 区域信息一并写回任务记录：老任务第一次续传后就补上了这三个字段
+        task.region_type = region.region_type.value
+        task.region_id = region.region_id or ""
+        task.boundary_version = region.boundary_version or ""
         _logger.info("Existing tiles: %d", existing)
         _logger.info("Remaining tiles: %d", max(0, total - existing))
         for line in describe_existing_tiles(total, existing):
@@ -972,6 +1052,10 @@ class MapDownloadService:
             task=task,
             task_service=task_service,
             resumed=True,
+            # **必须**把区域传下去：漏了它，续传会按矩形候选区间去下，
+            # 于是一边报"目标 60 张"、一边把区域外那 40 张也下下来 ——
+            # 任务的定义被悄悄改掉了，而且只有对着账单才看得出（Spec §12）。
+            region=region,
         )
         _logger.info(
             "Resume finished id=%s skipped=%d downloaded=%d failed=%d db_tiles=%d/%d",
@@ -1005,6 +1089,7 @@ class MapDownloadService:
         task: DownloadTask | None,
         task_service,
         resumed: bool,
+        region: DownloadRegion | None = None,
     ) -> MapDownloadOutcome:
         """建库 → 起 sink → 下载 → drain → close → 校验（两条入口共用）。"""
         if not isinstance(bounds, GeoBounds):
@@ -1031,6 +1116,26 @@ class MapDownloadService:
         path = output_path
         name = map_name or path.stem
 
+        # --- 区域计划（Slice 16）---
+        # 放在**建库之前**：边界文件缺失/损坏时应当当场失败，而不是先建出一个
+        # 空 .mbtiles 再抛异常 —— 后者会在输出目录里留下一堆无法解释的空文件。
+        region_filter = build_region_filter(region)
+        total = (
+            estimate_tile_count(bounds, min_zoom, max_zoom)
+            if region_filter is None
+            else RegionTileEstimator(
+                region, region_filter=region_filter
+            ).estimate(min_zoom, max_zoom).selected_tiles
+        )
+        if region_filter is not None:
+            _logger.info(
+                "Polygon region: %s id=%s version=%s selected=%d",
+                region.name,
+                region.region_id,
+                region.boundary_version,
+                total,
+            )
+
         if merged and str(image_format).strip().lower() != "png":
             # 合成产物一律 PNG（Spec §4）：注记依赖透明通道，JPEG 存不下 alpha。
             # 与其落一个"metadata 说 jpg、内容其实是 png"的库，不如当场拒绝。
@@ -1049,6 +1154,11 @@ class MapDownloadService:
             source_map_type=map_type.value,
             with_labels=merged,
             composition=composition_for(merged),
+            # Spec §19：矩形也要显式写 region_type=rectangle —— Inspector 才不用
+            # 靠"没有这个键"去猜（那也是老文件的情形，两者得分得开）。
+            region_type=region.region_type.value if region else "rectangle",
+            region_id=region.region_id if region else "",
+            boundary_version=region.boundary_version if region else "",
         )
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,10 +1181,19 @@ class MapDownloadService:
         # --- 跳过判定：用 writer 自己的写连接查"库里已有什么" ---
         zooms = list(range(int(min_zoom), int(max_zoom) + 1))
         policy = resume_policy or ResumePolicy.disabled()
-        total = estimate_tile_count(bounds, min_zoom, max_zoom)
+        # total 已在建库前算好（多边形下即"选中瓦片数"），这里**不再重算**。
+        # 它有三个身份：进度条分母、ExistingTileIndex 的 expected_total
+        # （决定走 CACHED 还是 QUERY 模式）、收尾报告里的"目标张数"。
         # 只查一次（GROUP BY 一次拿回所有 zoom 的计数），别再放进生成器里循环调
         counts_by_zoom = writer.count_tiles_by_zoom()
-        existing_tiles = sum(counts_by_zoom.get(zoom, 0) for zoom in zooms)
+        if region_filter is None:
+            existing_tiles = sum(counts_by_zoom.get(zoom, 0) for zoom in zooms)
+        else:
+            # 多边形任务下"文件里一共有多少行"是个没有意义的数：区域外的瓦片
+            # 不算"已有"。报 100 而目标 60，用户会在收尾小结里看到
+            # "已有 100 / 目标 60"这种自相矛盾的一行（Spec §12）。
+            # 走**同一个函数**，于是服务、GUI 扫描、续传预算三处口径完全一致。
+            existing_tiles = count_existing_region_tiles(path, zooms, region)
         index = ExistingTileIndex(
             writer, policy, expected_total=total, zooms=zooms
         )
@@ -1144,6 +1263,8 @@ class MapDownloadService:
                     manager, on_progress, task=task, task_service=task_service
                 ),
                 should_skip_tile=skip_predicate,
+                region_filter=region_filter,
+                total_tiles=total,
             )
         finally:
             self._manager = None
@@ -1314,3 +1435,65 @@ def count_existing_tiles(path: str | Path, zooms) -> int:
     except (sqlite3.DatabaseError, OSError, RuntimeError):
         return 0
     return sum(count for zoom, count in counts.items() if zoom in wanted)
+
+
+# --------------------------------------------------------------------------- #
+# 区域计划（Slice 16）
+# --------------------------------------------------------------------------- #
+def region_target_tiles(
+    region: DownloadRegion | None,
+    bounds: GeoBounds,
+    min_zoom: int,
+    max_zoom: int,
+) -> int:
+    """本次任务的**目标瓦片数**（进度分母、续传的"共多少张"）。
+
+    - 矩形（或 ``region`` 为 ``None``）→ 候选数，与 Slice 0~15 逐位一致；
+    - 多边形 → 与区域真正相交的瓦片数（``selected``）。
+
+    用候选数当分母的后果不是"数字大一点"：进度条会永远停在 60% 然后突然跳满，
+    续传时"还差 1.4 万张"也会一直说不准（Spec §11/§12）。
+    """
+    if region is None or not region.is_polygon:
+        return estimate_tile_count(bounds, min_zoom, max_zoom)
+    return RegionTileEstimator(region).estimate(min_zoom, max_zoom).selected_tiles
+
+
+def count_existing_region_tiles(
+    path: str | Path,
+    zooms,
+    region: DownloadRegion | None,
+) -> int:
+    """统计库里**落在区域内**的瓦片数（多边形续传的"已有多少张"）。
+
+    为什么不复用 :func:`count_existing_tiles`：那个数是按 zoom 统计**全部行**的，
+    如果文件里混着区域外的瓦片（例如这个文件的前身是个矩形任务），"已有"就会
+    偏大、"还要下"偏小，用户面对的是一个永远补不平的缺口（Spec §12 明确要求
+    "Polygon 外 Tile 不能参与 Resume 统计"）。
+
+    这里逐张过一遍几何判定，与下载时的判据**同源**（同一个
+    :class:`~app.geo.PolygonTileRegionFilter`），不存在"下载算一套、统计算另一套"。
+    矩形区域直接转发给 :func:`count_existing_tiles`，不做任何额外 IO。
+    """
+    if region is None or not region.is_polygon:
+        return count_existing_tiles(path, zooms)
+
+    region_filter = build_region_filter(region)
+    if region_filter is None:  # pragma: no cover - is_polygon 已保证非空
+        return count_existing_tiles(path, zooms)
+
+    target = Path(path)
+    if not target.is_file():
+        return 0
+    total = 0
+    try:
+        with MBTilesReader(target) as reader:
+            for zoom in sorted({int(z) for z in zooms}):
+                for z, x, y in reader.iter_tile_coordinates(zoom):
+                    if region_filter.intersects_tile_xyz(z, x, y):
+                        total += 1
+    except (sqlite3.DatabaseError, OSError, RuntimeError):
+        # 与 count_existing_tiles 同一态度：数不出来就当作 0，
+        # 后续动作都是"去下"，没必要让调用方分辨。
+        return 0
+    return total

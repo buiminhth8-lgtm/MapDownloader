@@ -41,7 +41,9 @@ from app.package.models import (
     MANIFEST_BOUNDS_FIELDS,
     MANIFEST_FIELD_ORDER,
     MANIFEST_MBTILES_FIELDS,
+    MANIFEST_REGION_FIELDS,
     MapPackageManifest,
+    PackageRegion,
     UnsupportedFormatVersion,
     parse_manifest_dict,
 )
@@ -109,6 +111,11 @@ def _python_required_keys() -> set[str]:
     # description 是**可选**的（Slice 9 在 None 时压根不写这个键），
     # Android 也把它当可选处理 —— 所以两边都不算进"必填"。
     keys.discard("description")
+    # region 同样是**可选**的（Slice 16）。它进了 MANIFEST_FIELD_ORDER 只是为了
+    # 固定书写位置（在 bounds 之后），不代表必填：Slice ≤15 生成的包没有这个键，
+    # 必须继续能读（Spec §21/§29）。Android 侧也不用读它 —— 运行时加载只依赖
+    # bounds / minZoom / maxZoom / MBTiles（Spec §22）。
+    keys.discard("region")
     keys.discard("bounds")
     keys.discard("mbtiles")
     keys.update(f"bounds.{field}" for field in MANIFEST_BOUNDS_FIELDS)
@@ -190,6 +197,57 @@ def test_fixture_carries_every_required_field(v1_manifest_dict: dict) -> None:
         elif key not in v1_manifest_dict:
             missing.append(key)
     assert not missing, f"协议样例缺少必填字段：{missing}"
+
+
+# --------------------------------------------------------------------------- #
+# §2b region 是可选字段（Slice 16）
+# --------------------------------------------------------------------------- #
+def test_region_is_optional_for_backward_compatibility(v1_manifest_dict: dict) -> None:
+    """``region`` 是**可选**字段：旧包没有它必须照样读得出来（Spec §21/§29）。
+
+    这条断言守的是"Slice 16 没把 Slice 15 固化的旧包兼容性破坏掉"。样例
+    （代表 Slice 15 之前产出的包）不含 region，解析器必须不报错，且结果里
+    ``region is None`` —— **不能**被哪一层默默填成 rectangle：在 Inspector 眼里
+    "没有记录区域"（老包）与"记录了矩形"（新包）是两种含义，合并就没法区分了。
+    """
+    assert "region" not in v1_manifest_dict, "协议样例不该有 region（它代表旧包）"
+
+    manifest = parse_manifest_dict(v1_manifest_dict)
+    assert manifest.region is None
+
+
+def test_region_round_trips_and_keeps_field_order(v1_manifest_dict: dict) -> None:
+    """带上 region 后仍能往返，其余字段逐字节不变，且位置固定。"""
+    with_region = dict(v1_manifest_dict)
+    with_region["region"] = {
+        "type": "polygon",
+        "id": "china",
+        "boundaryVersion": "2026-09",
+    }
+
+    manifest = parse_manifest_dict(with_region)
+    assert manifest.region == PackageRegion(
+        region_type="polygon", region_id="china", boundary_version="2026-09"
+    )
+
+    data = manifest.to_dict()
+    keys = list(data)
+    # 顺序由 MANIFEST_FIELD_ORDER 决定：region 紧跟在 bounds 之后
+    assert keys.index("region") == keys.index("bounds") + 1
+    assert list(data["region"]) == [
+        key for key in MANIFEST_REGION_FIELDS if key in data["region"]
+    ]
+
+    # 去掉 region 应当**逐字节**还原成样例 —— 证明新增字段没有波及任何既有字段
+    data.pop("region")
+    assert data == v1_manifest_dict
+
+
+def test_rectangle_region_omits_empty_subfields() -> None:
+    """矩形区域只写 ``type``：空字段写成 ``null`` 会在 Android 侧变成字符串 "null"。"""
+    assert PackageRegion.for_rectangle().to_dict() == {"type": "rectangle"}
+    # 残缺写法（``{"region": {}}``）落回最保守解释
+    assert PackageRegion.from_dict({}) == PackageRegion(region_type="rectangle")
 
 
 def test_fixture_field_order_is_canonical(v1_manifest_dict: dict) -> None:

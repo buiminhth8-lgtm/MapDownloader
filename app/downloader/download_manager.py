@@ -4,6 +4,8 @@
 
     Tile Producer (协程，惰性生成)
           ↓
+      region_filter.intersects_tile(tile)   # Slice 16：区域外的瓦片在这里丢掉
+          ↓ True（区域外直接 continue，不计数）
       should_skip_tile(tile)         # Slice 5：已有瓦片在这里就被拦下
           ↓ False
       asyncio.Queue  ← 有界，容量 = concurrency * 4
@@ -61,6 +63,7 @@ import time
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Iterator
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from app.config.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -86,7 +89,7 @@ from app.downloader.tile_downloader import TileDownloader
 from app.geo import GeoBounds, TileRange, calculate_tile_ranges
 from app.models.map_layer import MapLayerType, MapType
 
-__all__ = ["DownloadManager", "iter_tile_coordinates"]
+__all__ = ["DownloadManager", "iter_tile_coordinates", "RegionFilterLike"]
 
 #: ``layer`` 参数允许的取值。
 #:
@@ -98,6 +101,23 @@ __all__ = ["DownloadManager", "iter_tile_coordinates"]
 #: （``downloader.download_tile(tile, layer)``）。因此这里不需要一套
 #: "合成模式下换成别的参数"的分支——下载调度与"一层还是两层"无关。
 LayerArgument = MapLayerType | MapType
+
+
+class RegionFilterLike(Protocol):
+    """区域过滤器的**结构化类型**（Slice 16）。
+
+    本模块只需要它回答一个问题："这张瓦片要不要下？"。刻意只声明这一个方法，
+    而不是 import :class:`~app.geo.PolygonTileRegionFilter` 这个具体类：下载调度
+    与"用多边形还是别的什么形状裁剪"是两件独立的事，测试里传一个
+    ``lambda tile: ...`` 的假过滤器也应当能跑。
+
+    实现方**必须**保证判定是纯函数式的（同一张瓦片每次问都得到同样的答案）：
+    生产者的顺序遍历依赖这一点。
+    """
+
+    def intersects_tile(self, tile: TileCoordinate) -> bool:
+        """``True`` 表示这张瓦片落在区域内，应当下载。"""
+        ...
 
 
 _logger = logging.getLogger(__name__)
@@ -360,6 +380,8 @@ class DownloadManager:
         on_tile: TileCallback | None = None,
         on_progress: ProgressCallback | None = None,
         should_skip_tile: SkipPredicate | None = None,
+        region_filter: RegionFilterLike | None = None,
+        total_tiles: int | None = None,
     ) -> DownloadSummary:
         """下载覆盖范围内的全部瓦片。
 
@@ -379,6 +401,18 @@ class DownloadManager:
                 **判定发生在生产者里，也就是任何 HTTP 请求之前**——
                 这是 Spec §5 的硬性要求："禁止先下载，再发现数据库里已经有"。
                 判定本身可以是同步函数，也可以是协程函数。
+            region_filter: 区域过滤器（Slice 16 的多边形裁剪）。给了它以后，
+                **只有** :meth:`RegionFilterLike.intersects_tile` 返回 ``True``
+                的候选瓦片才会进入队列；区域外的瓦片**连计数都不参与** ——
+                既不算 ``failed``，也不算 ``skipped_existing``。这一点是
+                Spec §10 的硬性要求：把区域外的瓦片算进失败或跳过，会让
+                用户看到"失败 1.4 万张"这种纯粹由裁剪造成的假故障。
+
+                传 ``None``（默认）时行为与 Slice 0~15 完全一致。
+            total_tiles: 本次任务的**目标张数**（进度分母）。省略时按矩形候选数
+                计算；给了 ``region_filter`` 而没给它，本方法会自己流式数一遍
+                （正确但会多遍历一轮候选瓦片，千万级任务请由调用方传预算好的值 ——
+                :class:`~app.geo.RegionTileEstimator` 已经算过一次了）。
 
         Returns:
             :class:`DownloadSummary`。被取消时 ``cancelled=True``，已下载的
@@ -400,10 +434,26 @@ class DownloadManager:
             raise ValueError(
                 f"should_skip_tile 必须是可调用对象，实际为 {type(should_skip_tile).__name__}"
             )
+        if region_filter is not None and not callable(
+            getattr(region_filter, "intersects_tile", None)
+        ):
+            raise ValueError(
+                "region_filter 必须提供 intersects_tile(tile) 方法，"
+                f"实际为 {type(region_filter).__name__}"
+            )
 
         # 交给 Slice 1 做 zoom 校验与瓦片统计（这里不复制任何公式）
         ranges = calculate_tile_ranges(bounds, min_zoom, max_zoom)
-        total = sum(item.tile_count for item in ranges)
+        if total_tiles is not None:
+            total = int(total_tiles)
+            if total < 0:
+                raise ValueError(f"total_tiles 不能为负，实际为 {total}")
+        elif region_filter is None:
+            total = sum(item.tile_count for item in ranges)
+        else:
+            # 没给预算值：自己流式数一遍选中瓦片。**必须用 selected 而不是
+            # candidate**，否则进度条永远到不了 100%（分母里混着区域外瓦片）。
+            total = self._count_region_tiles(bounds, min_zoom, max_zoom, region_filter)
 
         self._reset_state(total)
         self._loop = asyncio.get_running_loop()
@@ -419,6 +469,7 @@ class DownloadManager:
                 on_tile,
                 on_progress,
                 should_skip_tile,
+                region_filter,
             )
         finally:
             # 无论正常结束、取消还是异常，都必须把运行时状态清干净，
@@ -438,6 +489,7 @@ class DownloadManager:
         on_tile: TileCallback | None,
         on_progress: ProgressCallback | None,
         should_skip_tile: SkipPredicate | None = None,
+        region_filter: RegionFilterLike | None = None,
     ) -> DownloadSummary:
         """真正干活的部分（状态已就绪，异常由 :meth:`download` 统一收尾）。"""
         started = time.perf_counter()
@@ -472,6 +524,7 @@ class DownloadManager:
                 queue,
                 iter_tile_coordinates(bounds, min_zoom, max_zoom),
                 should_skip_tile,
+                region_filter,
             ),
             name="tile-producer",
         )
@@ -512,14 +565,18 @@ class DownloadManager:
         queue: asyncio.Queue[TileCoordinate | None],
         tiles: Iterator[TileCoordinate],
         should_skip_tile: SkipPredicate | None = None,
+        region_filter: RegionFilterLike | None = None,
     ) -> None:
-        """生产者：把瓦片喂进有界队列，受闸门、取消与"跳过判定"控制。
+        """生产者：把瓦片喂进有界队列，受闸门、取消、"区域判定"与"跳过判定"控制。
 
-        跳过判定放在这里（而不是 worker 里）是**有意为之**：
+        两道判定都放在这里（而不是 worker 里）是**有意为之**：
 
         - 命中的瓦片**根本不会进队列**，因此绝不会消耗 HTTP 配额，
           也绝不会出现"下完了才发现库里已经有"的浪费；
         - 判定与下载的先后顺序在代码结构上就是确定的，不依赖 worker 的自觉。
+
+        两道的顺序也有讲究：**先区域、后跳过**。区域外的瓦片连"要不要跳过"
+        都不必问 —— 它压根不属于这次任务，去查一次数据库纯属浪费。
         """
         assert self._gate is not None and self._cancel_event is not None
         gate = self._gate
@@ -532,6 +589,16 @@ class DownloadManager:
             await gate.wait()
             if cancel_event.is_set():
                 return
+
+            if region_filter is not None and not region_filter.intersects_tile(tile):
+                # 区域外的候选瓦片：**不计数、不入队**，直接翻篇。
+                #
+                # 这里刻意连 ``self._counters`` 都不碰：一旦给它记个
+                # failed / skipped，用户就会在收尾报告里看到"失败 1.4 万张"
+                # 或者"跳过 1.4 万张"，而真相是这些瓦片本来就不该被下
+                # （Spec §10/§32）。把它们排除在计数之外，total（=选中瓦片数）
+                # 与各计数项才自洽。
+                continue
 
             if should_skip_tile is not None:
                 try:
@@ -551,6 +618,24 @@ class DownloadManager:
                     continue
 
             await queue.put(tile)
+
+    def _count_region_tiles(
+        self,
+        bounds: GeoBounds,
+        min_zoom: int,
+        max_zoom: int,
+        region_filter: RegionFilterLike,
+    ) -> int:
+        """流式数一遍"选中瓦片"数（仅在调用方没给 ``total_tiles`` 时用到）。
+
+        刻意用生成器逐张过，不落地任何列表：全国 z14 的候选瓦片是千万级，
+        先 materialize 再过滤会把内存吃光（Spec §9）。
+        """
+        count = 0
+        for tile in iter_tile_coordinates(bounds, min_zoom, max_zoom):
+            if region_filter.intersects_tile(tile):
+                count += 1
+        return count
 
     async def _worker(
         self,

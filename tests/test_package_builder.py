@@ -38,10 +38,12 @@ from app.config.settings import (
     PACKAGE_MANIFEST_FILENAME,
     PACKAGE_MBTILES_FILENAME,
 )
-from app.geo import GeoBounds, calculate_tile_ranges
+from app.geo import GeoBounds, RegionPreset, calculate_tile_ranges
+from app.geo import region as region_module
 from app.mbtiles import MBTilesMetadata, MBTilesWriter
 from app.models.map_layer import COMPOSITION_MERGED, COMPOSITION_SINGLE
 from app.package import (
+    MANIFEST_FIELD_ORDER,
     MapPackageBuilder,
     PackageValidationResult,
     make_package_id,
@@ -941,3 +943,229 @@ def test_build_does_not_raise_on_weird_inputs(work_dir: Path) -> None:
     assert result.errors and "不存在" in result.errors[0]
     assert result.package_dir is None
     assert not (work_dir / "packages").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 区域子对象（Slice 16，Spec §21）
+#
+# 地图包协议 V1 新增了一个**可选**的 ``region`` 子对象。三件事必须同时成立：
+# 1. 多边形包要能把它写进去（Android 与 Inspector 都靠它判断"这是按行政区裁的"）；
+# 2. 矩形包写的是"显式的矩形"，与"没有这个键的老包"分得开；
+# 3. 老包（MBTiles metadata 里没有 region_* 三键）产出的 manifest 必须
+#    **逐字节**与 Slice ≤15 一致 —— 加一个字段不该动到任何既有字段。
+# --------------------------------------------------------------------------- #
+BOUNDARY_FILE = "china.geojson"
+BOUNDARY_VERSION = "2026-09"
+
+
+def _register_test_preset(work_dir: Path, monkeypatch) -> None:
+    """注册一个 ``region_id=china`` 的**临时**预设，边界文件放在临时目录里。
+
+    为什么要注册：多边形源的 ``region_id`` 会触发**打包前的覆盖度检查**
+    （Spec §23），而"边界文件找不到"是一条 WARNING —— WARNING 会让构建器
+    停下来等用户确认（``accept_warnings`` 默认 ``False``），用例就会在
+    ``assert result.success`` 上摔一跤，测的却不再是 manifest 里的 region。
+
+    为什么边界多边形取**恰好等于候选矩形**：覆盖度检查会按行政区几何算
+    expected。取一个比 ``BOUNDS`` 更大的多边形，就会多出几张"应该有但没有"的
+    瓦片 → 又是一条 WARNING。取成相等，expected 与源库里的实际张数一致。
+
+    为什么沿用 ``china`` 这个 id：用例要验证的正是"真实下载时那个 region_id
+    会不会原样进 manifest"，换成自造 id 就少测了这一层。资源目录指向临时目录 ⇒
+    仓库的 ``resources/regions/`` 保持干净（Spec §3：国界数据不内置、不伪造）。
+    """
+    (work_dir / BOUNDARY_FILE).write_text(
+        json.dumps(
+            {
+                "type": "Feature",
+                "properties": {
+                    "name": "测试矩形区",
+                    "id": "china",
+                    "boundaryVersion": BOUNDARY_VERSION,
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [BOUNDS.west, BOUNDS.south],
+                            [BOUNDS.east, BOUNDS.south],
+                            [BOUNDS.east, BOUNDS.north],
+                            [BOUNDS.west, BOUNDS.north],
+                            [BOUNDS.west, BOUNDS.south],
+                        ]
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    item = RegionPreset(
+        region_id="china",
+        name="测试矩形区",
+        geojson_filename=BOUNDARY_FILE,
+        default_boundary_version=BOUNDARY_VERSION,
+    )
+    monkeypatch.setattr(region_module, "REGION_RESOURCE_DIR", work_dir)
+    monkeypatch.setattr(region_module, "REGION_PRESETS", (item,))
+
+
+def test_polygon_region_is_copied_into_the_manifest(
+    work_dir: Path, monkeypatch
+) -> None:
+    """MBTiles 里写着 polygon / china / 2026-09 → manifest 里原样出现。"""
+    _register_test_preset(work_dir, monkeypatch)
+    source = _make_mbtiles(
+        work_dir / "china.mbtiles",
+        metadata=MBTilesMetadata.for_bounds(
+            BOUNDS,
+            8,
+            9,
+            name="china",
+            region_type="polygon",
+            region_id="china",
+            boundary_version="2026-09",
+        ),
+    )
+
+    result = MapPackageBuilder().build(source, work_dir / "packages")
+
+    assert result.success is True, result.errors
+    manifest = _read_manifest(result.package_dir)
+    assert manifest["region"] == {
+        "type": "polygon",
+        "id": "china",
+        "boundaryVersion": "2026-09",
+    }
+    # 协议里的键顺序是固定的（Android 侧与人工比对都依赖它）
+    assert list(manifest).index("region") == list(manifest).index("bounds") + 1
+
+
+def test_rectangle_region_is_written_as_a_type_only_object(work_dir: Path) -> None:
+    """矩形包写 ``{"type": "rectangle"}``：显式，但不多出两个空值键。"""
+    source = _make_mbtiles(
+        work_dir / "rect.mbtiles",
+        metadata=MBTilesMetadata.for_bounds(
+            BOUNDS, 8, 9, name="rect", region_type="rectangle"
+        ),
+    )
+
+    result = MapPackageBuilder().build(source, work_dir / "packages")
+
+    assert result.success is True, result.errors
+    manifest = _read_manifest(result.package_dir)
+    assert manifest["region"] == {"type": "rectangle"}
+    assert "id" not in manifest["region"]
+    assert "boundaryVersion" not in manifest["region"]
+
+
+def test_old_source_without_region_metadata_produces_no_region_key(
+    work_dir: Path,
+) -> None:
+    """Slice ≤15 的源文件（metadata 里没有 region_* 三键）→ manifest 里没有 region。
+
+    这条是这次改动最重要的兼容锚点：给了 region_* 才写 region，没给就一个字都不写。
+    用"两次构建的 manifest 逐字节相等"来做断言 —— 只断言 ``"region" not in ...``
+    还不够，那样漏掉"顺手改动了别的字段"这种情况。
+    """
+    source = _make_mbtiles(work_dir / "old.mbtiles")  # 默认不带任何 region_* 键
+    assert "region_type" not in _source_metadata(source), "夹具前提：源文件是老的"
+
+    result = MapPackageBuilder().build(source, work_dir / "packages", package_name="old")
+
+    assert result.success is True, result.errors
+    manifest_text = (Path(result.package_dir) / PACKAGE_MANIFEST_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    manifest = json.loads(manifest_text)
+
+    assert "region" not in manifest
+    # 与"把 region 加进去之前"应有的样子逐字节一致：期望值直接由**生产的那张
+    # 字段顺序表**推出来（``MANIFEST_FIELD_ORDER`` 去掉两个可选键），而不是在
+    # 这里再手抄一份 —— 手抄的那份迟早和生产不一致，而且错的时候看着很像
+    # "协议改了"，实际只是测试记错了字段名。
+    # ``list(manifest) == expected_keys`` 同时钉住**键集**与**书写顺序**：
+    # 多一个键、少一个键、或把 region 插错位置，都会在这里红。
+    optional_keys = {"description", "region"}
+    expected_keys = [key for key in MANIFEST_FIELD_ORDER if key not in optional_keys]
+    assert list(manifest) == expected_keys, (
+        "既不该少字段、也不该多字段，顺序也必须与 MANIFEST_FIELD_ORDER 一致"
+    )
+
+
+def test_polygon_and_rectangle_packages_differ_only_by_region(
+    work_dir: Path, monkeypatch
+) -> None:
+    """同一个库、只改 region_* 三键 → manifest 的差异**只有** region 一项。
+
+    这条把"新增可选字段没有波及既有字段"钉死：任何一处顺手改动（例如
+    ``createdAt`` 的格式、``bounds`` 的键序）都会在这里显形。
+    """
+    _register_test_preset(work_dir, monkeypatch)
+    common = dict(name="cmp", source_map_type="vector", composition=COMPOSITION_SINGLE)
+    polygon_source = _make_mbtiles(
+        work_dir / "poly.mbtiles",
+        metadata=MBTilesMetadata.for_bounds(
+            BOUNDS,
+            8,
+            9,
+            region_type="polygon",
+            region_id="china",
+            boundary_version="2026-09",
+            **common,
+        ),
+    )
+    rectangle_source = _make_mbtiles(
+        work_dir / "rect2.mbtiles",
+        metadata=MBTilesMetadata.for_bounds(
+            BOUNDS, 8, 9, region_type="rectangle", **common
+        ),
+    )
+
+    # 显式给同一个 package_id：包的 id 是由"名字 + 当天日期"算出来的
+    # （``make_package_id``），不固定住的话它可能因为跨午夜而变成一条
+    # 与 region 无关的差异 —— 那样这个用例就变成偶发红了。
+    poly_result = MapPackageBuilder().build(
+        polygon_source, work_dir / "pk1", package_id="cmp_fixed"
+    )
+    rect_result = MapPackageBuilder().build(
+        rectangle_source, work_dir / "pk2", package_id="cmp_fixed"
+    )
+    assert poly_result.success is True, poly_result.errors
+    assert rect_result.success is True, rect_result.errors
+
+    poly_manifest = _read_manifest(poly_result.package_dir)
+    rect_manifest = _read_manifest(rect_result.package_dir)
+
+    assert poly_manifest["region"] == {
+        "type": "polygon",
+        "id": "china",
+        "boundaryVersion": "2026-09",
+    }
+    assert rect_manifest["region"] == {"type": "rectangle"}
+
+    # 两个源的 metadata 表本身就不同（region_* 三键不一样），所以库文件的
+    # 字节数 / SHA256 必然不同 —— 那是**事实**，不是协议差异。这里先确认
+    # ``mbtiles`` 子对象的**形状**没变，再把它和 createdAt 一起排除。
+    assert set(poly_manifest["mbtiles"]) == set(rect_manifest["mbtiles"])
+    assert poly_manifest["mbtiles"]["file"] == rect_manifest["mbtiles"]["file"]
+
+    differences = {
+        key
+        for key in set(poly_manifest) | set(rect_manifest)
+        if poly_manifest.get(key) != rect_manifest.get(key)
+    }
+    # ``createdAt`` 是构建时刻，本来就每次不同（同一秒内也可能相同），与 region
+    # 无关；除它之外，差异**只能**是 region。
+    assert differences - {"createdAt", "mbtiles"} == {"region"}, differences
+
+
+def _source_metadata(path: Path) -> dict[str, str]:
+    """读源 MBTiles 的 metadata 表（只用来断言夹具本身是"老文件"）。"""
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    try:
+        return {str(k): str(v) for k, v in conn.execute("SELECT name, value FROM metadata")}
+    finally:
+        conn.close()

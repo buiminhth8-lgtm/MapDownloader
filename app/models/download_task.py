@@ -147,6 +147,23 @@ class DownloadTask:
     #: 老记录里没有这个键，读回来正好等于当时的事实。
     with_labels: bool = False
 
+    #: 下载区域类型（``RegionType.value``：``rectangle`` / ``polygon``）。Slice 16 新增。
+    #: 空串表示"这条记录没有区域信息"——Slice ≤15 建的老任务都是这个状态，
+    #: 恢复时按矩形处理（那正是它们当初的下载行为）。
+    region_type: str = ""
+
+    #: 行政区标识（``china`` …）。矩形任务与老任务为空串。
+    region_id: str = ""
+
+    #: 边界数据版本，用来回答"这批瓦片是按哪一版边界裁的"。
+    #: 边界数据更新后同一个 ``region_id`` 的 expected 瓦片集会变，
+    #: 覆盖度检查需要它才能说清"对不上是因为换了数据"。
+    #:
+    #: 刻意**不把 GeoJSON 本身存进来**（Spec §13）：一份省级边界就有几 MB，
+    #: 塞进 ``tasks.json`` 会让每次进度落盘都变成一次大写入。恢复时按
+    #: ``region_id`` 回到预设表找边界文件即可。
+    boundary_version: str = ""
+
     #: 进度计数器（Slice 5 起是持久化的权威来源，Spec §7）
     total_tiles: int = 0
     completed_tiles: int = 0

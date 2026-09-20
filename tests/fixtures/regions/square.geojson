@@ -1,0 +1,20 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "测试方框",
+    "id": "test-square",
+    "boundaryVersion": "2026.09-fixture"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [116.0, 39.0],
+        [117.0, 39.0],
+        [117.0, 40.0],
+        [116.0, 40.0],
+        [116.0, 39.0]
+      ]
+    ]
+  }
+}

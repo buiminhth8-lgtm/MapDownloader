@@ -92,10 +92,16 @@ from app.config.settings import (
     WEB_MERCATOR_MAX_LAT,
 )
 from app.geo import (
+    DownloadRegion,
     GeoBounds,
+    GeoJSONError,
+    PolygonTileRegionFilter,
+    RegionType,
     TileRange,
+    build_region_filter,
     calculate_tile_range,
     format_size,
+    region_from_metadata,
     tms_y_to_xyz_y,
     xyz_y_to_tms_y,
 )
@@ -946,6 +952,17 @@ def check_coverage(
         result.notices.append(f"无法进行覆盖完整性检查：bounds 不是有效范围（{exc}）")
         return
 
+    # --- 区域（Slice 16）：多边形包按行政区几何算 expected，而不是按 bounding box ---
+    region, region_filter, region_note = _resolve_coverage_region(result, bounds)
+    if region_note:
+        # **不退回矩形**：那会把区域外的瓦片全报成缺失（一个完整的多边形包会被
+        # 判成缺 60%），属于 Spec §20 明令禁止的误报。宁可承认"不知道"。
+        result.warnings.append(
+            f"{region_note}；覆盖完整性无法按行政区几何判定，已标记为"
+            "未知（不按外包矩形估算，以免把区域外瓦片误报成缺失）"
+        )
+        return
+
     by_zoom = {stats.zoom: stats for stats in result.zoom_stats}
     expected_total = 0
     actual_total = 0
@@ -958,16 +975,35 @@ def check_coverage(
         if should_stop is not None and should_stop():
             aborted = True
             break
-        tile_range = calculate_tile_range(bounds, zoom)
-        expected = tile_range.tile_count
-        actual = reader.count_tiles_in_range(
-            zoom,
-            tile_range.min_x,
-            tile_range.max_x,
-            xyz_y_to_tms_y(zoom, tile_range.max_y),  # XYZ 的 max_y ↔ TMS 的 min
-            xyz_y_to_tms_y(zoom, tile_range.min_y),
-        )
-        missing = max(0, expected - actual)
+        if region_filter is None:
+            tile_range = calculate_tile_range(bounds, zoom)
+            expected = tile_range.tile_count
+            actual = reader.count_tiles_in_range(
+                zoom,
+                tile_range.min_x,
+                tile_range.max_x,
+                xyz_y_to_tms_y(zoom, tile_range.max_y),  # XYZ 的 max_y ↔ TMS 的 min
+                xyz_y_to_tms_y(zoom, tile_range.min_y),
+            )
+            missing = max(0, expected - actual)
+            if missing and len(details) < MAX_MISSING_TILE_DETAILS:
+                found = _missing_in_range(
+                    reader, tile_range, MAX_MISSING_TILE_DETAILS - len(details)
+                )
+                details.extend(found)
+        else:
+            # 多边形：expected 只数"与区域相交"的瓦片（Spec §20）。
+            # 按外包矩形数的话，区域外那一大片会被算成"应该有但没有"。
+            expected, actual, found = _polygon_zoom_coverage(
+                reader,
+                bounds,
+                zoom,
+                region_filter,
+                MAX_MISSING_TILE_DETAILS - len(details),
+            )
+            missing = max(0, expected - actual)
+            details.extend(found)
+
         expected_total += expected
         actual_total += actual
         missing_total += missing
@@ -979,10 +1015,6 @@ def check_coverage(
             result.zoom_stats.append(stats)
         stats.expected_tiles = expected
         stats.missing_tiles = missing
-
-        if missing and len(details) < MAX_MISSING_TILE_DETAILS:
-            found = _missing_in_range(reader, tile_range, MAX_MISSING_TILE_DETAILS - len(details))
-            details.extend(found)
 
         emit(
             progress_callback,
@@ -1008,7 +1040,101 @@ def check_coverage(
     result.missing_details = details
     result.missing_details_truncated = max(0, missing_total - len(details))
 
+    if region_filter is not None and region is not None:
+        # 说清"这个期望值是按什么算的"：同一个包按矩形算与按行政区算会得到
+        # 天差地别的 expected，报告里不写明依据，数字就没法解释。
+        result.notices.append(
+            f"覆盖完整性按行政区几何计算（{region.describe()}）："
+            f"期望 {expected_total:,} 张只统计与区域相交的瓦片"
+        )
+
     _report_coverage(result)
+
+
+def _resolve_coverage_region(
+    result: MBTilesDiagnosticsResult,
+    bounds: GeoBounds,
+) -> tuple[DownloadRegion | None, PolygonTileRegionFilter | None, str]:
+    """读 metadata 里的区域信息并准备过滤器（Slice 16，Spec §20）。
+
+    Returns:
+        ``(region, region_filter, note)``：
+
+        - 矩形包 / 老包（没有 ``region_type``）→ ``(None, None, "")``，
+          调用方走原来的矩形路径，行为与 Slice ≤15 逐位一致；
+        - 多边形且边界可用 → 过滤器；
+        - 多边形但边界不可用 / 认不出 ``region_id`` → ``note`` 非空，
+          调用方应把覆盖度标成**未知**。
+
+    "边界不可用就标未知"是 Spec §20 的硬性要求，理由很实际：按 bounding box
+    去算一个多边形包的 expected，会得出"缺了区域外那 60% 瓦片"的结论，
+    而那个包很可能是**完整**的。误报比不知道更糟 —— 用户会去重下几万张。
+    """
+    region_type = str(result.metadata.get("region_type") or "").strip().lower()
+    if RegionType.parse(region_type) is RegionType.RECTANGLE:
+        return None, None, ""
+
+    region, note = region_from_metadata(
+        region_type,
+        result.metadata.get("region_id"),
+        result.metadata.get("boundary_version"),
+        bounds,
+    )
+    if region is None:
+        return None, None, note or "行政区边界资源不可用"
+
+    try:
+        region_filter = build_region_filter(region)
+    except GeoJSONError as exc:
+        return None, None, f"行政区边界资源不可用：{exc}"
+    if region_filter is None:  # pragma: no cover - is_polygon 已保证非空
+        return None, None, "行政区边界资源不可用：无法构造几何过滤器"
+    return region, region_filter, ""
+
+
+def _polygon_zoom_coverage(
+    reader: MBTilesReader,
+    bounds: GeoBounds,
+    zoom: int,
+    region_filter: PolygonTileRegionFilter,
+    detail_limit: int,
+) -> tuple[int, int, list[str]]:
+    """按行政区几何统计某个 zoom 的 ``(expected, actual, missing_details)``。
+
+    算法（两次流式遍历，都不落地"期望瓦片全集"）：
+
+    1. 用 ``reader.iter_tile_coordinates(zoom)`` 读库里该级别的坐标
+       （**只读三列，不读 BLOB**），把**落在区域内**的存进一个小集合；
+    2. 遍历外包矩形的格子，对每张与区域相交的瓦片：``expected += 1``；
+       再查它在不在第 1 步的集合里 —— 在则 ``actual += 1``，不在则记一条缺失明细。
+
+    ``expected == actual + missing`` **恒成立**（两者都只在"区域内 ∩ 候选范围内"
+    这个集合上统计）。这一点很重要：如果库里混着区域外的瓦片（例如这个文件的
+    前身是个矩形任务），按"库内总数 - 区域外"去凑就会得出自相矛盾的三个数字。
+
+    内存占用与**库内该级别的瓦片数**同阶，与"区域面积"无关 —— 全国 z14 的
+    期望瓦片是千万级，先 materialize 再比对会直接把内存吃光（Spec §9）。
+    """
+    present: set[tuple[int, int]] = set()
+    for z, x, y in reader.iter_tile_coordinates(zoom):
+        if region_filter.intersects_tile_xyz(z, x, y):
+            present.add((x, y))
+
+    tile_range = calculate_tile_range(bounds, zoom)
+    expected = 0
+    actual = 0
+    details: list[str] = []
+    for y in range(tile_range.min_y, tile_range.max_y + 1):
+        for x in range(tile_range.min_x, tile_range.max_x + 1):
+            if not region_filter.intersects_tile_xyz(zoom, x, y):
+                continue
+            expected += 1
+            if (x, y) in present:
+                actual += 1
+                continue
+            if len(details) < detail_limit:
+                details.append(f"{zoom}/{x}/{y}")
+    return expected, actual, details
 
 
 def _missing_in_range(

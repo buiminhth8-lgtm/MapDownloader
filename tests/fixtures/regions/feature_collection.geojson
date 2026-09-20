@@ -1,0 +1,37 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "测试方框 A", "id": "test-a" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [116.0, 39.0],
+            [117.0, 39.0],
+            [117.0, 40.0],
+            [116.0, 40.0],
+            [116.0, 39.0]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "测试方框 B", "id": "test-b", "boundaryVersion": "2026.09-fixture" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [118.0, 39.0],
+            [119.0, 39.0],
+            [119.0, 40.0],
+            [118.0, 40.0],
+            [118.0, 39.0]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -133,13 +133,17 @@ from app.config.settings import (
 )
 from app.downloader import DownloadProgress, ResumePolicy
 from app.geo import (
+    DownloadRegion,
     GeoBounds,
-    calculate_tile_ranges,
+    GeoJSONError,
+    RegionTileEstimate,
+    RegionTileEstimator,
+    RegionType,
     estimate_size_bytes,
-    estimate_tile_count,
     format_size,
     lat_to_tile_y,
     lon_to_tile_x,
+    region_from_task,
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType, MapType, describe_map_type
@@ -287,6 +291,9 @@ class _DownloadPlan:
             开启中文注记后每张瓦片要请求底图 + 注记两次，因此这个数字是
             ``effective_tiles`` 的两倍 —— 大任务提示必须给出它，
             否则用户看到"配额消耗"时无法预估真实开销。
+        region: 下载区域（Slice 16）。``None`` = 纯矩形（老行为）。
+        estimate: 区域估算结果（Slice 16），只用于界面展示；
+            ``total`` 才是权威数字，且它取自 ``estimate.selected_tiles``。
     """
 
     provider: TiandituProvider
@@ -308,6 +315,26 @@ class _DownloadPlan:
     map_type: MapType | None = None
     with_labels: bool = False
     requests: int = 0
+    region: DownloadRegion | None = None
+    estimate: RegionTileEstimate | None = None
+
+    @property
+    def is_polygon(self) -> bool:
+        """本次是否按行政区域（多边形）裁剪。"""
+        return self.region is not None and self.region.region_type is RegionType.POLYGON
+
+    @property
+    def region_text(self) -> str:
+        """一行区域说明（日志与结果区共用）。
+
+        矩形时不写"自定义矩形"这种废话——用户填的就是四个数字，再报一遍
+        只是噪音；行政区域时必须写名字，否则日志里看不出这次下的是哪块地。
+        """
+        if self.region is None:
+            return ""
+        if not self.is_polygon:
+            return ""
+        return self.region.name
 
     @property
     def is_resume(self) -> bool:
@@ -440,8 +467,11 @@ class MainWindow(QMainWindow):
         self._transfer_overwrite = False
         #: 关窗确认结果（Spec §17：先提示，用户确认后才真正退出）
         self._exit_confirmed = False
-        #: 最近一次"计算"的结果，用于输出路径变化时重绘「输出文件」行
-        self._last_calculation: tuple[int, str] | None = None
+        #: 最近一次"计算"的结果（张数 / 容量文本 / 区域预估），用于输出路径
+        #: 变化时重绘结果区。带上 ``estimate`` 是为了重绘时**不丢**行政区域的
+        #: 候选 / 过滤 / Zoom 明细那几行——只留张数的话，改个文件名就会把
+        #: "这是一个被裁剪过的任务"这条信息抹掉。
+        self._last_calculation: tuple[int, str, RegionTileEstimate] | None = None
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -586,6 +616,10 @@ class MainWindow(QMainWindow):
         # Slice 6：切换地图类型 / 勾选中文注记会改变每张瓦片的请求次数，
         # 已算出的「预估结果」要跟着重画那一行请求量。
         self.download_panel.layer_plan_changed.connect(self._refresh_output_preview)
+        # Slice 16：区域（矩形 / 行政区）一变，上一次的预估结论就不再成立。
+        # 这一条是**必备**的：行政区域模式下边界文件不可用时，界面上如果还留着
+        # 上一个矩形算出来的张数，用户看到的就是一个"静默退化成矩形"的结论。
+        self.download_panel.region_changed.connect(self._on_region_changed)
         self.device_panel.refresh_requested.connect(self._on_refresh_devices)
         # Slice 10：名字沿用 Slice 0 的 import_requested，语义变成"传输到设备"
         self.device_panel.import_requested.connect(self._on_transfer_to_android)
@@ -651,10 +685,39 @@ class MainWindow(QMainWindow):
     # 槽：瓦片计算（Slice 1）
     # ------------------------------------------------------------------ #
     @Slot()
+    def _on_region_changed(self) -> None:
+        """下载区域变了 → 作废上一次的预估结论（Slice 16）。
+
+        为什么必须显式作废，而不是"等用户再点一次计算"：
+
+        - **旧的数字会张冠李戴。** 一次计算的结果属于**当时那个区域**。用户从
+          「自定义矩形」切到「行政区域」时，结果区里那句"预计 56 张"还在，而它
+          说的是矩形 —— 看起来就像"行政区域也算出了 56 张"。
+        - **错误提示会被擦掉。** 切换后若边界文件不可用，用户点「计算」会看到一句
+          人话错误；但接下来只要动一下输出目录或勾一下注记，
+          :meth:`_refresh_output_preview` 就会拿**缓存里的旧结论**把错误提示盖回去，
+          用户于是以为算成功了。这正是 Spec §16/§32 要禁的"静默退回矩形"。
+
+        所以这里做三件事：清缓存、清结果区、把「总瓦片」退回占位。日志留一行，
+        免得用户以为界面是自己抖了一下。
+        """
+        had_result = self._last_calculation is not None
+        self._last_calculation = None
+        self.download_panel.clear_calculation_result()
+        if not had_result:
+            return
+        self._status_values["tile_total"].setText("0")
+        self.log_panel.append_log("下载区域已变更：上一次的瓦片预估已作废，请重新「计算」")
+
+    @Slot()
     def _run_tile_math(self) -> None:
         """把当前表单交给 ``app.geo`` 计算瓦片数量与预估容量。
 
         本方法只做"读表单 → 调 geo → 展示"，不复制任何瓦片公式。
+
+        Spec §17：行政区域模式下展示的必须是**区域内**张数（``selected``）；
+        "候选"只是给用户看的对照（"不裁剪的话会是多少"），**不参与任何下游计算**
+        —— 进度条分母、大任务阈值、容量预估全都取 ``selected``。
         """
         data = self.download_panel.get_form_data()
         try:
@@ -664,26 +727,56 @@ class MainWindow(QMainWindow):
                 east=data["east"],
                 north=data["north"],
             )
-            ranges = calculate_tile_ranges(bounds, data["min_zoom"], data["max_zoom"])
-            total = sum(item.tile_count for item in ranges)
-            size_text = format_size(estimate_size_bytes(total))
-        except ValueError as exc:
+            region = self._require_region()
+            estimate = RegionTileEstimator(
+                region, geometry=self.download_panel.region_geometry
+            ).estimate(int(data["min_zoom"]), int(data["max_zoom"]))
+        except (ValueError, GeoJSONError) as exc:
             self._report_calculation_error(str(exc))
             return
 
+        total = estimate.selected_tiles
+        size_text = estimate.size_text
         output_path = self._resolve_output_path(data)
-        self.download_panel.set_calculation_result(total, size_text, output_path)
-        self._last_calculation = (total, size_text)
+        self.download_panel.set_calculation_result(
+            total, size_text, output_path, estimate=estimate
+        )
+        self._last_calculation = (total, size_text, estimate)
         self._status_values["tile_total"].setText(f"{total:,}")
         self.log_panel.append_log(
             f"瓦片计算完成：范围={bounds.as_tuple()}，"
-            f"缩放={data['min_zoom']}~{data['max_zoom']}（{len(ranges)} 级），"
+            f"区域={estimate.region_name}（{estimate.region_type.value}），"
+            f"缩放={data['min_zoom']}~{data['max_zoom']}（{len(estimate.per_zoom)} 级），"
             f"预计瓦片 {total:,}，预计容量 {size_text}"
         )
+        if estimate.is_polygon:
+            # Spec §17：候选 / 区域内 / 过滤 / 比例 / 容量 / 请求量六件事一起给。
+            # 文案由 ``estimate.as_lines`` 统一产出（与结果区同一份格式），
+            # 免得"界面写 3 行、日志写 4 行、数字还不一样"。
+            per_tile = data["map_type"].request_count_per_tile(bool(data["with_labels"]))
+            for line in estimate.as_lines(per_tile=per_tile, zoom_detail=False):
+                self.log_panel.append_log(f"区域裁剪 · {line}")
         self.log_panel.append_log(
-            "各级瓦片数：" + "，".join(f"z{r.zoom}={r.tile_count:,}" for r in ranges)
+            "各级瓦片数："
+            + "，".join(f"z{item.zoom}={item.selected_tiles:,}" for item in estimate.per_zoom)
         )
         self.statusBar().showMessage(f"预计瓦片 {total:,} · 预计容量 {size_text}", 8000)
+
+    def _require_region(self) -> DownloadRegion:
+        """读表单并拿到**可信的**下载区域；拿不到就抛 ``ValueError``（人话）。
+
+        Spec §16/§32 的红线：行政区域模式下边界文件没就绪时**绝不退回矩形**
+        —— 退回的后果是静默下一大片区域外的瓦片，而用户在界面上看不出这一点，
+        只会在账单上看到。
+        """
+        panel = self.download_panel
+        region = panel.current_region()
+        if region is not None:
+            return region
+        message = panel.current_region_error() or "无法解析下载区域"
+        if panel.current_region_type() is RegionType.POLYGON:
+            raise ValueError(f"行政区域不可用：{message}")
+        raise ValueError(message)
 
     def _resolve_output_path(self, data: dict) -> Path | None:
         """由表单里的"输出目录 + 地图名称"得到输出文件路径。
@@ -705,9 +798,12 @@ class MainWindow(QMainWindow):
         cached = self._last_calculation
         if cached is None:
             return
-        total, size_text = cached
+        total, size_text, estimate = cached
         self.download_panel.set_calculation_result(
-            total, size_text, self._resolve_output_path(self.download_panel.get_form_data())
+            total,
+            size_text,
+            self._resolve_output_path(self.download_panel.get_form_data()),
+            estimate=estimate,
         )
 
     def _report_calculation_error(self, message: str) -> None:
@@ -1019,6 +1115,9 @@ class MainWindow(QMainWindow):
             plan.output_path,
             list(range(plan.min_zoom, plan.max_zoom + 1)),
             parent=self,
+            # Slice 16：行政区域任务的"已有多少张"只算区域内那些
+            # （Spec §12：Polygon 外的瓦片不参与续传统计）
+            region=plan.region,
         )
         worker.scanned.connect(self._on_scan_finished)
         self._scan_worker = worker
@@ -1069,6 +1168,10 @@ class MainWindow(QMainWindow):
         而不会出现"下载跑起来却没有任务记录"这种反向缺口。
 
         **不查磁盘**：已有瓦片数由调用方在后台扫描后补进来（Spec §7）。
+
+        Spec §10：``total`` 必须是**选中**瓦片数（``selected``），不是候选数。
+        区域外被过滤掉的瓦片既不会出现在任务数里，也不会污染"失败 / 跳过"计数
+        —— 用户看到的每个数字都只描述"真正要下的那批"。
         """
         data = self.download_panel.get_form_data()
 
@@ -1094,9 +1197,13 @@ class MainWindow(QMainWindow):
             min_zoom = int(data["min_zoom"])
             max_zoom = int(data["max_zoom"])
             # 先算总量——不能"跑起来才发现是几十万张"
-            total = estimate_tile_count(bounds, min_zoom, max_zoom)
+            region = self._require_region()
+            estimate = RegionTileEstimator(
+                region, geometry=self.download_panel.region_geometry
+            ).estimate(min_zoom, max_zoom)
+            total = estimate.selected_tiles
             output_path = build_output_path(data["output_dir"], data["map_name"])
-        except ValueError as exc:
+        except (ValueError, GeoJSONError) as exc:
             self._report_download_error(str(exc), dialog_title=UI_TEXT_VALIDATION_TITLE)
             return None
 
@@ -1110,6 +1217,7 @@ class MainWindow(QMainWindow):
                 output_path=output_path,
                 total_tiles=total,
                 with_labels=with_labels,
+                region=region,
             )
         except (TaskStoreError, OSError) as exc:
             self._report_download_error(
@@ -1130,7 +1238,7 @@ class MainWindow(QMainWindow):
                 map_type, with_labels, min_zoom, max_zoom, bounds
             ),
             total=total,
-            size_text=format_size(estimate_size_bytes(total)),
+            size_text=estimate.size_text,
             task=task,
             # 已有张数未知，先当作 0；扫描完成后由 _apply_scan 修正
             existing_tiles=0,
@@ -1140,6 +1248,8 @@ class MainWindow(QMainWindow):
             map_type=map_type,
             with_labels=with_labels,
             requests=total * map_type.request_count_per_tile(with_labels),
+            region=region,
+            estimate=estimate,
         )
 
     def _discard_plan(self, plan: _DownloadPlan) -> None:
@@ -1417,6 +1527,22 @@ class MainWindow(QMainWindow):
             f"超时={DEFAULT_REQUEST_TIMEOUT:g}s，"
             f"最大尝试={DEFAULT_MAX_RETRIES} 次"
         )
+        if plan.is_polygon and plan.region is not None:
+            # Spec §15：行政区域必须写清"哪块地、边界版本、裁掉了多少"。
+            # 只报一个瓦片总数的话，事后没人能复现"这次到底下的是哪片区域"。
+            version = plan.region.boundary_version or "未标注"
+            tail = ""
+            if plan.estimate is not None:
+                tail = (
+                    f"，候选 {plan.estimate.candidate_tiles:,} → "
+                    f"区域内 {plan.estimate.selected_tiles:,}，"
+                    f"过滤 {plan.estimate.filtered_tiles:,}"
+                    f"（{plan.estimate.filtered_percent_text}）"
+                )
+            self.log_panel.append_log(
+                f"下载区域：{plan.region.name}"
+                f"（id={plan.region.region_id}，边界版本={version}）{tail}"
+            )
         # Spec §23：开工前一次性说清"这次到底在下什么"。合成模式与纯底图模式的
         # 产物、请求量、体积都不一样，只报一个"瓦片总数"是交代不清楚的。
         self.log_panel.append_log(f"合成方式：{plan.composition_text}")
@@ -1452,6 +1578,9 @@ class MainWindow(QMainWindow):
             timeout=DEFAULT_REQUEST_TIMEOUT,
             resume_policy=plan.resume_policy,
             resume_task=resume_task,
+            # 区域只在全新下载时传：续传的边界以任务记录为准（Spec §12），
+            # 传了也会被服务层忽略，索性不传，免得读代码的人以为它生效了。
+            region=None if resume_task is not None else plan.region,
             # Token 只在内存里过一道（Spec §9：任务记录不存 Token）
             token=token,
             # 续传时数据源就是 ``resume_task`` 本身，不要再传一次
@@ -2144,6 +2273,30 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Slice 16：区域也要从记录里还原。记录里只有标识（类型 / id / 版本），
+        # 边界文件按 id 回预设表找 —— GeoJSON 本身**不进** tasks.json（Spec §12/§13）。
+        # 找不回来时**绝不退回矩形**：那会把"继续"变成"沿外包矩形下一大片"，
+        # 直接推翻这个任务的全部意义（Spec §12/§32）。
+        try:
+            region = region_from_task(task)
+        except ValueError as exc:
+            self._report_download_error(
+                f"任务参数无法还原，记录可能已损坏：{exc}", dialog_title="无法继续任务"
+            )
+            return
+        if RegionType.parse(getattr(task, "region_type", "")) is RegionType.POLYGON and (
+            region is None
+        ):
+            region_id = getattr(task, "region_id", "")
+            message = (
+                f"该任务按行政区域「{region_id}」下载，但当前版本找不到它的边界文件，"
+                "无法安全继续。请补齐边界文件后重试，或重新发起一次下载。"
+            )
+            self.log_panel.append_log(message, "ERROR")
+            self.statusBar().showMessage("行政区域边界文件缺失，无法继续", 8000)
+            self._show_error_dialog("无法继续任务", message)
+            return
+
         # Slice 6：地图类型与"要不要合成"都从任务记录还原。
         # 老记录（Slice ≤5）没有这两项 —— 那时的产物一定是单层底图，
         # 因此 source_map_type 空串、with_labels 为 False 都是**正确**的还原结果。
@@ -2153,8 +2306,10 @@ class MainWindow(QMainWindow):
         with_labels = bool(getattr(task, "with_labels", False))
 
         path = Path(task.output_path)
-        total = task.total_tiles or estimate_tile_count(
-            bounds, task.min_zoom, task.max_zoom
+        # Spec §12：多边形任务的分母必须是**区域内**张数。老记录没存 total_tiles 时
+        # 现场按区域重算，而不是退回矩形候选数（那会让"还差多少张"永久失真）。
+        total = task.total_tiles or region_target_tiles(
+            region, bounds, int(task.min_zoom), int(task.max_zoom)
         )
 
         self.log_panel.append_log(f"Resume task: {task.id}")
@@ -2183,6 +2338,7 @@ class MainWindow(QMainWindow):
             map_type=map_type,
             with_labels=with_labels,
             requests=total * map_type.request_count_per_tile(with_labels),
+            region=region,
         )
         # 扫描走后台：它是一次 SQLite 查询，而 Spec §7 禁止在 Qt 主线程里做。
         # 目标文件不存在时没有任何可扫的东西，直接按"全新下载"往下走。

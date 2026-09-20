@@ -45,8 +45,10 @@ from app.services.map_download_service import (
     ResumeCompatibility,
     build_output_path,
     check_resume_compatibility,
+    count_existing_region_tiles,
     count_existing_tiles,
     read_existing_metadata,
+    region_target_tiles,
     sanitize_map_name,
 )
 from app.services.map_package_service import MapPackageService
@@ -62,6 +64,9 @@ __all__ = [
     "read_existing_metadata",
     "build_output_path",
     "sanitize_map_name",
+    # Slice 16
+    "region_target_tiles",
+    "count_existing_region_tiles",
     # Slice 8
     "MBTilesInspectionService",
     # Slice 9

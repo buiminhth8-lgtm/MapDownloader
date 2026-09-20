@@ -250,6 +250,35 @@ DEFAULT_TASKS_DIR: Path = DEFAULT_OUTPUT_DIR.parent / TASKS_DIR_NAME
 DEFAULT_TASKS_FILE: Path = DEFAULT_TASKS_DIR / TASKS_FILE_NAME
 
 # --------------------------------------------------------------------------- #
+# 行政区域边界资源（Slice 16）
+# --------------------------------------------------------------------------- #
+#: 行政区域边界（GeoJSON）所在目录：``<仓库根>/resources/regions``。
+#:
+#: **本目录默认不含中国边界数据。** 中国国界属于法定地图内容，必须使用带
+#: 审图号的合法授权数据，本仓库既不内置也不伪造；部署方需自行放入
+#: :data:`CHINA_REGION_FILENAME`（见该目录下的 ``README.md``）。
+#: 缺少该文件时，"行政区域"模式会明确报错或把覆盖度标成 UNKNOWN，
+#: 而不是退化成矩形下载 —— 那会静默下载一大片境外瓦片。
+REGION_RESOURCE_DIR: Path = (
+    Path(__file__).resolve().parents[2] / "resources" / "regions"
+)
+
+#: 中国行政区域边界文件的规范文件名（Preset ``china`` 用它）。
+CHINA_REGION_FILENAME: str = "china.geojson"
+
+#: 行政区域 Preset 的展示名。
+CHINA_REGION_NAME: str = "中国"
+
+#: 行政区边界资源不可用时的说明文案（UI / Inspector / 包校验共用同一句，
+#: 避免三处各写一遍导致用户看到三种说法）。``{path}`` 由调用方填入。
+REGION_BOUNDARY_MISSING_HINT: str = "行政区边界文件不可用：{path}"
+
+#: 行政区边界数据缺失时，README 与界面提示里指向的获取要求。
+REGION_BOUNDARY_LICENSE_NOTICE: str = (
+    "中国国界属于法定地图内容，请使用带审图号的合法授权 GeoJSON 数据"
+)
+
+# --------------------------------------------------------------------------- #
 # 日志
 # --------------------------------------------------------------------------- #
 LOG_LEVEL: int = 20  # logging.INFO，避免在此 import logging 造成额外耦合

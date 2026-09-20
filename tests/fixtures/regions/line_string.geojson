@@ -1,0 +1,11 @@
+{
+  "type": "Feature",
+  "properties": { "name": "只有一条线" },
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [116.0, 39.0],
+      [117.0, 40.0]
+    ]
+  }
+}
