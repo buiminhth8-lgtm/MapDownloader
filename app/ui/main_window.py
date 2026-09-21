@@ -64,6 +64,7 @@ from app.config.settings import (
     LOG_PACKAGE_VALIDATED,
     LOG_TRANSFER_STARTED,
     PACKAGE_MANIFEST_FILENAME,
+    PLANS_FILE_NAME,
     TRANSFER_ERROR_PACKAGE_DIR_MISSING,
     UI_TEXT_BUTTON_CANCEL,
     UI_TEXT_BUTTON_CLOSE,
@@ -147,7 +148,10 @@ from app.geo import (
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType, MapType, describe_map_type
+from app.planning.plan_service import PlanService
+from app.planning.plan_store import PlanStore, PlanStoreError
 from app.providers import TiandituProvider, TileTestResult, mask_url
+from app.regions.models import RegionCatalogError
 from app.services import (
     AdbStatus,
     AndroidTransferService,
@@ -175,6 +179,7 @@ from app.ui.download_panel import (
     DownloadPanel,
 )
 from app.ui.download_worker import DownloadWorker
+from app.ui.download_plan_dialog import DownloadPlanDialog
 from app.ui.log_panel import LogPanel
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
@@ -375,6 +380,7 @@ class MainWindow(QMainWindow):
         task_service: TaskService | None = None,
         preferences: UiPreferences | None = None,
         android_service: AndroidTransferService | None = None,
+        plan_service: PlanService | None = None,
     ) -> None:
         """
         Args:
@@ -388,6 +394,9 @@ class MainWindow(QMainWindow):
             android_service: ADB 与设备传输的编排层（Slice 10）；``None`` 时自建。
                 测试与验收脚本注入假的实现，于是**测试不依赖本机真的装了 adb**
                 ——一台没装 Android SDK 的 CI 机器上也必须能跑全套用例。
+            plan_service: 多级下载计划的编排层（Slice 20）；``None`` 时自建，
+                且它的 ``plans.json`` 落在**任务文件旁边**（理由见下面那段注释）。
+                测试注入一个指向临时目录的实例。
         """
         super().__init__(parent)
 
@@ -401,6 +410,22 @@ class MainWindow(QMainWindow):
         self.preferences = preferences or UiPreferences()
         #: Android 传输编排层（Slice 10）。界面不直接碰 adb。
         self.android_service = android_service or AndroidTransferService()
+        #: 多级下载计划编排层（Slice 20，Spec §10）。**没有计划文件也能起**
+        #: ——``load()`` 会新建一份空计划（Spec §18）。
+        #:
+        #: ``plans.json`` 的位置刻意从 ``task_service`` 推出来而不是各用各的默认值：
+        #: 两处都写"默认值"的话，生产里恰好是同一个目录（``data/``），但测试注入的
+        #: 那个临时 ``tasks.json`` 旁边不会有计划文件 —— 于是一条用例会**顺手写进
+        #: 用户主目录**（Slice 7 的教训：测试绝不碰真实用户数据）。一个来源，
+        #: 两种环境都对。
+        self.plan_service = (
+            plan_service
+            if plan_service is not None
+            else PlanService(
+                store=PlanStore(self.task_service.store.path.parent / PLANS_FILE_NAME),
+                task_service=self.task_service,
+            )
+        )
 
         # 四大面板 + 当前任务进度区
         self.download_panel = DownloadPanel(self)
@@ -445,6 +470,10 @@ class MainWindow(QMainWindow):
         #: 关掉之后再打开时复用同一个实例。
         self._package_dialog: PackageDialog | None = None
         self._package_validator_dialog: PackageValidateDialog | None = None
+        #: Slice 20：下载计划页。与上面两个同一约定 —— 主窗口持有引用，
+        #: **不带** ``WA_DeleteOnClose``（页面里的估算线程跑着时销毁 QThread
+        #: 会中止进程），关掉再打开复用同一个实例。
+        self._plan_dialog: DownloadPlanDialog | None = None
 
         # --- Slice 10：Android 传输的三个后台线程与三个非模态弹窗 --------
         #: 设备刷新线程（adb version + devices -l + getprop）
@@ -480,6 +509,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._apply_preferences()
         self._recover_tasks()
+        self._load_download_plan()
 
     # ------------------------------------------------------------------ #
     # 兼容入口（Slice 3~6 的调用点与测试都用这几个名字）
@@ -638,6 +668,9 @@ class MainWindow(QMainWindow):
         self.task_panel.inspect_requested.connect(self.open_mbtiles_inspector)
         # Slice 9：打包入口（任务列表里的 [生成地图包] 带着选中任务的产物路径）
         self.task_panel.package_requested.connect(self._on_task_package_requested)
+        # Slice 20：多级下载计划的两个入口（Spec §10）
+        self.download_panel.plan_add_requested.connect(self._on_plan_add_requested)
+        self.download_panel.plan_open_requested.connect(self._on_plan_open_requested)
 
     # ------------------------------------------------------------------ #
     # 槽：下载动作
@@ -2795,6 +2828,131 @@ class MainWindow(QMainWindow):
             pass
 
     # ------------------------------------------------------------------ #
+    # 槽：多级下载计划（Slice 20，Spec §10 / §11 / §14 / §18）
+    # ------------------------------------------------------------------ #
+    def _load_download_plan(self) -> None:
+        """启动时把磁盘上的计划读回来（Spec §18）。
+
+        没有计划文件（旧版本 / 首次运行）是**正常情况**：``PlanService.load()``
+        会新建一份空计划，程序照常启动。区域被删、边界文件缺失也**不在这里**
+        判定 —— 那是校验器与估算器的事，它们把单条标成不可用，而不是让整份计划
+        打不开（否则用户连"把坏的那条删掉"都做不了）。
+        """
+        try:
+            plan = self.plan_service.load()
+        except (PlanStoreError, OSError) as exc:
+            self.log_panel.append_log(f"读取下载计划失败：{exc}", "ERROR")
+            return
+        self._refresh_plan_summary()
+        if not plan.is_empty:
+            self.log_panel.append_log(f"已载入下载计划：{plan.describe()}")
+
+    def _refresh_plan_summary(self) -> None:
+        """把计划规模写到下载面板那行摘要上（Spec §10）。"""
+        self.download_panel.set_plan_summary(self.plan_service.summary_text())
+
+    def _sync_plan_settings_from_panel(self) -> None:
+        """把界面上的设置同步进计划：名字 / 输出目录 / 图层 / 注记。
+
+        四样都必须进计划（Spec §14 / §16）：名字与输出目录决定**文件落在哪**，
+        图层与注记决定**下的是什么**。只留在界面上，重启后就恢复不出来了 ——
+        而用户会以为那些选择跟着计划一起存下来了。
+        """
+        data = self.download_panel.get_form_data()
+        self.plan_service.apply_settings(
+            name=data.get("map_name") or None,
+            output_dir=data.get("output_dir"),
+            map_layer=data["map_type"].base_layer,
+            with_labels=bool(data.get("with_labels")),
+        )
+
+    @Slot()
+    def _on_plan_add_requested(self) -> None:
+        """把「下载区域」里当前选中的那块地加进计划（Spec §10）。
+
+        Zoom 按面板当前的**模式**给（Spec §3 / §6）：推荐模式取策略推荐值；
+        自定义模式**原样**带上用户那两个数（只警告、不改值 —— 那是校验与
+        估算阶段的事）。
+        """
+        panel = self.download_panel
+        region_id = panel.current_region_id()
+        if not region_id:
+            self.log_panel.append_log(
+                "没有可加入计划的区域：请先在「下载区域」里选好国家 / 省 / 市",
+                "WARNING",
+            )
+            self.statusBar().showMessage(
+                "请先在「下载区域」里选好国家 / 省 / 市，再加入下载计划", 6000
+            )
+            return
+
+        custom = panel.zoom_mode is ZoomMode.CUSTOM
+        min_spin, max_spin = panel.zoom_spins
+        try:
+            self._sync_plan_settings_from_panel()
+            result = self.plan_service.add_region(
+                region_id,
+                use_recommended_zoom=not custom,
+                min_zoom=min_spin.value() if custom else None,
+                max_zoom=max_spin.value() if custom else None,
+            )
+        except (RegionCatalogError, ValueError, PlanStoreError, OSError) as exc:
+            self.log_panel.append_log(f"加入下载计划失败：{exc}", "ERROR")
+            self.statusBar().showMessage(f"加入下载计划失败：{exc}", 8000)
+            return
+
+        item = result.item
+        verb = "加入" if result.created else "更新"
+        self._refresh_plan_summary()
+        self._refresh_plan_dialog()
+        self.log_panel.append_log(f"{verb}下载计划：{item.describe()}")
+        self.statusBar().showMessage(self.plan_service.summary_text(), 8000)
+
+    @Slot()
+    def _on_plan_open_requested(self) -> None:
+        """打开下载计划页（Spec §11）。
+
+        复用同一个实例（与检查 / 打包窗口同一约定）：关掉再打开时窗口位置与
+        上次滚动到的行都还在，而且页面里的估算线程不会因为反复创建而留下尾巴。
+        """
+        self._sync_plan_settings_from_panel()
+        dialog = self._plan_dialog
+        if dialog is None:
+            dialog = DownloadPlanDialog(self.plan_service, self)
+            dialog.tasks_created.connect(self._on_plan_tasks_created)
+            dialog.plan_changed.connect(self._refresh_plan_summary)
+            self._plan_dialog = dialog
+        else:
+            dialog.refresh()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.log_panel.append_log(
+            f"打开下载计划页：{self.plan_service.plan.describe()}"
+        )
+
+    def _refresh_plan_dialog(self) -> None:
+        """计划页开着的话顺手刷新它（没开就什么都不做）。"""
+        dialog = self._plan_dialog
+        if dialog is not None:
+            dialog.refresh()
+
+    @Slot(object)
+    def _on_plan_tasks_created(self, tasks: list) -> None:
+        """计划页生成了下载任务 → 刷新任务列表（Spec §14）。
+
+        **不开始下载**：那些任务停在"已创建"，等用户在任务列表里逐条发起。
+        批量调度是 Slice 21。
+        """
+        self._refresh_task_list()
+        self.log_panel.append_log(
+            f"下载计划已生成 {len(tasks)} 条下载任务（尚未开始下载）"
+        )
+        self.statusBar().showMessage(
+            f"已生成 {len(tasks)} 条下载任务，可在「下载任务」里逐条开始", 8000
+        )
+
+    # ------------------------------------------------------------------ #
     # 槽：帮助
     # ------------------------------------------------------------------ #
     @Slot()
@@ -2971,6 +3129,14 @@ class MainWindow(QMainWindow):
         if validator is not None:
             validator.shutdown()
             validator.close()
+
+        # Slice 20：计划页里可能正在跑估算线程（一个省级区域在深 Zoom 下要遍历
+        # 几十万张瓦片）。页面自己的 ``closeEvent`` 会先请求取消再有界等待 ——
+        # 让一个 running 的 QThread 随父窗口一起销毁，Qt 会中止整个进程。
+        plan_dialog = self._plan_dialog
+        if plan_dialog is not None:
+            self.log_panel.append_log("关闭下载计划页…")
+            plan_dialog.close()
 
         # Slice 10：传输线程可能在 push 一个几 GB 的文件。先请求取消（它会 kill
         # 掉 adb push 子进程并清理远端 .part），再有界等待——让一个 running 的

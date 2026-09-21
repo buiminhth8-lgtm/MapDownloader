@@ -146,3 +146,90 @@ def region_loader(region_catalog):
     from app.regions import RegionLoader
 
     return RegionLoader(region_catalog)
+
+
+# --------------------------------------------------------------------------- #
+# 多级下载计划（Slice 20）
+# --------------------------------------------------------------------------- #
+#: 一块**三角形**边界：外包矩形是 1°×1°，但只有一部分瓦片真的与它相交。
+#:
+#: 为什么需要它：合成目录里的多边形全是**轴对齐矩形**（几何 == 外包矩形），
+#: 于是 ``selected == candidate`` —— 那种数据永远测不出"计划按**选中**张数
+#: 汇总"这条 Spec §7 的硬要求（用候选数也能让所有断言通过）。
+#: 三角形让两者明显分离，一个写错的实现会立刻现形。
+TRIANGLE_GEOJSON: dict = {
+    "type": "Feature",
+    "properties": {
+        "name": "示例三角省",
+        "id": "triangleland",
+        "boundaryVersion": "2026-09-fixture",
+    },
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [118.0, 30.0],
+                [119.0, 30.0],
+                [118.0, 31.0],
+                [118.0, 30.0],
+            ]
+        ],
+    },
+}
+
+
+@pytest.fixture
+def region_root_with_triangle(region_root: Path) -> Path:
+    """在可写副本上追加一块三角形区域（``triangleland``，省级）。
+
+    只动工作区里的那份副本，仓库里的夹具保持只读（同 :func:`region_root` 的
+    理由：往仓库夹具上写东西会污染后续用例）。
+    """
+    import json
+
+    (region_root / "province" / "triangleland.geojson").write_text(
+        json.dumps(TRIANGLE_GEOJSON, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    index_path = region_root / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["regions"].append(
+        {
+            "id": "triangleland",
+            "name": "示例三角省",
+            "level": "province",
+            "parentId": "demoland",
+            "geojson": "province/triangleland.geojson",
+            "boundaryVersion": "2026-09-fixture",
+        }
+    )
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return region_root
+
+
+@pytest.fixture
+def region_resources(monkeypatch, region_root_with_triangle: Path) -> Path:
+    """把内置资源目录重定向到合成树（含三角形区域）。
+
+    只改 ``app.geo.region.REGION_RESOURCE_DIR`` 这一个全局：区域服务每次取根
+    目录时都重新读它，因此**在构造任何东西之前**改好就够了。
+    """
+    from app.geo import region as region_module
+
+    monkeypatch.setattr(region_module, "REGION_RESOURCE_DIR", region_root_with_triangle)
+    return region_root_with_triangle
+
+
+@pytest.fixture
+def plans_file() -> Path:
+    """计划文件（Slice 20 ``plans.json``）的独立临时路径。
+
+    刻意**不**放进 ``work_dir``：不少用例会断言 ``work_dir`` 里"只有那个
+    .mbtiles"，计划文件写进去会把那些断言搅黄（与 :func:`tasks_file` 同理）。
+    """
+    directory = Path(tempfile.mkdtemp(prefix="plans-test-"))
+    try:
+        yield directory / "plans.json"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

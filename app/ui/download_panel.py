@@ -93,6 +93,14 @@ ACTION_RESUME = "resume"
 ACTION_CANCEL = "cancel"
 ACTION_TEST_CONNECTION = "test_connection"
 
+#: 下载计划的两个入口（Slice 20，Spec §10）。
+#:
+#: 它们**不是** :class:`~app.ui.task_actions.TaskAction`：那两个动作描述的是
+#: "拿当前这块地现在开始下载"，而这两个是"把它攒进计划，稍后一起下"。
+#: 放进 ``TaskAction`` 会让按钮矩阵多出两个与任务状态无关的格子。
+ACTION_PLAN_ADD = "plan_add"
+ACTION_PLAN_OPEN = "plan_open"
+
 #: :class:`~app.ui.task_actions.TaskAction` → 动作标识。
 #:
 #: 两个枚举不能合成一个：``TaskAction`` 是"用户可以干什么"（纯逻辑，不 import Qt，
@@ -139,6 +147,9 @@ _CONNECTION_PLACEHOLDER = "尚未测试"
 
 #: 尚未下载时"下载结果"区的占位文案
 _DOWNLOAD_RESULT_PLACEHOLDER = "尚未下载"
+
+#: 还没有计划时那行摘要的文案（Slice 20，Spec §10）
+_PLAN_SUMMARY_PLACEHOLDER = "下载计划：暂无区域"
 
 #: 折行标签（Slice 7 起放在 ``app.ui.widgets`` 里，三个面板共用）。
 #: 这里保留 ``_WrappingLabel`` / ``_wrap_anywhere`` 两个名字：
@@ -200,6 +211,18 @@ class DownloadPanel(QGroupBox):
     #: 两个因子分别来自"范围计算"与"图层选择"，所以两边任何一边变了都要重画。
     layer_plan_changed = Signal()
 
+    #: 用户点了「加入下载计划」（Slice 20，Spec §10）。
+    #:
+    #: 刻意**不**复用 :attr:`action_requested`：那一路的可用性由
+    #: :class:`~app.ui.task_actions.UiTaskState` 的按钮矩阵决定（"任务在跑时
+    #: 能点哪些"），而"把当前区域加进计划"与下载任务的状态**无关** ——
+    #: 下载中一样可以规划下一批。塞进矩阵会逼着为每个状态各补一格，
+    #: 而漏掉一格的表现是"某个按钮在某个状态下莫名点不动"。
+    plan_add_requested = Signal()
+
+    #: 用户点了「查看下载计划」（Slice 20，Spec §10）。同上，与任务状态无关。
+    plan_open_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
 
@@ -227,6 +250,7 @@ class DownloadPanel(QGroupBox):
         self._build_area_form()
         self._build_output_form()
         self._build_buttons()
+        self._build_plan_row()
         self._build_result_area()
         self._build_download_result_area()
         self._build_connection_area()
@@ -237,6 +261,8 @@ class DownloadPanel(QGroupBox):
         layout.addLayout(self._output_form)
         layout.addLayout(self._button_row)
         layout.addWidget(self._mode_notice)
+        layout.addLayout(self._plan_button_row)
+        layout.addWidget(self._plan_summary_label)
         layout.addWidget(self._result_group)
         layout.addWidget(self._download_result_group)
         layout.addWidget(self._connection_group)
@@ -1070,6 +1096,43 @@ class DownloadPanel(QGroupBox):
         # 初始态：四个控制动作都没有意义，全部保持禁用
         self.apply_task_state(UiTaskState.IDLE)
 
+    def _build_plan_row(self) -> None:
+        """多级下载计划的入口（Slice 20，Spec §10）。
+
+        放在下载按钮下面、结果区上面：它产生的是**计划**而不是**下载**，
+        与上面那排"现在就开始下"是同一个层次上的两种选择，摆在旁边用户才发现
+        得了他其实可以先把全国 + 几个省一起规划好。同时它也在"预估结果"之前 ——
+        计划的总量是那两块地的合计，先看到入口再看数字才顺。
+
+        标签写的是**计划**的规模（"3 个区域 / 5.7 万张 / 1.6 GB"），因此
+        「加入下载计划」点一下就能看到全局变化，不必先打开对话框。
+        """
+        self._plan_add_button = QPushButton("加入下载计划", self)
+        self._plan_add_button.setToolTip(
+            "把当前选中的区域（国家 / 省 / 市）加进下载计划。"
+            "计划可以先攒起来，最后一次性生成多个下载任务"
+        )
+        self._plan_open_button = QPushButton("查看下载计划", self)
+        self._plan_open_button.setToolTip(
+            "打开下载计划：查看每个区域的范围 / 张数 / 容量，"
+            "逐项启用或移除，生成下载任务"
+        )
+        #: 按钮顺序即从左到右的顺序（与 ``_action_buttons`` 同一约定）
+        self._plan_buttons: dict[str, QPushButton] = {
+            ACTION_PLAN_ADD: self._plan_add_button,
+            ACTION_PLAN_OPEN: self._plan_open_button,
+        }
+        self._plan_add_button.clicked.connect(self.plan_add_requested.emit)
+        self._plan_open_button.clicked.connect(self.plan_open_requested.emit)
+
+        self._plan_button_row = QHBoxLayout()
+        self._plan_button_row.addWidget(self._plan_add_button)
+        self._plan_button_row.addWidget(self._plan_open_button)
+        self._plan_button_row.addStretch(1)
+
+        self._plan_summary_label = _WrappingLabel(_PLAN_SUMMARY_PLACEHOLDER, self)
+        _apply_secondary_text(self._plan_summary_label)
+
     def _build_result_area(self) -> None:
         """瓦片计算结果区。
 
@@ -1281,6 +1344,25 @@ class DownloadPanel(QGroupBox):
     def action_buttons(self) -> dict[str, QPushButton]:
         """动作按钮字典（只读用途，如测试点击或后续禁用/启用）。"""
         return dict(self._action_buttons)
+
+    # ------------------------------------------------------------------ #
+    # 下载计划（Slice 20，Spec §10 / §11）
+    # ------------------------------------------------------------------ #
+    def plan_buttons(self) -> dict[str, QPushButton]:
+        """计划入口按钮：``ACTION_PLAN_ADD`` / ``ACTION_PLAN_OPEN``。"""
+        return dict(self._plan_buttons)
+
+    def set_plan_summary(self, text: str) -> None:
+        """写"下载计划"那行摘要（由 :meth:`PlanService.summary_text` 提供）。
+
+        摘要由主窗口算：面板不认识计划模型（同「预估结果」的分工 ——
+        面板只画控件与结论，业务数字一律来自服务层）。
+        """
+        self._plan_summary_label.setText(str(text or _PLAN_SUMMARY_PLACEHOLDER))
+
+    def plan_summary_label(self) -> QLabel:
+        """计划摘要标签（验收脚本据此读界面上的真实文案）。"""
+        return self._plan_summary_label
 
     # ------------------------------------------------------------------ #
     # 直接写入单项（Slice 7：恢复界面偏好 / 回填任务参数用）

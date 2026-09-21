@@ -209,6 +209,37 @@ TASKS_CORRUPT_SUFFIX: str = ".corrupt"
 DEFAULT_TASK_SAVE_INTERVAL_SECONDS: float = 1.0
 DEFAULT_TASK_SAVE_TILE_INTERVAL: int = 100
 
+# --------------------------------------------------------------------------- #
+# 多级下载计划（Slice 20）
+# --------------------------------------------------------------------------- #
+#: 计划文件：与任务记录同一个目录（``~/MapDownloader/data/``）。
+#:
+#: 刻意与 ``tasks.json`` **分开两个文件**：它们的写入频率差了几个数量级
+#: ——任务记录在下载过程中被反复覆盖（进度落盘），计划只在用户改计划时写一次。
+#: 混在一个文件里，一次进度落盘就会把计划一起重写，任何一次半截写入都会
+#: 同时毁掉两份数据。
+PLANS_FILE_NAME: str = "plans.json"
+
+#: 计划文件的 JSON 结构版本号（与任务文件分开计数：两者的 schema 无关）。
+PLANS_FILE_VERSION: int = 1
+
+#: 计划文件损坏时的隔离后缀（同 :data:`TASKS_CORRUPT_SUFFIX`：不删用户文件）
+PLANS_CORRUPT_SUFFIX: str = ".corrupt"
+
+#: 默认计划名。它同时是**输出子目录名**（``<输出目录>/<计划名>/``），
+#: 因此必须是文件名安全的 ASCII：中文在 Windows 上能用，但会让命令行排查、
+#: 外部工具与日志 grep 都变麻烦，而用户随时能在界面上改成自己的名字。
+DEFAULT_PLAN_NAME: str = "offline_plan"
+
+#: 计划级"规模偏大"的提示阈值（只警告，不禁止）。
+#:
+#: 单任务的大任务确认阈值是 :data:`GUI_LARGE_TASK_CONFIRM_TILES`（1 万张），
+#: 但那是**一个**任务；一个计划由多个任务组成，"全国 + 若干省 + 若干市"
+#: 加到一起轻易就超过它。5 万张 ≈ 1.5GB、5GB 容量两档，是"用户该看一眼"
+#: 而不是"值得为它弹一次确认框"的量级（Spec §9 明确只要 warning）。
+PLAN_LARGE_TILES_WARNING: int = 50_000
+PLAN_LARGE_SIZE_WARNING_BYTES: int = 5 * 1024 * 1024 * 1024
+
 #: 恢复前一致性校验时，经纬度的允许偏差。
 #: metadata 里存的是 6 位小数字符串，回读成 float 会有量化误差；
 #: 1e-6 度 ≈ 0.1 米，远小于单张瓦片的精度，不会把正常文件判成"不兼容"。
@@ -248,6 +279,9 @@ DEFAULT_OUTPUT_DIR: Path = Path.home() / "MapDownloader" / "output"
 #: 刻意与输出目录同一父目录——"这个工具产生的东西"集中在一处，用户好清理。
 DEFAULT_TASKS_DIR: Path = DEFAULT_OUTPUT_DIR.parent / TASKS_DIR_NAME
 DEFAULT_TASKS_FILE: Path = DEFAULT_TASKS_DIR / TASKS_FILE_NAME
+
+#: 计划文件：``~/MapDownloader/data/plans.json``（Slice 20）。
+DEFAULT_PLANS_FILE: Path = DEFAULT_TASKS_DIR / PLANS_FILE_NAME
 
 # --------------------------------------------------------------------------- #
 # 行政区域边界资源（Slice 16）
