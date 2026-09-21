@@ -64,6 +64,7 @@ from app.config.settings import (
     LOG_PACKAGE_VALIDATED,
     LOG_TRANSFER_STARTED,
     PACKAGE_MANIFEST_FILENAME,
+    PLAN_EXECUTIONS_FILE_NAME,
     PLANS_FILE_NAME,
     TRANSFER_ERROR_PACKAGE_DIR_MISSING,
     UI_TEXT_BUTTON_CANCEL,
@@ -148,6 +149,11 @@ from app.geo import (
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType, MapType, describe_map_type
+from app.planning.plan_execution_store import (
+    PlanExecutionStore,
+    PlanExecutionStoreError,
+)
+from app.planning.plan_scheduler import MapDownloadTaskRunner, PlanScheduler
 from app.planning.plan_service import PlanService
 from app.planning.plan_store import PlanStore, PlanStoreError
 from app.providers import TiandituProvider, TileTestResult, mask_url
@@ -426,6 +432,11 @@ class MainWindow(QMainWindow):
                 task_service=self.task_service,
             )
         )
+        #: 计划执行记录（Slice 21，Spec §19）。与 ``plans.json`` 同一目录，
+        #: 理由与上面那段完全一样（测试注入临时 ``tasks.json`` 时不该写进用户主目录）。
+        self.execution_store = PlanExecutionStore(
+            self.task_service.store.path.parent / PLAN_EXECUTIONS_FILE_NAME
+        )
 
         # 四大面板 + 当前任务进度区
         self.download_panel = DownloadPanel(self)
@@ -510,6 +521,7 @@ class MainWindow(QMainWindow):
         self._apply_preferences()
         self._recover_tasks()
         self._load_download_plan()
+        self._recover_plan_executions()
 
     # ------------------------------------------------------------------ #
     # 兼容入口（Slice 3~6 的调用点与测试都用这几个名字）
@@ -2851,6 +2863,50 @@ class MainWindow(QMainWindow):
         """把计划规模写到下载面板那行摘要上（Spec §10）。"""
         self.download_panel.set_plan_summary(self.plan_service.summary_text())
 
+    def _recover_plan_executions(self) -> None:
+        """启动时处理"上次没跑完的计划"（Slice 21 / Spec §20）。
+
+        **只读回来 + 降级，绝不自动开始下载**：记录里如果还是 ``RUNNING``，
+        那说明程序上次是被关掉 / 崩掉的（真跑完会写成 ``COMPLETED``），一律降成
+        ``PAUSED`` 并立即落盘 —— 文件里留着"正在跑"就是假的。
+
+        降级之后只做两件事：写日志、在状态栏留一句"去哪继续"。真正把
+        「继续 / 取消」摆到用户面前的是下载计划页（它打开时会读回同一条记录）。
+        """
+        try:
+            pending = self.execution_store.unfinished()
+        except (PlanExecutionStoreError, OSError) as exc:
+            self.log_panel.append_log(f"读取计划执行记录失败：{exc}", "ERROR")
+            return
+        recovered = []
+        for execution in pending:
+            result, _changed = self.execution_store.load_for_recovery(execution.plan_id)
+            if result is not None:
+                recovered.append(result)
+        if not recovered:
+            return
+
+        for execution in recovered:
+            self.log_panel.append_log(
+                f"上次的计划「{self._plan_name(execution.plan_id)}」没跑完"
+                f"（{execution.status.display_name} {execution.items_text}）："
+                "打开「下载计划」可以继续，本次启动不会自动开始下载"
+            )
+        first = recovered[0]
+        self.statusBar().showMessage(
+            f"上次有 {len(recovered)} 份下载计划没跑完"
+            f"（第一份：{self._plan_name(first.plan_id)}）。"
+            "已保留进度，打开「下载计划」可以继续",
+            0,
+        )
+
+    def _plan_name(self, plan_id: str) -> str:
+        """执行记录对应的计划名（计划换了 / 被删了就退回 id，别报错）。"""
+        plan = self.plan_service.plan
+        if plan.id == plan_id:
+            return plan.name or plan.id
+        return plan_id
+
     def _sync_plan_settings_from_panel(self) -> None:
         """把界面上的设置同步进计划：名字 / 输出目录 / 图层 / 注记。
 
@@ -2914,11 +2970,17 @@ class MainWindow(QMainWindow):
 
         复用同一个实例（与检查 / 打包窗口同一约定）：关掉再打开时窗口位置与
         上次滚动到的行都还在，而且页面里的估算线程不会因为反复创建而留下尾巴。
+        计划执行线程（Slice 21）也依赖这一点：关页只是"暂停"，再打开时
+        :meth:`DownloadPlanDialog.showEvent` 会把"上次没跑完"的记录读回来。
         """
         self._sync_plan_settings_from_panel()
         dialog = self._plan_dialog
         if dialog is None:
-            dialog = DownloadPlanDialog(self.plan_service, self)
+            dialog = DownloadPlanDialog(
+                self.plan_service,
+                self,
+                scheduler_factory=self.build_plan_scheduler,
+            )
             dialog.tasks_created.connect(self._on_plan_tasks_created)
             dialog.plan_changed.connect(self._refresh_plan_summary)
             self._plan_dialog = dialog
@@ -2929,6 +2991,33 @@ class MainWindow(QMainWindow):
         dialog.activateWindow()
         self.log_panel.append_log(
             f"打开下载计划页：{self.plan_service.plan.describe()}"
+        )
+
+    def map_token(self) -> str:
+        """当前天地图 Token（下载计划页要拿它建瓦片源）。
+
+        Token **只在内存里过一道**，绝不进计划文件、任务文件、执行记录
+        （Spec §19；Slice 9 起就是这条规则）。
+        """
+        return self.download_panel.get_form_data()["token"]
+
+    def build_plan_scheduler(self) -> PlanScheduler:
+        """造一个计划调度器（下载计划页的「开始计划」会调它）。
+
+        只有主窗口知道 Token、任务服务与执行记录文件在哪，所以由这里注入。
+        调度器本身**不含下载实现**：真正的单个任务执行交给
+        :class:`~app.planning.plan_scheduler.MapDownloadTaskRunner`，它内部
+        走既有的 ``MapDownloadService.resume_task`` —— 顺序、暂停语义、
+        进度聚合在执行记录那一层（Spec §5 禁止重写下载 / Resume / MBTiles）。
+        """
+        runner = MapDownloadTaskRunner(
+            TiandituProvider(self.map_token()), task_service=self.task_service
+        )
+        return PlanScheduler(
+            self.plan_service,
+            runner,
+            task_service=self.task_service,
+            store=self.execution_store,
         )
 
     def _refresh_plan_dialog(self) -> None:

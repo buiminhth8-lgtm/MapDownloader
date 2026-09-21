@@ -24,6 +24,7 @@
 - [行政区域层级模型（中国 → 省 → 市）](docs/region_catalog.md) —— Slice 18
 - [行政区域级联选择 + 推荐 Zoom](docs/region_selection_ui.md) —— Slice 19
 - [多级下载计划（全国 / 省 / 市）](docs/download_plan.md) —— Slice 20
+- [计划批量调度（串行执行 / 暂停 / 继续 / 取消 / 重试 / 跳过）](docs/plan_scheduler.md) —— Slice 21
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -237,6 +238,86 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 21：计划批量调度
+
+Slice 20 把"一次只规划一块地"升级成了**一份计划装多块地**，但那份计划**不会自己跑**——
+点「生成任务」只造出一堆停在「已创建」的任务记录，下载要自己去「下载任务」列表里逐条发起。
+这一版在计划页上加了一排执行按钮，把"一个接一个跑完整份计划"补上。
+
+```text
+[开始计划] [暂停] [继续] [取消执行] [重试当前] [跳过并继续]        [关闭]
+──────────────────────────────────────────────────────────────────────
+状态：执行中   当前：示例北省 Z9~13   任务：2 / 3
+当前任务：63%   总体：57%（32,640 / 57,302 张）   速度：5.2 MB/s
+```
+
+### 严格串行，每一项都走 `resume_task`
+
+调度器按计划里的层级顺序（全国 → 省 → 市）**串行**跑：任何时刻只有一个文件在写、只有一个
+进度在动。每一项都调用 `MapDownloadService.resume_task()`——它同时覆盖"第一次跑"和
+"暂停后继续"两种情形，于是"暂停后继续必须复用 MBTiles Resume、不能从头下载"成了这条路
+的自然结果，而不是一句要人遵守的约定。单任务**内部**仍是并发下载（Slice 3 那条路一行未改）。
+
+### 三份数据，执行态单独落盘
+
+"跑到哪一步了"和"用户想下哪几块地"是两回事，所以新落地一份 `data/plan_executions.json`，
+与 `plans.json` / `tasks.json` 各管各的。执行记录里只有两个**引用**（`plan_item_id` /
+`task_id`），区域名、Zoom、张数全部现查——复制进来就多一个会过期的真相。
+
+### 两个"状态"不能混
+
+`PlanItemStatus`（Slice 20，可用性）和 `PlanItemRunStatus`（本 Slice，执行态）取值集合完全
+不重叠却同名同层，import 错了不会报错只会静默走错——因此执行态**刻意换名**加 `Run`。整份
+计划另有独立的 `PlanExecutionStatus`（含 `PARTIAL_FAILED` 这种计划独有概念），不复用任务状态。
+
+### 暂停 = 安全停下 + 改写状态；恢复绝不自动联网
+
+"暂停"实现成"请求引擎 `cancel()` 安全停下 → 等返回 → 把任务从磁盘上的 `CANCELLED` 改回
+`PAUSED`"，于是暂停变成一个**可跨进程**的状态。程序异常退出后，启动时发现还停在 `RUNNING`
+的执行一律降级成 `PAUSED`，**绝不自动联网继续**——自动下载会消耗用户的配额，必须由人拍板。
+
+### 失败即停，决定权交还用户
+
+一项失败就停下、整份落到 `PARTIAL_FAILED`（**不是终态**）：用户在「重试当前」与「跳过并继续」
+间选一个才能往前走。`unresolved_count = FAILED + SKIPPED + CANCELLED > 0` 即判"部分失败"，
+"留下任何一块没下成就是部分失败"。
+
+### 进度按张数聚合，不是按条目数
+
+整体进度条走 `selected_tiles` 加权的纯函数 `build_progress()`：分母取计划启用项之和、分子
+按实际处理张数累计并收口（防 >100%）。速度只取当前任务、任务切换即归零——串行下不存在
+"整份速度"这种独立量，否则界面会挂着上一个任务的残留速度。
+
+### 这一版写测试抓出来的缺陷
+
+1. **Qt 跨线程信号"慢一拍"让验收脚本误判失败**：worker 在线程里发 `status_changed` /
+   `item_changed`，主线程槽（`refresh` → 重画进度条 / 状态行 / 表格符号 / 按钮可用性）会
+   比 `execution().status` 落终态**晚几帧**。验收脚本若在那一瞬读控件值，会看到
+   "进度条还是 3%、状态行还写执行中、表格符号还是 ▶"。修法：断言前先 `_wait_until`
+   **控件真的重画到位**（进度条=100、状态行含"已完成"、表格全 ✓、按钮可用状态正确），
+   而不是只等模型状态变。这条教训适用于所有"真窗口 + 真按钮"验收。
+2. **跨场景复用服务集串味**：验收脚本里一个失败/跳过的场景若与另一子场景共用同一套
+   `make_services()`，会因为 `plan.id` 相同而复用同一份执行记录，导致 `FakeRunner` 根本
+   没被调用。修法：每个子场景建**独立**的服务集（`work_dir/"c1"` / `work_dir/"c2"`）。
+3. **延迟的 `closeEvent` 拆掉活着的 worker**：上一个场景没完全收尾的 `closeEvent` 可能
+   迟到进下一个场景，对仍在跑的 worker 调 `request_close()` → 循环因 `_closed` 断裂 →
+   后续点击走到 `worker is None → start_plan()`（重跑整份计划）而不是 `retry_current()`。
+   修法：场景切换前显式等 `is_running_plan() is False` 且 worker 收尾，再断言。
+
+### 验收
+
+```bash
+# 调度层全部用例（模型 / 存储 / 调度器 / worker / 计划页执行 / 主窗口接线）
+.venv/Scripts/python.exe -m pytest tests/test_plan_execution.py \
+    tests/test_plan_execution_store.py tests/test_plan_scheduler.py \
+    tests/test_plan_worker.py tests/test_download_plan_execution_ui.py -q
+
+# 实机验收：真窗口 / 真按钮 / 截图落 docs/（五态各一张）
+.venv/Scripts/python.exe scripts/verify_slice21_plan_execution.py
+```
+
+细节见 [docs/plan_scheduler.md](docs/plan_scheduler.md)。
 
 ## Slice 20：多级下载计划
 

@@ -37,7 +37,8 @@ PlanService.create_download_tasks()
 DownloadTask × N        现有的任务记录模型（Slice 5），形状与单区域下载完全一样
         │               顺序：全国 → 省 → 市（为串行执行做准备）
         ▼
-（Slice 21）批量调度     本 Slice **不实现**：怎么一个接一个跑、失败了怎么办
+（Slice 21）批量调度     怎么一个接一个跑、失败了怎么办 —— 见
+                        [docs/plan_scheduler.md](plan_scheduler.md)
 ```
 
 ## 怎么用
@@ -129,8 +130,9 @@ DownloadTask × N        现有的任务记录模型（Slice 5），形状与单
 
 ## 这一版**不做**的事
 
-- **不提供「全部开始下载」**：本 Slice 只生成任务记录，开始下载仍在任务列表里
-  逐条发起。批量调度是 Slice 21。
+- **不提供「全部开始下载」**（Slice 20 当时）：本 Slice 只生成任务记录。批量调度、
+  失败重试、串行推进、暂停 / 继续 / 取消已由 **Slice 21** 补上，见
+  [docs/plan_scheduler.md](plan_scheduler.md)。其余"不做"项不变。
 - **不做 Mission 航线 / 作业区**：`MISSION` 等级在模型里预留，但没有界面入口。
 - **不做完整风险分析**：只有"规模偏大 / 超出推荐 / 目标文件已存在"三条提醒。
 - **不动下载器**：`MapDownloadService` / `DownloadWorker` / MBTiles 格式一行未改，

@@ -240,6 +240,31 @@ DEFAULT_PLAN_NAME: str = "offline_plan"
 PLAN_LARGE_TILES_WARNING: int = 50_000
 PLAN_LARGE_SIZE_WARNING_BYTES: int = 5 * 1024 * 1024 * 1024
 
+# --------------------------------------------------------------------------- #
+# 下载计划的**执行**记录（Slice 21）
+# --------------------------------------------------------------------------- #
+#: 执行记录文件：``~/MapDownloader/data/plan_executions.json``。
+#:
+#: 第三个文件（``plans.json`` 是"用户想要什么"，``tasks.json`` 是"每一块地的
+#: 单任务记录"，这里是"这份计划跑到哪一步了"）。分开的理由与 Slice 20 分
+#: ``plans.json`` 时一样，而且更硬：执行记录带着**进度**，写入频率与任务记录
+#: 同级（秒级），而计划本身只在用户改计划时写一次。混在一起的话，一次进度
+#: 落盘就会把用户的计划一起重写。
+PLAN_EXECUTIONS_FILE_NAME: str = "plan_executions.json"
+
+#: 执行记录的结构版本号（与前两个文件分开计数：schema 无关）。
+PLAN_EXECUTIONS_FILE_VERSION: int = 1
+
+#: 执行记录损坏时的隔离后缀（同 :data:`TASKS_CORRUPT_SUFFIX`：不删用户文件）
+PLAN_EXECUTIONS_CORRUPT_SUFFIX: str = ".corrupt"
+
+#: 执行进度落盘的节流参数（与任务记录同一套规则：满足任一即写）。
+#:
+#: **状态变化不受节流限制**：开始 / 暂停 / 继续 / 取消 / 每项完成 / 整份计划
+#: 结束一律立即落盘。丢一秒的进度无所谓，丢"计划已经停了"会让人判断错误。
+DEFAULT_PLAN_SAVE_INTERVAL_SECONDS: float = 1.0
+DEFAULT_PLAN_SAVE_TILE_INTERVAL: int = 100
+
 #: 恢复前一致性校验时，经纬度的允许偏差。
 #: metadata 里存的是 6 位小数字符串，回读成 float 会有量化误差；
 #: 1e-6 度 ≈ 0.1 米，远小于单张瓦片的精度，不会把正常文件判成"不兼容"。
@@ -282,6 +307,9 @@ DEFAULT_TASKS_FILE: Path = DEFAULT_TASKS_DIR / TASKS_FILE_NAME
 
 #: 计划文件：``~/MapDownloader/data/plans.json``（Slice 20）。
 DEFAULT_PLANS_FILE: Path = DEFAULT_TASKS_DIR / PLANS_FILE_NAME
+
+#: 执行记录文件：``~/MapDownloader/data/plan_executions.json``（Slice 21）。
+DEFAULT_PLAN_EXECUTIONS_FILE: Path = DEFAULT_TASKS_DIR / PLAN_EXECUTIONS_FILE_NAME
 
 # --------------------------------------------------------------------------- #
 # 行政区域边界资源（Slice 16）

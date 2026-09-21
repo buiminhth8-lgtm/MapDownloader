@@ -96,6 +96,23 @@ from app.planning.download_plan import (
     plan_folder_name,
     planned_output_paths,
 )
+
+# 执行态模型（Slice 21）。同样只有**模型**：调度器、执行记录 store、后台 worker
+# 一律从子模块导入（``app.planning.plan_scheduler`` / ``.plan_execution_store``）
+# —— 理由与下面那段导入顺序说明完全一样，而且更硬：``plan_scheduler`` 会拉
+# ``plan_service``（进而拉区域目录与任务服务），一旦从这里转出，``import app.geo``
+# 那条链就会拖着半个应用一起初始化。
+#
+# 注意名字分工：``PlanItemStatus``（上面那个）是**可用性**（可用 / 不可用），
+# ``PlanItemRunStatus``（这里）是**执行态**（等待 / 执行中 / 已完成 …）。
+# 刻意不合并、也不重名，理由见 ``plan_execution`` 的模块文档。
+from app.planning.plan_execution import (
+    PlanExecution,
+    PlanExecutionStatus,
+    PlanItemExecution,
+    PlanItemRunStatus,
+    PlanProgress,
+)
 from app.planning.zoom_policy import (
     DEFAULT_ZOOM_POLICIES,
     get_zoom_policy,
@@ -135,4 +152,10 @@ __all__ = [
     "item_file_stem",
     "item_output_path",
     "planned_output_paths",
+    # --- 计划执行（Slice 21）：同样只有模型 ---
+    "PlanExecution",
+    "PlanExecutionStatus",
+    "PlanItemExecution",
+    "PlanItemRunStatus",
+    "PlanProgress",
 ]
