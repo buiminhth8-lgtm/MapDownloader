@@ -278,10 +278,14 @@ strategy.recommend(MISSION_REGION_LEVEL)     # → Z15~18（DEFAULT_ZOOM_POLICIE
 Inspector（完整 / 缺一张 / 几何不在本机）→ 删除保护（被引用时拒绝）→
 重启（任务区还在 / 坏目录不阻塞启动）。
 
+![下载区域的第三个入口](slice22_mission_entry.png)
+
 ![任务区域窗口](slice22_mission_created.png)
 
 ![计算：候选 / 选中 / 过滤](slice22_mission_estimated.png)
 
 ![进入下载计划](slice22_mission_plan.png)
+
+![MBTiles 检查窗口里的覆盖结论](slice22_mission_inspector.png)
 
 ![被引用时拒绝删除](slice22_mission_delete_blocked.png)

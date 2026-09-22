@@ -102,6 +102,25 @@ def _pump(rounds: int = 8) -> None:
         _APP.processEvents()
 
 
+def _wait_until(predicate, timeout: float = 20.0, interval: float = 0.02) -> bool:
+    """空转事件循环直到 ``predicate()`` 为真（超时返回 ``False``，由调用方断言）。
+
+    检查窗口的结论是**后台线程**发信号回来的，不空转事件循环就永远等不到；
+    但也不能死循环 —— 超时要把"没等到"这件事说成失败，而不是把脚本挂死。
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            _pump(4)
+            return True
+        if _APP is not None:
+            _APP.processEvents()
+        time.sleep(interval)
+    return bool(predicate())
+
+
 def _shot(widget, name: str, enabled: bool) -> None:
     """把控件存成 ``docs/<name>``（``grab()`` 不触发布局重算，先 ``activate()``）。"""
     if not enabled:
@@ -774,7 +793,43 @@ def scene_inspector(
         "结论 PASS，且 region_level / buffer_meters 不会被通用校验器判成错",
         f"status={result.status} errors={result.errors[:2]}",
     )
-    _shot_roomy(window, "slice22_mission_inspector.png", shots)
+
+    # 界面证据要**从界面那一条路**拿：真的开检查窗口、真的点「快速检查」，
+    # 等它自己跑完 —— 直接 grab 主窗口会得到一张与场景 E 一模一样的图，
+    # 那种截图叫"我截了张图"，不叫"我验了这件事"。
+    window.open_mbtiles_inspector(str(complete))
+    dialog = window._inspector_dialog
+    dialog.buttons["quick"].click()
+    _wait_until(lambda: dialog.result is not None, timeout=60.0)
+    shown = dialog.result
+    checker.check(
+        shown is not None
+        and shown.coverage_checked is True
+        and shown.expected_tiles == len(inside)
+        and shown.missing_tiles == 0,
+        "检查窗口里点「快速检查」→ 它自己算出的结论与服务层一致（不是拿服务层的数字去凑）",
+        f"检查窗口 result={None if shown is None else (shown.expected_tiles, shown.missing_tiles)}",
+    )
+
+    # 结论得**看得见**：读渲染出来的 Zoom 统计表（列：级别 / 张数 / Expected / Missing），
+    # 而不是回头去读服务层的对象 —— 用户看的是这张表。
+    table = dialog.zoom_table
+    rendered = {}
+    for row in range(table.rowCount()):
+        cells = [
+            table.item(row, column).text() if table.item(row, column) else ""
+            for column in range(table.columnCount())
+        ]
+        rendered[cells[0].strip()] = cells[2:]
+    expected_text, missing_text = rendered.get(str(ZOOM), ["", ""])
+    checker.check(
+        expected_text.replace(",", "") == str(len(inside)) and missing_text == "0",
+        f"界面上 Z{ZOOM} 那一行写着 Expected={len(inside)} / Missing=0（覆盖结论看得见）",
+        f"Z{ZOOM} 行 = {expected_text} / {missing_text}",
+    )
+    _shot_roomy(dialog, "slice22_mission_inspector.png", shots)
+    dialog.close()
+    _pump(6)
 
     omitted = inside[0]
     missing_one = work_dir / "mission_missing_one.mbtiles"
