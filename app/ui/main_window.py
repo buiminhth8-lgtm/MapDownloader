@@ -63,6 +63,7 @@ from app.config.settings import (
     LOG_PACKAGE_INVALID,
     LOG_PACKAGE_VALIDATED,
     LOG_TRANSFER_STARTED,
+    MISSION_REGIONS_DIR_NAME,
     PACKAGE_MANIFEST_FILENAME,
     PLAN_EXECUTIONS_FILE_NAME,
     PLANS_FILE_NAME,
@@ -149,6 +150,12 @@ from app.geo import (
 )
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import MapLayerType, MapType, describe_map_type
+from app.mission import (
+    CompositeRegionService,
+    MissionRegionService,
+    MissionRegionStore,
+    mission_reference_files,
+)
 from app.planning.plan_execution_store import (
     PlanExecutionStore,
     PlanExecutionStoreError,
@@ -156,8 +163,10 @@ from app.planning.plan_execution_store import (
 from app.planning.plan_scheduler import MapDownloadTaskRunner, PlanScheduler
 from app.planning.plan_service import PlanService
 from app.planning.plan_store import PlanStore, PlanStoreError
+from app.planning.zoom_strategy import ZoomStrategyService
 from app.providers import TiandituProvider, TileTestResult, mask_url
 from app.regions.models import RegionCatalogError
+from app.regions.service import RegionService
 from app.services import (
     AdbStatus,
     AndroidTransferService,
@@ -187,6 +196,7 @@ from app.ui.download_panel import (
 from app.ui.download_worker import DownloadWorker
 from app.ui.download_plan_dialog import DownloadPlanDialog
 from app.ui.log_panel import LogPanel
+from app.ui.mission_region_dialog import MissionRegionDialog
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import RegionSelection, UiPreferences
@@ -387,6 +397,7 @@ class MainWindow(QMainWindow):
         preferences: UiPreferences | None = None,
         android_service: AndroidTransferService | None = None,
         plan_service: PlanService | None = None,
+        mission_service: MissionRegionService | None = None,
     ) -> None:
         """
         Args:
@@ -402,6 +413,9 @@ class MainWindow(QMainWindow):
                 ——一台没装 Android SDK 的 CI 机器上也必须能跑全套用例。
             plan_service: 多级下载计划的编排层（Slice 20）；``None`` 时自建，
                 且它的 ``plans.json`` 落在**任务文件旁边**（理由见下面那段注释）。
+            mission_service: 任务区（Slice 22）；``None`` 时自建，
+                且任务区目录落在**任务文件旁边**的 ``mission_regions/`` ——
+                理由与 ``plans.json`` 完全一样：默认值在测试里会写到用户主目录去。
                 测试注入一个指向临时目录的实例。
         """
         super().__init__(parent)
@@ -424,18 +438,48 @@ class MainWindow(QMainWindow):
         #: 那个临时 ``tasks.json`` 旁边不会有计划文件 —— 于是一条用例会**顺手写进
         #: 用户主目录**（Slice 7 的教训：测试绝不碰真实用户数据）。一个来源，
         #: 两种环境都对。
+        data_dir = self.task_service.store.path.parent
+        #: Zoom 策略服务（Slice 17）。**一个实例供全窗口使用**：任务区（Slice 22）
+        #: 与行政区必须查同一张策略表 —— 两处各建一个实例，就等于"推荐 Z15~18"
+        #: 这句话有两个来源，而它们迟早会因为有人只改了一处而不同。
+        self.strategy = ZoomStrategyService()
+        #: 任务区（Slice 22，Spec §13）。落在 ``data/mission_regions/`` 下
+        #: （跟着 ``task_service`` 走，理由同 ``plans.json``）。
+        #: 引用检查要看的正是同一个目录里的三份文件 —— 界面必须把它自己那一份
+        #: 传进去，默认值（用户主目录）只在"单跑服务"时才对。
+        self.mission_service = (
+            mission_service
+            if mission_service is not None
+            else MissionRegionService(
+                MissionRegionStore(data_dir / MISSION_REGIONS_DIR_NAME),
+                strategy=self.strategy,
+                reference_files=mission_reference_files(data_dir),
+            )
+        )
+        #: 让"拿一个 region_id 还原几何"这件事在续传与 Inspector 里成立（Spec §20）。
+        #: 注册的是一个回调：``app.geo`` 不认识任务区，它只在"行政区预设里找不到
+        #: 这个 id"时问一句。**后装上的会顶掉先前那一个**（见 app.mission 的说明）。
+        self.mission_service.install()
+        #: 行政区 + 任务区合成一个入口（Spec §18）：规划层（计划构建 / 估算 /
+        #: 校验）只认一套接口，合成之后"一个计划里既有中国又有某条航线"不需要
+        #: 改动规划层的任何一行。
+        self.region_service = CompositeRegionService(
+            RegionService(strategy=self.strategy), self.mission_service
+        )
         self.plan_service = (
             plan_service
             if plan_service is not None
             else PlanService(
-                store=PlanStore(self.task_service.store.path.parent / PLANS_FILE_NAME),
+                store=PlanStore(data_dir / PLANS_FILE_NAME),
+                service=self.region_service,
+                strategy=self.strategy,
                 task_service=self.task_service,
             )
         )
         #: 计划执行记录（Slice 21，Spec §19）。与 ``plans.json`` 同一目录，
         #: 理由与上面那段完全一样（测试注入临时 ``tasks.json`` 时不该写进用户主目录）。
         self.execution_store = PlanExecutionStore(
-            self.task_service.store.path.parent / PLAN_EXECUTIONS_FILE_NAME
+            data_dir / PLAN_EXECUTIONS_FILE_NAME
         )
 
         # 四大面板 + 当前任务进度区
@@ -485,6 +529,9 @@ class MainWindow(QMainWindow):
         #: **不带** ``WA_DeleteOnClose``（页面里的估算线程跑着时销毁 QThread
         #: 会中止进程），关掉再打开复用同一个实例。
         self._plan_dialog: DownloadPlanDialog | None = None
+        #: Slice 22：任务区域窗口。同上（它本身没有后台线程，但"关掉再打开
+        #: 复用同一个实例"能保住用户刚填的名称 / 航线 / 半径，省得重填一遍）。
+        self._mission_dialog: MissionRegionDialog | None = None
 
         # --- Slice 10：Android 传输的三个后台线程与三个非模态弹窗 --------
         #: 设备刷新线程（adb version + devices -l + getprop）
@@ -683,6 +730,9 @@ class MainWindow(QMainWindow):
         # Slice 20：多级下载计划的两个入口（Spec §10）
         self.download_panel.plan_add_requested.connect(self._on_plan_add_requested)
         self.download_panel.plan_open_requested.connect(self._on_plan_open_requested)
+        self.download_panel.mission_region_requested.connect(
+            self._on_mission_region_requested
+        )
 
     # ------------------------------------------------------------------ #
     # 槽：下载动作
@@ -2992,6 +3042,53 @@ class MainWindow(QMainWindow):
         self.log_panel.append_log(
             f"打开下载计划页：{self.plan_service.plan.describe()}"
         )
+
+    @Slot()
+    def _on_mission_region_requested(self) -> None:
+        """打开任务区域窗口（Slice 22，Spec §19）。
+
+        与下载计划页同一约定：主窗口持有引用、复用同一个实例（关掉再打开时
+        用户刚填的名称 / 航线 / 半径还在），非模态。
+
+        窗口里的每一步都即时生效（生成 / 计算 / 加入计划），因此它没有"取消" ——
+        真正会改变外部状态的两个动作（生成任务区、加入计划）都由服务层落盘，
+        界面上没有"暂存但没提交"的中间态。
+        """
+        self._sync_plan_settings_from_panel()
+        dialog = self._mission_dialog
+        if dialog is None:
+            dialog = MissionRegionDialog(
+                self.mission_service, self.plan_service, self
+            )
+            dialog.plan_changed.connect(self._on_mission_plan_changed)
+            dialog.regions_changed.connect(self._on_mission_regions_changed)
+            self._mission_dialog = dialog
+        else:
+            dialog.refresh()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.log_panel.append_log(
+            "打开任务区域窗口：已登记 "
+            f"{len(self.mission_service.list_all())} 个任务区"
+        )
+
+    @Slot()
+    def _on_mission_plan_changed(self) -> None:
+        """任务区域窗口改了计划 → 与「加入下载计划」走同一条收尾。
+
+        摘要与计划页必须一起刷：计划页可能正开着（用户在两个窗口之间来回看），
+        而"计划里到底有几块地 / 多少张"只有一处显示会让人以为操作没生效。
+        """
+        self._refresh_plan_summary()
+        self._refresh_plan_dialog()
+        self.statusBar().showMessage(self.plan_service.summary_text(), 8000)
+
+    @Slot()
+    def _on_mission_regions_changed(self) -> None:
+        """任务区被新建 / 删除 → 只记一条日志（列表本身在窗口里已经刷新过了）。"""
+        regions = self.mission_service.list_all()
+        self.log_panel.append_log(f"任务区已更新：当前共 {len(regions)} 个")
 
     def map_token(self) -> str:
         """当前天地图 Token（下载计划页要拿它建瓦片源）。

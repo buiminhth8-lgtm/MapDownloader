@@ -38,7 +38,9 @@ UI 的预估、进度条分母、大任务提示都必须用 selected —— 用
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -75,16 +77,34 @@ __all__ = [
     "get_region_preset",
     "region_from_task",
     "region_from_metadata",
+    # 动态区域解析（Slice 22）：任务区几何不在 REGION_PRESETS 里，
+    # 由业务层注册回调，本模块在"预设找不到"时问一句。
+    "register_region_resolver",
+    "unregister_region_resolver",
+    "clear_region_resolvers",
     # 资源路径规则（Slice 18 抽成公开函数：目录层与扁平预设共用同一份实现）
     "normalize_region_relative_path",
     "is_safe_region_relative_path",
     "resolve_region_path",
 ]
 
+_logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------- #
 # 区域类型
 # --------------------------------------------------------------------------- #
+def _format_meters(value: float) -> str:
+    """把"米"写成稳定的字符串（MBTiles 的 metadata 表是 TEXT）。
+
+    ``5000.0`` → ``"5000"``；``1500.5`` → ``"1500.5"``。
+    写成整数字符串而不是 ``"5000.0"``：这个值会被 Inspector、打包说明和
+    人眼读到，"5000 米"比"5000.0 米"少一个要解释的尾数。
+    """
+    text = f"{float(value):.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+
 class RegionType(Enum):
     """下载区域的几何类型。
 
@@ -380,6 +400,12 @@ class DownloadRegion:
             与自定义矩形都落在这里，因此它们的行为与 Slice ≤16 逐位一致。
             **不写进 tasks.json / manifest**：它由 ``region_id`` 反查预设即可得到
             （见 :func:`region_from_task`），多存一份就多一处会不同步的地方。
+            **例外**是任务区（``MISSION``，Slice 22）：它的几何不在资源目录里，
+            反查不出等级，因此 metadata 里会显式写下 ``region_level=mission``。
+        buffer_meters: 任务区走廊半径（米，Slice 22）。只有任务区有值；
+            矩形与行政区边界都是 ``None``（它们的"半径"没有意义）。
+            它会被写进 MBTiles metadata，供 Inspector / 打包说明"这个包是
+            按几公里的走廊下的"。
 
     Raises:
         ValueError: 名称为空；或多边形模式缺 :attr:`geojson_path`
@@ -393,6 +419,7 @@ class DownloadRegion:
     boundary_version: str | None = None
     geojson_path: str | None = None
     region_level: RegionLevel = RegionLevel.CUSTOM
+    buffer_meters: float | None = None
 
     def __post_init__(self) -> None:
         region_type = RegionType.parse(self.region_type)
@@ -414,6 +441,15 @@ class DownloadRegion:
         object.__setattr__(self, "region_id", region_id or None)
         version = (self.boundary_version or "").strip()
         object.__setattr__(self, "boundary_version", version or None)
+
+        radius = self.buffer_meters
+        if radius is None:
+            object.__setattr__(self, "buffer_meters", None)
+        else:
+            radius = float(radius)
+            if not (radius > 0):
+                raise ValueError(f"buffer_meters 必须大于 0，实际为 {radius}")
+            object.__setattr__(self, "buffer_meters", radius)
 
     # ------------------------------------------------------------------ #
     # 构造
@@ -468,16 +504,33 @@ class DownloadRegion:
         return self.region_type is RegionType.POLYGON
 
     @property
+    def is_mission(self) -> bool:
+        """是不是**任务区**（Slice 22）。
+
+        判据是等级而不是名字前缀：任务区的几何存在 ``data/mission_regions/``
+        下（用户数据），行政区边界存在 ``resources/regions/`` 下（随程序分发），
+        这两者在"几何从哪来"这件事上完全不同，而等级正是表达这件事的字段。
+        """
+        return self.region_level is RegionLevel.MISSION
+
+    @property
     def preset(self) -> RegionPreset | None:
         """多边形区域对应的预设（用于 Inspector 按 region_id 找边界文件）。"""
         return get_region_preset(self.region_id) if self.is_polygon else None
 
     def describe(self) -> str:
-        """一行展示文案，如 ``中国（行政区域）`` / ``自定义矩形``。"""
-        if self.is_polygon:
-            suffix = f"，{self.boundary_version}" if self.boundary_version else ""
-            return f"{self.name}（行政区域{suffix}）"
-        return "自定义矩形"
+        """一行展示文案，如 ``中国（行政区域）`` / ``自定义矩形`` / ``某航线（任务区，5.00 km）``。"""
+        if not self.is_polygon:
+            return "自定义矩形"
+        if self.is_mission:
+            radius = (
+                f"，{self.buffer_meters / 1000.0:.2f} km"
+                if self.buffer_meters
+                else ""
+            )
+            return f"{self.name}（任务区{radius}）"
+        suffix = f"，{self.boundary_version}" if self.boundary_version else ""
+        return f"{self.name}（行政区域{suffix}）"
 
     def bounds_text(self) -> str:
         """候选范围的紧凑文本（UI 的"范围："行用）。"""
@@ -508,26 +561,122 @@ class DownloadRegion:
         矩形也写 ``region_type=rectangle``：显式写出来，Inspector 才不用靠
         "没有这个键"来猜。``region_id`` / ``boundary_version`` 只在有值时写，
         避免矩形包多出两个空值键。
+
+        **任务区（Slice 22）多写两个键**：``region_level=mission`` 与
+        ``buffer_meters``。这两个键在别的区域类型上依旧不写 ——
+        行政区包多写一个"等级"是噪声（等级能从 ``region_id`` 反查出来），
+        而任务区**反查不出来**（它的几何不在资源目录里），
+        所以必须把"这是什么级别的区域"落在包里（Spec §20）。
         """
         rows = {"region_type": self.region_type.value}
         if self.region_id:
             rows["region_id"] = self.region_id
         if self.boundary_version:
             rows["boundary_version"] = self.boundary_version
+        if self.is_mission:
+            rows["region_level"] = self.region_level.value
+            if self.buffer_meters:
+                rows["buffer_meters"] = _format_meters(self.buffer_meters)
         return rows
 
-    def manifest_region(self) -> dict[str, str]:
-        """写进地图包 manifest 的 ``region`` 子对象（Spec §21）。"""
-        data = {"type": self.region_type.value}
+    def manifest_region(self) -> dict[str, Any]:
+        """写进地图包 manifest 的 ``region`` 子对象（Spec §21）。
+
+        任务区多写 ``level`` / ``bufferMeters`` / ``geometryVersion`` 三个键
+        （Spec §19 的字段名）。``type`` 仍然是**几何类型**（``polygon``）而不是
+        ``mission``：这个键在 Slice 16 就定成"矩形还是多边形"，
+        它的读取方（含 Android）对认不出的取值一律按矩形兜底 ——
+        把 ``mission`` 塞进去，等于让老读取方把一个多边形包当矩形看，
+        "是哪种区域"改由 ``level`` 表达，两者各管一件事、互不挤占。
+
+        注意：真正写 manifest 的是 :mod:`app.package`（它从 MBTiles metadata
+        取信息，见 ``package_builder._region_from_metadata``）。本方法保证
+        "同一件事在两处的写法一致"，方便核对与测试。
+        """
+        data: dict[str, Any] = {"type": self.region_type.value}
         if self.region_id:
             data["id"] = self.region_id
         if self.boundary_version:
             data["boundaryVersion"] = self.boundary_version
+        if self.is_mission:
+            data["level"] = self.region_level.value
+            if self.buffer_meters:
+                data["bufferMeters"] = float(self.buffer_meters)
+            if self.boundary_version:
+                data["geometryVersion"] = self.boundary_version
         return data
 
     def with_bounds(self, bounds: GeoBounds) -> "DownloadRegion":
         """换一个候选范围（返回新实例；本类型不可变）。"""
         return replace(self, bounds=bounds)
+
+
+# --------------------------------------------------------------------------- #
+# 动态区域解析（Slice 22）
+# --------------------------------------------------------------------------- #
+#: 一个"按 id 还原区域"的回调：``(region_id, bounds) -> (region, note) | None``。
+#:
+#: - 返回 ``None``：**这个 id 不归我管**（继续问下一个）；
+#: - 返回 ``(region, "")``：认这个 id，几何可用；
+#: - 返回 ``(None, note)``：认这个 id，但几何不可用（``note`` 就是给用户的说明）。
+#:
+#: ``bounds`` 由调用方给出（任务记录 / MBTiles metadata 里那份）：它决定候选矩形，
+#: 必须与当初下单用的**同一个**，否则恢复出来的瓦片集会变。
+RegionResolver = Callable[[str, GeoBounds], "tuple[DownloadRegion | None, str] | None"]
+
+#: 已注册的回调，按注册顺序询问。
+#:
+#: 为什么是"注册回调"而不是"让 geo 认识任务区"：``app.geo`` 是纯计算层，
+#: 任务区几何是**业务数据**（存在用户数据目录、由 ``app.mission`` 管理）。
+#: 让 geo 反过来 import 业务层会立刻造出一个循环；注册一个函数则只暴露
+#: "我需要一个能把 id 变回几何的东西"这一个需求。
+_DYNAMIC_REGION_RESOLVERS: list[RegionResolver] = []
+
+
+def register_region_resolver(resolver: RegionResolver) -> None:
+    """注册一个动态区域解析器（重复注册同一个对象只会生效一次）。"""
+    if resolver not in _DYNAMIC_REGION_RESOLVERS:
+        _DYNAMIC_REGION_RESOLVERS.append(resolver)
+
+
+def unregister_region_resolver(resolver: RegionResolver) -> None:
+    """撤掉一个动态区域解析器（不在表里时静默返回）。"""
+    try:
+        _DYNAMIC_REGION_RESOLVERS.remove(resolver)
+    except ValueError:
+        pass
+
+
+def clear_region_resolvers() -> None:
+    """清空全部动态解析器（**测试用**：避免用例之间互相污染）。"""
+    _DYNAMIC_REGION_RESOLVERS.clear()
+
+
+def _resolve_dynamic_region(
+    region_id: str, bounds: GeoBounds
+) -> tuple[DownloadRegion | None, str]:
+    """依次询问已注册的解析器。
+
+    Returns:
+        ``(region, note)``：``note`` 非空表示"某个解析器认识这个 id，
+        但几何不可用"，调用方应据此把覆盖度标成未知（**不要退回矩形**）。
+    """
+    last_error = ""
+    for resolver in tuple(_DYNAMIC_REGION_RESOLVERS):
+        try:
+            result = resolver(region_id, bounds)
+        except Exception as exc:  # noqa: BLE001 - 一个坏解析器不该让 Inspector 崩掉
+            _logger.warning("动态区域解析器 %r 抛异常：%s", resolver, exc)
+            last_error = str(exc)
+            continue
+        if result is None:
+            continue
+        region, note = result
+        if region is not None:
+            return region, ""
+        if note:
+            return None, note
+    return None, last_error
 
 
 def region_from_task(task: object) -> DownloadRegion | None:
@@ -539,7 +688,8 @@ def region_from_task(task: object) -> DownloadRegion | None:
     还原规则：
 
     - 记录里的 ``region_type`` 认不出、或就是 ``rectangle`` → 矩形区域；
-    - 是多边形但 ``region_id`` 找不到对应预设 → 返回 ``None``
+    - 是多边形但 ``region_id`` 找不到对应预设 → 先问一遍动态解析器
+      （任务区走这条路，Slice 22），仍然还原不出来才返回 ``None``
       （调用方据此提示"这个任务的行政区边界已不可用"，而不是猜一个形状）。
 
     Returns:
@@ -561,7 +711,8 @@ def region_from_task(task: object) -> DownloadRegion | None:
     region_id = str(getattr(task, "region_id", "") or "").strip()
     preset = get_region_preset(region_id)
     if preset is None:
-        return None
+        dynamic, _note = _resolve_dynamic_region(region_id, bounds)
+        return dynamic
     version = str(getattr(task, "boundary_version", "") or "").strip()
     return DownloadRegion(
         region_type=RegionType.POLYGON,
@@ -596,10 +747,18 @@ def region_from_metadata(
     wanted = (region_id or "").strip()
     preset = get_region_preset(wanted)
     if preset is None:
+        # 预设里没有：可能是**任务区**（Slice 22，几何在用户数据目录里），
+        # 问一遍动态解析器。它认不出来就还是走原来那条"不认识这个 id"的说明。
+        dynamic, dynamic_note = _resolve_dynamic_region(wanted, bounds)
+        if dynamic is not None:
+            return dynamic, ""
         return None, (
-            f"行政区边界资源不可用：本版本不认识 region_id={wanted!r}"
-            if wanted
-            else "行政区边界资源不可用：metadata 缺少 region_id"
+            dynamic_note
+            or (
+                f"行政区边界资源不可用：本版本不认识 region_id={wanted!r}"
+                if wanted
+                else "行政区边界资源不可用：metadata 缺少 region_id"
+            )
         )
     if not preset.available:
         return None, preset.missing_message()

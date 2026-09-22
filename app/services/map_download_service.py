@@ -1159,6 +1159,17 @@ class MapDownloadService:
             region_type=region.region_type.value if region else "rectangle",
             region_id=region.region_id if region else "",
             boundary_version=region.boundary_version if region else "",
+            # Slice 22（Spec §20）：任务区额外记两项 —— 等级与走廊半径。
+            # 行政区的这两项**保持为空**：等级能从 region_id 反查，
+            # 而任务区的几何在用户数据目录里，反查不出来，必须落在包里。
+            # 「按不含任务区的输入跑出来的字节与 Slice ≤21 逐位一致」由
+            # tests/test_mbtiles_region_metadata.py 守着。
+            region_level=(
+                region.region_level.value if region and region.is_mission else ""
+            ),
+            buffer_meters=(
+                region.buffer_meters if region and region.is_mission else ""
+            ),
         )
 
         path.parent.mkdir(parents=True, exist_ok=True)

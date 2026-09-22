@@ -131,12 +131,23 @@ MANIFEST_FIELD_ORDER: tuple[str, ...] = (
     "createdAt",
 )
 
-#: ``region`` 子对象的字段顺序（Slice 16）。
+#: ``region`` 子对象的字段顺序（Slice 16；Slice 22 追加三个可选键）。
 #:
 #: 与 ``description`` 同属**可选**字段：旧包没有它，读到 ``None`` 时按矩形处理
 #: （Spec §21/§29）。因此它虽然进了 :data:`MANIFEST_FIELD_ORDER`（决定书写位置），
 #: 却**不**是必填项 —— 判定"哪些字段必填"的表在协议测试里，那边把它排除掉。
-MANIFEST_REGION_FIELDS: tuple[str, ...] = ("type", "id", "boundaryVersion")
+#:
+#: ``level`` / ``bufferMeters`` / ``geometryVersion``（Slice 22）只对**任务区**
+#: 出现：行政区包多写一个"等级"是噪声（等级能从 ``id`` 反查出来），而任务区的
+#: 几何在用户数据目录里、反查不出来，必须把这个事实落在包里（Spec §19）。
+MANIFEST_REGION_FIELDS: tuple[str, ...] = (
+    "type",
+    "id",
+    "boundaryVersion",
+    "level",
+    "bufferMeters",
+    "geometryVersion",
+)
 
 #: ``bounds`` 子对象的字段顺序（west, south, east, north —— 与 MBTiles 的
 #: ``bounds`` 字符串同序，避免两处顺序不一致时靠人眼核对）
@@ -184,8 +195,16 @@ class PackageRegion:
 
     Attributes:
         region_type: ``rectangle`` / ``polygon``。
-        region_id: 行政区标识（``china``）；矩形为 ``None``。
-        boundary_version: 边界数据版本；未知为 ``None``。
+        region_id: 行政区标识（``china``）或任务区标识（``mission-001``）；
+            矩形为 ``None``。
+        boundary_version: 边界数据版本；未知为 ``None``。任务区的几何版本号
+            也走这个字段（下载链路上它们的语义完全相同：**这批瓦片是按哪一版
+            几何裁的**）。
+        level: 区域等级（``country`` / ``province`` / ``city`` / ``mission`` /
+            ``custom``）。**只有任务区写**：行政区等级能从 ``region_id`` 反查，
+            任务区不能（Slice 22）。
+        buffer_meters: 任务区走廊半径（米）；非任务区为 ``None``。
+        geometry_version: 任务区几何版本号；非任务区为 ``None``。
 
     取值刻意**不做白名单校验**（只做归一化）：manifest 由本工具生成，
     但也会被别的工具/未来版本读。一个写着 ``multipolygon`` 的包仍然是
@@ -196,6 +215,9 @@ class PackageRegion:
     region_type: str = "rectangle"
     region_id: str | None = None
     boundary_version: str | None = None
+    level: str | None = None
+    buffer_meters: float | None = None
+    geometry_version: str | None = None
 
     def __post_init__(self) -> None:
         # 空串 / 空白都落回 rectangle：连 ``{"region": {}}`` 这种残缺写法
@@ -206,18 +228,42 @@ class PackageRegion:
         object.__setattr__(self, "region_id", region_id or None)
         version = str(self.boundary_version).strip() if self.boundary_version else ""
         object.__setattr__(self, "boundary_version", version or None)
+        level = str(self.level).strip().lower() if self.level else ""
+        object.__setattr__(self, "level", level or None)
+        geometry_version = (
+            str(self.geometry_version).strip() if self.geometry_version else ""
+        )
+        object.__setattr__(self, "geometry_version", geometry_version or None)
+        if self.buffer_meters is None:
+            object.__setattr__(self, "buffer_meters", None)
+        else:
+            try:
+                radius = float(self.buffer_meters)
+            except (TypeError, ValueError) as exc:
+                raise ManifestError(
+                    f"manifest.region.bufferMeters 不是数字：{self.buffer_meters!r}"
+                ) from exc
+            object.__setattr__(self, "buffer_meters", radius)
 
-    def to_dict(self) -> dict[str, str]:
-        """转成 JSON 结构（``type`` / ``id`` / ``boundaryVersion``）。
+    def to_dict(self) -> dict[str, Any]:
+        """转成 JSON 结构（Slice 16 的三个键 + 任务区的三个可选键）。
 
         空字段**不写**：``"id": null`` 与"没有 id"在 Android 侧是两种语义
         （前者可能被反序列化成字符串 ``"null"``），与 ``description`` 同一处理。
+        这也保证了**加了新键不会改变任何既有包的字节**：行政区包与矩形包
+        里这三个键根本不会出现（协议用例守着这件事）。
         """
-        data: dict[str, str] = {"type": self.region_type}
+        data: dict[str, Any] = {"type": self.region_type}
         if self.region_id:
             data["id"] = self.region_id
         if self.boundary_version:
             data["boundaryVersion"] = self.boundary_version
+        if self.level:
+            data["level"] = self.level
+        if self.buffer_meters is not None:
+            data["bufferMeters"] = self.buffer_meters
+        if self.geometry_version:
+            data["geometryVersion"] = self.geometry_version
         return {key: data[key] for key in MANIFEST_REGION_FIELDS if key in data}
 
     @classmethod
@@ -235,6 +281,9 @@ class PackageRegion:
             region_type=str(data.get("type", "") or ""),
             region_id=data.get("id"),
             boundary_version=data.get("boundaryVersion"),
+            level=data.get("level"),
+            buffer_meters=data.get("bufferMeters"),
+            geometry_version=data.get("geometryVersion"),
         )
 
     @classmethod

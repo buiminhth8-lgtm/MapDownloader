@@ -98,11 +98,22 @@ def _dialog(
 
 
 def _wait_until(qapp, predicate, timeout_s: float = 30.0) -> bool:
-    """轮询等待条件成立，期间持续处理 Qt 事件（主线程不阻塞）。"""
+    """轮询等待条件成立，期间持续处理 Qt 事件（主线程不阻塞）。
+
+    条件一成立**还要再settle 几圈**事件循环才返回：调度器在后台线程里推进，
+    状态落到 ``execution()`` 与"界面上那行字被重画"是两次独立的事件投递
+    （后者由排队信号触发）。predicate 只看前者时，返回得太早就会读到
+    上一帧的文案 —— 表现为"状态明明已经部分失败，标签还写着执行中"，
+    而且是否复现取决于机器快慢（Slice 21 收尾时的间歇性失败就出在这里）。
+    多转几圈不改变任何被测行为，只是把"界面已经跟上"这件事等实。
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         qapp.processEvents()
         if predicate():
+            for _ in range(8):
+                qapp.processEvents()
+                time.sleep(0.005)
             return True
         time.sleep(0.02)
     return False

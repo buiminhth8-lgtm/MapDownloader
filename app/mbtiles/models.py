@@ -91,6 +91,9 @@ METADATA_KEY_ORDER: tuple[str, ...] = (
     "region_type",
     "region_id",
     "boundary_version",
+    # Slice 22：只有任务区会写这两项（见 MBTilesMetadata 的字段说明）
+    "region_level",
+    "buffer_meters",
 )
 
 #: ``metadata.region_type`` 允许的取值（Spec §19）。
@@ -147,10 +150,20 @@ class MBTilesMetadata:
     #: ``rectangle`` / ``polygon``；空串表示"这个文件没有记录区域信息"
     #: （Slice ≤15 生成的包读回来就是 ``""``，Inspector 据此按矩形处理）。
     region_type: str = ""
-    #: 行政区标识（``china``）；矩形或老文件为空串。
+    #: 行政区标识（``china``）或任务区标识（``mission-001``）；矩形或老文件为空串。
     region_id: str = ""
     #: 边界数据版本，用于追溯"这批瓦片是按哪一版边界裁的"。
+    #: 任务区写的是**几何版本号**（``1:5000.0:9c1f…``）—— 语义完全相同。
     boundary_version: str = ""
+    # --- Slice 22：任务区补充信息（Spec §20）---
+    #: 区域等级（``mission``）。**只有任务区写**：行政区的等级能从 ``region_id``
+    #: 反查出来，多写一份只会多一处不同步的地方；任务区的几何在用户数据目录里，
+    #: 反查不出来，所以必须落在文件里。
+    region_level: str = ""
+    #: 任务区走廊半径（米，字符串形式）。非任务区为空串。
+    #: 它的用处是回答"这个包是按几公里的走廊下的" —— 一个 20 km 的任务区包
+    #: 与一个 500 m 的包，Tile 数可能差上百倍，只写 bounds 是解释不清的。
+    buffer_meters: str = ""
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -199,6 +212,23 @@ class MBTilesMetadata:
             )
         self.region_id = str(self.region_id).strip()
         self.boundary_version = str(self.boundary_version).strip()
+
+        # --- Slice 22：任务区补充信息（空值表示"本文件不记录这一项"）---
+        self.region_level = str(self.region_level).strip().lower()
+        radius = self.buffer_meters
+        if radius is None or str(radius).strip() == "":
+            self.buffer_meters = ""
+        else:
+            try:
+                meters = float(radius)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"buffer_meters 必须是数字，实际为 {radius!r}"
+                ) from exc
+            # 写成稳定的字符串（与 ``DownloadRegion.metadata_rows`` 同一格式）：
+            # 5000.0 → "5000"，1500.5 → "1500.5"。
+            text = f"{meters:.1f}"
+            self.buffer_meters = text[:-2] if text.endswith(".0") else text
 
         try:
             min_zoom = operator.index(self.min_zoom)
@@ -297,6 +327,10 @@ class MBTilesMetadata:
             values["region_id"] = self.region_id
         if self.boundary_version:
             values["boundary_version"] = self.boundary_version
+        if self.region_level:
+            values["region_level"] = self.region_level
+        if self.buffer_meters:
+            values["buffer_meters"] = self.buffer_meters
         return values
 
     def as_rows(self) -> list[tuple[str, str]]:
@@ -323,6 +357,8 @@ class MBTilesMetadata:
         region_type: str = "",
         region_id: str = "",
         boundary_version: str = "",
+        region_level: str = "",
+        buffer_meters: str | float | None = "",
     ) -> "MBTilesMetadata":
         """便捷构造：直接用 :class:`~app.geo.GeoBounds` 建元数据。
 
@@ -352,6 +388,8 @@ class MBTilesMetadata:
             region_type=region_type,
             region_id=region_id,
             boundary_version=boundary_version,
+            region_level=region_level,
+            buffer_meters="" if buffer_meters is None else buffer_meters,
         )
 
 

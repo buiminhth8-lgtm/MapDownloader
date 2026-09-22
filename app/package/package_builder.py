@@ -216,23 +216,50 @@ class SourceFacts:
 def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
     """从 MBTiles ``metadata`` 里读区域信息（Spec §21）。
 
-    三项**都空**时返回 ``None``，manifest 里就不写 ``region`` 子对象 ——
+    四项**都空**时返回 ``None``，manifest 里就不写 ``region`` 子对象 ——
     这样 Slice ≤15 时代的老文件打出来的包与以前**逐字节一致**，
     "旧包兼容"才不只是口头承诺（协议样例的往返用例会守住这一点）。
 
     同时，同一条规则也让"新工具打老包"和"老工具打新包"两个方向都安全：
     前者不凭空多出一个字段，后者只是多读到一个不认识的键（Android 侧忽略）。
+
+    Slice 22 追加两项（只有**任务区**会写它们）：``region_level`` 与
+    ``buffer_meters``。任务区的几何在用户数据目录里，反查不出等级，
+    所以"这是什么级别的区域"必须落在包里；而行政区的等级能从 ``id`` 反查，
+    多写一份只会多一处不同步的地方 —— 因此这两项原样透传、不做任何猜测。
     """
     region_type = str(metadata.get("region_type") or "").strip().lower()
     region_id = str(metadata.get("region_id") or "").strip()
     version = str(metadata.get("boundary_version") or "").strip()
-    if not (region_type or region_id or version):
+    level = str(metadata.get("region_level") or "").strip().lower()
+    if not (region_type or region_id or version or level):
         return None
     return PackageRegion(
         region_type=region_type or "rectangle",
         region_id=region_id or None,
         boundary_version=version or None,
+        level=level or None,
+        buffer_meters=_optional_float(metadata.get("buffer_meters")),
+        # 写 region_level 的区域（当前只有任务区）其 boundary_version 就是
+        # **几何版本号** —— 两者是同一个事实，因此从同一个来源取值，
+        # 不会出现"boundaryVersion 说 A、geometryVersion 说 B"。
+        geometry_version=((version or None) if level else None),
     )
+
+
+def _optional_float(value: object) -> float | None:
+    """把 metadata 里的字符串转成 float；空 / 转不动时返回 ``None``。
+
+    转不动**不报错**：这只是一个附加信息，一个手改坏了的包不该因此打不成包
+    （Spec §19 的同一条原则：不认识 / 读不懂的附加字段按"没有"处理）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 class MapPackageBuilder:

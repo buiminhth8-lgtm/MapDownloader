@@ -101,6 +101,13 @@ ACTION_TEST_CONNECTION = "test_connection"
 ACTION_PLAN_ADD = "plan_add"
 ACTION_PLAN_OPEN = "plan_open"
 
+#: 任务区域入口（Slice 22，Spec §19）。
+#:
+#: 第三种"要下哪块地"的来源：自定义矩形与行政区都在上面的区域类型下拉框里，
+#: 而任务区要"导入航线 + 定缓冲半径"，有自己的对话框。它同样与任务状态无关 ——
+#: 下载中一样可以准备下一个任务区。
+ACTION_MISSION_OPEN = "mission_open"
+
 #: :class:`~app.ui.task_actions.TaskAction` → 动作标识。
 #:
 #: 两个枚举不能合成一个：``TaskAction`` 是"用户可以干什么"（纯逻辑，不 import Qt，
@@ -222,6 +229,14 @@ class DownloadPanel(QGroupBox):
 
     #: 用户点了「查看下载计划」（Slice 20，Spec §10）。同上，与任务状态无关。
     plan_open_requested = Signal()
+
+    #: 用户点了「任务区域…」（Slice 22，Spec §19）。同上，与任务状态无关：
+    #: 打开任务区对话框只是"准备下一块地"，改不动当前正在跑的那个下载任务。
+    #:
+    #: 面板只发信号、不自己开对话框：对话框需要任务区服务 / 计划服务，
+    #: 而面板刻意只持有区域选择那一套（它的构造参数里没有服务注入）。
+    #: 由主窗口统一接线，与「加入下载计划」同一条路数。
+    mission_region_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
@@ -1097,7 +1112,7 @@ class DownloadPanel(QGroupBox):
         self.apply_task_state(UiTaskState.IDLE)
 
     def _build_plan_row(self) -> None:
-        """多级下载计划的入口（Slice 20，Spec §10）。
+        """多级下载计划的入口（Slice 20，Spec §10）+ 任务区域入口（Slice 22）。
 
         放在下载按钮下面、结果区上面：它产生的是**计划**而不是**下载**，
         与上面那排"现在就开始下"是同一个层次上的两种选择，摆在旁边用户才发现
@@ -1106,6 +1121,12 @@ class DownloadPanel(QGroupBox):
 
         标签写的是**计划**的规模（"3 个区域 / 5.7 万张 / 1.6 GB"），因此
         「加入下载计划」点一下就能看到全局变化，不必先打开对话框。
+
+        Slice 22 追加的「任务区域」是**第三种"要下哪块地"的来源**：前两种是
+        自定义矩形与行政区（都在下面那个下拉框里选），任务区是"一条航线两侧
+        若干公里"的走廊，需要先导入航线、定半径，所以它有自己的对话框。
+        它放在这一排而不是下拉框里，是因为它产出的东西同样是"进计划的一块地"
+        （选区 → 定 Zoom → 加入计划）。
         """
         self._plan_add_button = QPushButton("加入下载计划", self)
         self._plan_add_button.setToolTip(
@@ -1117,17 +1138,25 @@ class DownloadPanel(QGroupBox):
             "打开下载计划：查看每个区域的范围 / 张数 / 容量，"
             "逐项启用或移除，生成下载任务"
         )
+        self._mission_button = QPushButton("任务区域…", self)
+        self._mission_button.setToolTip(
+            "由一条航线生成高精度任务区：导入 GeoJSON 航线 → 按米缓冲出走廊 → "
+            "只在这条走廊里下 Z15~18 的高精度图（总量比整座城市小一个数量级）"
+        )
         #: 按钮顺序即从左到右的顺序（与 ``_action_buttons`` 同一约定）
         self._plan_buttons: dict[str, QPushButton] = {
             ACTION_PLAN_ADD: self._plan_add_button,
             ACTION_PLAN_OPEN: self._plan_open_button,
+            ACTION_MISSION_OPEN: self._mission_button,
         }
         self._plan_add_button.clicked.connect(self.plan_add_requested.emit)
         self._plan_open_button.clicked.connect(self.plan_open_requested.emit)
+        self._mission_button.clicked.connect(self.mission_region_requested.emit)
 
         self._plan_button_row = QHBoxLayout()
         self._plan_button_row.addWidget(self._plan_add_button)
         self._plan_button_row.addWidget(self._plan_open_button)
+        self._plan_button_row.addWidget(self._mission_button)
         self._plan_button_row.addStretch(1)
 
         self._plan_summary_label = _WrappingLabel(_PLAN_SUMMARY_PLACEHOLDER, self)
@@ -1349,7 +1378,7 @@ class DownloadPanel(QGroupBox):
     # 下载计划（Slice 20，Spec §10 / §11）
     # ------------------------------------------------------------------ #
     def plan_buttons(self) -> dict[str, QPushButton]:
-        """计划入口按钮：``ACTION_PLAN_ADD`` / ``ACTION_PLAN_OPEN``。"""
+        """计划入口按钮：``ACTION_PLAN_ADD`` / ``ACTION_PLAN_OPEN`` / ``ACTION_MISSION_OPEN``。"""
         return dict(self._plan_buttons)
 
     def set_plan_summary(self, text: str) -> None:

@@ -41,8 +41,14 @@ PLANNING_DIR = APP_DIR / "planning"
 #:
 #: ``app/geo/region.py`` 是**数据**（中国预设有等级）而不是**规则**：
 #: 它只说"中国是全国级"，从不说"全国该用到 Z10"。规则只在 app/planning 里。
+#:
+#: ``app/mission/models.py``（Slice 22）同属**定义**而不是规则：它只说
+#: "任务区这一级叫 MISSION"，并把这件事收在 :data:`MISSION_REGION_LEVEL`
+#: 一处 —— 任务区层里凡是要问"我是哪一级"的地方都引用它，而不是各写一遍
+#: ``RegionLevel.MISSION``（那才会让"任务区属于哪一级"散落成多份）。
 _LEVEL_LITERAL_ALLOWED = {
     APP_DIR / "geo" / "region.py",
+    APP_DIR / "mission" / "models.py",
 }
 
 #: Spec §3 点名的四个层级（顺序即文档顺序）。

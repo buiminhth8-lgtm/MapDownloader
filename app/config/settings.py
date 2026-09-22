@@ -352,6 +352,80 @@ REGION_BOUNDARY_LICENSE_NOTICE: str = (
 )
 
 # --------------------------------------------------------------------------- #
+# 任务区（Mission）—— 航线 Buffer（Slice 22）
+# --------------------------------------------------------------------------- #
+#: 任务区落盘目录名：``~/MapDownloader/data/mission_regions``。
+#:
+#: 与 ``tasks.json`` / ``plans.json`` 同一个 ``data/`` 下面：任务区几何是
+#: **本工具产生的数据**，不是随程序分发的资源（那才是 ``resources/regions``）。
+#: 每个任务区一个子目录：``<mission-id>/route.geojson``、``region.geojson``、
+#: ``metadata.json``（Spec §11）。
+MISSION_REGIONS_DIR_NAME: str = "mission_regions"
+MISSION_REGIONS_DIR: Path = DEFAULT_TASKS_DIR / MISSION_REGIONS_DIR_NAME
+
+#: 一个任务区目录里的三个固定文件名（Spec §11）
+MISSION_ROUTE_FILENAME: str = "route.geojson"
+MISSION_REGION_FILENAME: str = "region.geojson"
+MISSION_METADATA_FILENAME: str = "metadata.json"
+
+#: 任务区 id 前缀。它**是跨层契约**：下载链路、Inspector、计划层都靠这个前缀
+#: 把"任务区"与"行政区目录里的 id"分开（``region_id`` 是唯一线索，见
+#: ``app.geo.region`` 的动态解析注册表）。
+MISSION_ID_PREFIX: str = "mission-"
+
+#: 任务区目录元数据的版本号（与 ``TASKS_FILE_VERSION`` 同一套思路）：
+#: 将来字段变了，读的时候能按版本号分流，而不是靠"有没有这个键"猜。
+MISSION_METADATA_VERSION: int = 1
+
+#: 几何版本号的前缀。完整版本号形如 ``1:5000.0:3f2a…``（结构 + Buffer + 航线摘要），
+#: 由 :meth:`app.mission.MissionRegionBuilder.geometry_version` 生成。
+#:
+#: 它会被写进任务记录的 ``boundary_version`` 与 MBTiles metadata：**同一份几何
+#: 永远得到同一个版本号**，于是"改了航线就该是一个新任务区"这件事有据可查
+#: （Spec §21：绝不悄悄改一个在跑 / 已下载的任务的几何）。
+MISSION_GEOMETRY_VERSION: str = "1"
+
+#: 默认 Buffer 半径（米）。5 km 对应 Spec §7 的例子：一条城市周边的航线，
+#: 5 km 走廊大约覆盖 Z15~18 的作业范围。
+DEFAULT_MISSION_BUFFER_METERS: float = 5000.0
+
+#: Buffer 半径允许区间（米）。下界防"退化成一条线"，上界防"其实是在下整座城市"。
+MISSION_BUFFER_METERS_MIN: float = 100.0
+MISSION_BUFFER_METERS_MAX: float = 50_000.0
+
+#: 一条航线至少要几个点。两个点才构成一条线；一个点只能生成圆，
+#: 那属于"自定义区域"而不是航线任务（Spec §6）。
+MISSION_MIN_WAYPOINTS: int = 2
+
+#: 本地米制投影（AEQD）允许的最大航线跨度（度）。
+#:
+#: AEQD 以航线中心为原点，离中心越远形变越大。本工具的用法是"一条作业航线"，
+#: 跨度通常在 0.1°~2° 量级；超过 10°（约 1100 km）的"航线"已经不适合用单点
+#: AEQD 做米制 Buffer，此时**直接报错**而不是给一个悄悄失真的结果（Spec §10）。
+MISSION_MAX_ROUTE_SPAN_DEGREES: float = 10.0
+
+#: 任务区几何与元数据里记录的范围允许的差异（度）。
+#: 两者本来就是同一份浮点数写出去的，差异只可能来自"文件被改过" —— 一旦超出
+#: 这个容差就报错，而不是拿着一个和元数据对不上的几何去续传（那会改变瓦片集）。
+MISSION_BOUNDS_TOLERANCE: float = 1e-6
+
+#: 任务区界面上 Buffer 输入框使用的单位换算（1 km = 1000 m）。
+#: 界面按 km 输入（"5" 比 "5000" 好读），业务层一律按米 —— 换算只在**入口**做一次。
+MISSION_BUFFER_KM_DECIMALS: int = 2
+
+# UI 文案（Slice 22）。与其余 UI_TEXT_* 一样：文案属于配置，不散落在控件代码里。
+UI_TEXT_MISSION_DIALOG_TITLE: str = "任务区域（航线 Buffer）"
+UI_TEXT_MISSION_NAME_REQUIRED: str = "请先填写任务区名称"
+UI_TEXT_MISSION_ROUTE_REQUIRED: str = "请先选择航线文件（GeoJSON LineString）"
+UI_TEXT_MISSION_BUFFER_RANGE: str = (
+    "Buffer 半径必须在 {min_m:.1f} ~ {max_m:.1f} 米"
+    "（界面按 km 输入）之间"
+)
+UI_TEXT_MISSION_DELETE_REFERENCED: str = "该任务区域正在被下载计划引用，无法删除"
+UI_TEXT_MISSION_EMPTY: str = "暂无任务区"
+UI_TEXT_MISSION_NOT_FOUND: str = "任务区不存在或几何文件已不可用：{mission_id}"
+
+# --------------------------------------------------------------------------- #
 # 日志
 # --------------------------------------------------------------------------- #
 LOG_LEVEL: int = 20  # logging.INFO，避免在此 import logging 造成额外耦合

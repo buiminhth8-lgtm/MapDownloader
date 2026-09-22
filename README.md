@@ -25,6 +25,7 @@
 - [行政区域级联选择 + 推荐 Zoom](docs/region_selection_ui.md) —— Slice 19
 - [多级下载计划（全国 / 省 / 市）](docs/download_plan.md) —— Slice 20
 - [计划批量调度（串行执行 / 暂停 / 继续 / 取消 / 重试 / 跳过）](docs/plan_scheduler.md) —— Slice 21
+- [任务区域：航线走廊的高精度离线图](docs/mission_region.md) —— Slice 22
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -238,6 +239,104 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 22：任务区域（航线走廊的高精度离线图）
+
+高精度离线图的代价是平方级增长：Z15 到 Z18 每升一级瓦片数翻四倍，于是
+"给长三角下 Z15~18"意味着三千万张瓦片、上百 GB —— 绝大多数作业场景装不下也下不完。
+而巡检 / 测绘 / 应急巡查真正需要的，往往只是**一条航线两侧的带状区域**。
+
+这一版把"一条航线两侧多少米"变成一块可下载的地：
+
+```text
+下载区域：…        [加入下载计划] [查看下载计划] [任务区域…]  ← 本 Slice 新增的入口
+                                                      ↓
+┌ 任务区域 ─────────────────────────────────────────────────────────┐
+│ 任务区名称  [西湖巡检航线            ]                             │
+│ 航线文件    [D:/routes/west-lake.geojson        ] [浏览…]          │
+│ Buffer 半径 [ 5.00 km]   ← 界面按 km，落盘按**米**（5000）          │
+│ 已有任务区  [mission-001 西湖巡检航线（3 个航点 / 走廊 5.00 km）▾]  │
+│                              [生成任务区]                          │
+├ Zoom ─────────────────────────────────────────────────────────────┤
+│ ● 使用推荐 Zoom   ○ 自定义 Zoom                                    │
+│ Min [15] Max [18]      ← 推荐模式下**只读**，数字来自 Zoom 策略表    │
+│ 推荐 Zoom：Z15~18                                                  │
+├ 下一步 ───────────────────────────────────────────────────────────┤
+│ [计算] [加入下载计划]                                              │
+├ 任务区预估 ───────────────────────────────────────────────────────┤
+│ 候选瓦片（外包矩形）：1,204                                        │
+│ 区域内瓦片（多边形）：742                                          │
+│ 过滤掉：462（38.37%）                                              │
+│ 预计容量：21.74 MB                                                 │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+链路（**复用**既有下载系统，不是第二套）：
+
+```text
+航点（WGS84）
+  │  route_loader：只认 GeoJSON LineString / Feature / FeatureCollection
+  ▼
+LineString
+  │  ★ region_builder：以航线中心为原点的本地投影（AEQD，单位 = 米）
+  ▼
+米制平面上的线 —— buffer(5000) —— 这才是地面上 5 公里
+  │  投回 WGS84
+  ▼
+Mission 多边形（RegionType.POLYGON / RegionLevel.MISSION）
+  │  三个文件落盘：data/mission_regions/<id>/{route,region}.geojson + metadata.json
+  ▼
+RegionTileEstimator（逐张判相交 → 候选 / 走廊内 / 被过滤）
+  │  推荐 Zoom Z15~18 来自 ZoomStrategyService
+  ▼
+DownloadRegion（region_type=polygon，与行政区**完全同构**）
+  │
+  ▼
+DownloadPlan → PlanScheduler → DownloadManager    Slice 20 / 21 一行未改
+   排在市级之后（全国 → 省 → 市 → 任务区 → 自定义）
+```
+
+最要紧的一条：**绝不在 WGS84 的"度"上 buffer**。"0.05 度"在广州是 5.5 km、
+在漠河是 2.5 km —— 一个随纬度变化的缓冲半径不是半径，是一个 bug，而且它不会抛异常，
+几何照样生成、瓦片照样算出来，只是"我设的 5 公里"在北边变成了 2.5 公里。
+用例守的判据是**量出来的地面宽度**：同一个 5000 米半径在北纬 20° 与 60° 缓冲出来的
+走廊地面宽度必须一样。
+
+其余几条关键取舍：
+
+- **任务区是"多边形区域的又一个来源"**：`DownloadRegion` 与行政区完全同构，
+  于是 Slice 16 的估算 / 下载 / 续传 / Inspector / 打包一行都不用改。
+  几何从"随程序分发的资源"变成"用户数据"这一处差异，靠 `app.geo.region` 里一张
+  **动态解析注册表**补上（注册回调，不是 import —— 否则会成环）。
+- **几何只算一次**：创建时缓冲一次并落盘，之后的估算 / 下载 / 续传 / Inspector
+  全读同一份 `region.geojson`。续传**绝不重算**：重算会得到一个"几乎一样"的几何，
+  差几行几列不会让任何断言失败，但会让 Inspector 报出一堆假缺失。
+- **改航线或半径 = 新建一个任务区**：`geometryVersion` 会进任务记录与 MBTiles
+  metadata，用来回答"这批瓦片是按哪一版几何裁的"；`load()` 还会把元数据记的范围
+  与几何实际范围对一遍，对不上就报错。
+- **Inspector 找得到几何就算，找不到就认错**：本机没有这个任务区时覆盖度标
+  **UNKNOWN** 并说明原因，**绝不退回外包矩形** —— 按矩形算一个完整的走廊包会得出
+  "缺了几十张"的结论，用户会照着这个数字去重下。
+- **被引用时不许删**：任务 / 计划 / 执行记录里还有这个 id 就拒绝，并且弹的是
+  **说明**而不是确认框（不骗用户点一次无意义的「是」）。
+- **任务区层里没有 Zoom 数字**：推荐区间一律来自策略表，层级字面量收在
+  `MISSION_REGION_LEVEL` 一处（两条都有 AST 静态守卫）。
+- **不做地图编辑器**：航线在别的软件里画好导出 GeoJSON，这里只负责按米缓冲、
+  算清代价、进计划。KML / GPX 明确拒绝并说明该转成什么。
+
+### 验收
+
+```bash
+# 任务区全部用例（航线导入 / 米制 Buffer / 持久化 / 计划接线 / 窗口按钮）
+.venv/Scripts/python.exe -m pytest tests/test_mission_route_loader.py \
+    tests/test_mission_region_builder.py tests/test_mission_region_store.py \
+    tests/test_mission_plan_integration.py tests/test_mission_region_dialog.py -q
+
+# 实机验收：真窗口 / 真按钮 / 真包 / 截图落 docs/（93 项检查）
+.venv/Scripts/python.exe scripts/verify_slice22_mission_region.py
+```
+
+细节见 [docs/mission_region.md](docs/mission_region.md)。
 
 ## Slice 21：计划批量调度
 

@@ -233,3 +233,52 @@ def plans_file() -> Path:
         yield directory / "plans.json"
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 22：任务区（Mission）
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _reset_mission_region_resolver():
+    """每个用例结束后清掉"任务区几何解析"的全局注册。
+
+    任务区靠**注册回调**让续传与 Inspector 能按 ``region_id`` 找回几何
+    （``app.geo.region`` 的动态解析注册表）。注册表是模块级全局，跨用例留着的话，
+    上一个用例那个指向**另一个临时目录**的解析器会继续回答同名的 ``mission-001``
+    —— Inspector 于是拿到另一份几何，而结论长得很像真的（这只是"结论错了"，
+    不是"报错了"，最难查的一类）。
+
+    因此每个用例都从空表开始。这也是 ``app.mission`` 只允许一个生效解析器的
+    另一半保障（见 ``_ACTIVE_RESOLVER``）。
+    """
+    from app.geo import region as region_module
+    from app.mission.mission_region_service import reset_mission_region_resolver
+
+    yield
+    region_module.clear_region_resolvers()
+    reset_mission_region_resolver()
+
+
+@pytest.fixture
+def mission_root() -> Path:
+    """任务区根目录（``data/mission_regions`` 的替身）。"""
+    directory = Path(tempfile.mkdtemp(prefix="mission-test-"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture
+def mission_service(mission_root: Path):
+    """任务区服务（临时目录、**不做引用检查**）。
+
+    引用检查默认会去读用户主目录里的 ``tasks.json`` / ``plans.json`` ——
+    测试绝不该碰那些文件（Slice 7 的教训），因此这里给一个空引用清单。
+    需要验证"被引用就拒绝删除"的用例自己传 ``reference_files``。
+    """
+    from app.mission import MissionRegionService, MissionRegionStore
+
+    return MissionRegionService(
+        MissionRegionStore(mission_root), reference_files=()
+    )

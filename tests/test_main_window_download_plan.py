@@ -21,7 +21,11 @@ from PySide6.QtCore import Qt
 from app.planning.region_level import RegionLevel
 from app.regions.service import RegionService
 from app.tasks.task_service import TaskService, TaskStore
-from app.ui.download_panel import ACTION_PLAN_ADD, ACTION_PLAN_OPEN
+from app.ui.download_panel import (
+    ACTION_MISSION_OPEN,
+    ACTION_PLAN_ADD,
+    ACTION_PLAN_OPEN,
+)
 from app.ui.main_window import MainWindow
 from app.ui.region_selection import ZoomMode
 
@@ -63,11 +67,18 @@ def _add_current_region(window: MainWindow, region_id: str, qapp) -> None:
 # 入口（Spec §10）
 # --------------------------------------------------------------------------- #
 def test_the_panel_exposes_both_plan_entries(window: MainWindow) -> None:
+    """计划两个入口（Slice 20）+ 任务区域入口（Slice 22）。
+
+    断言"恰好这三个 id"是有意的：它同时守住"没有多出别的按钮"。
+    加第四个入口时要连这条一起改 —— 那一刻正是让人**再确认一遍**
+    "这些入口都还通着吗"的时刻。
+    """
     buttons = window.download_panel.plan_buttons()
 
-    assert set(buttons) == {ACTION_PLAN_ADD, ACTION_PLAN_OPEN}
+    assert set(buttons) == {ACTION_PLAN_ADD, ACTION_PLAN_OPEN, ACTION_MISSION_OPEN}
     assert buttons[ACTION_PLAN_ADD].text() == "加入下载计划"
     assert buttons[ACTION_PLAN_OPEN].text() == "查看下载计划"
+    assert buttons[ACTION_MISSION_OPEN].text() == "任务区域…"
     assert all(button.isEnabled() for button in buttons.values())
 
 
