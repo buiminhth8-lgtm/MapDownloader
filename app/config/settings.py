@@ -426,6 +426,75 @@ UI_TEXT_MISSION_EMPTY: str = "暂无任务区"
 UI_TEXT_MISSION_NOT_FOUND: str = "任务区不存在或几何文件已不可用：{mission_id}"
 
 # --------------------------------------------------------------------------- #
+# 下载风险分析（Slice 23）
+# --------------------------------------------------------------------------- #
+#: 危险任务的**强确认词**（Spec §12）：必须手输这个字符串才能继续下载。
+#:
+#: 为什么不是"再点一次确认"：LARGE 那档已经是一次确认了，危险档必须拉开档次
+#: —— 一个可以无脑点的按钮，和一个要看清屏幕再敲 8 个字符的输入框，
+#: 拦下来的任务完全不是一回事。放在配置里是因为界面、测试与文档引用的是
+#: **同一个**字面量（在测试里写死 "CONTINUE" 就成了第二份真值）。
+DANGEROUS_CONFIRM_WORD: str = "CONTINUE"
+
+# UI 文案（Slice 23）。与其余 UI_TEXT_* 一样：文案属于配置，不散落在控件代码里。
+UI_TEXT_RISK_GROUP_TITLE: str = "风险提示"
+UI_TEXT_BUTTON_RISK_DETAILS: str = "查看详情"
+UI_TEXT_BUTTON_APPLY_RECOMMENDED_ZOOM: str = "采用推荐 Zoom"
+UI_TEXT_RISK_NONE: str = "尚未分析（请先点「计算」）"
+
+#: 「采用推荐 Zoom」的悬停说明。它会**改用户填好的 Zoom**，所以必须说清
+#: "改的是哪两个框、改成什么"，而且只有用户主动点才会生效（Spec §11）。
+UI_TEXT_RISK_APPLY_TOOLTIP: str = (
+    "把 Min / Max Zoom 改成该等级的推荐区间，然后重新计算。"
+    "只有你点这个按钮才会改，分析过程不会自动修改你的输入"
+)
+
+#: 「采用推荐 Zoom」在**无事可做**时（自定义等级没有推荐区间，或当前已经是
+#: 推荐区间）的悬停说明。按钮置灰而不隐藏：用户需要看到"这里本来有个功能，
+#: 只是现在用不上"，而不是怀疑界面缺了什么。
+UI_TEXT_RISK_APPLY_DISABLED: str = "当前无需调整 Zoom（已是推荐区间或不套用等级建议）"
+
+# 风险详情对话框（Spec §14）
+UI_TEXT_RISK_DETAILS_TITLE: str = "风险详情"
+UI_TEXT_RISK_COLUMN_ZOOM: str = "Zoom"
+UI_TEXT_RISK_COLUMN_TILES: str = "选中瓦片"
+UI_TEXT_RISK_COLUMN_SIZE: str = "预计容量"
+UI_TEXT_RISK_COLUMN_RECOMMENDED: str = "推荐"
+UI_TEXT_RISK_CELL_RECOMMENDED: str = "推荐"
+UI_TEXT_RISK_CELL_OVER: str = "高于推荐"
+UI_TEXT_RISK_CELL_NO_RULE: str = "—"
+UI_TEXT_RISK_DETAILS_TOTAL_ROW: str = "合计"
+
+#: 计划表格里的「风险」列（Spec §15）。列头与单元格都在这里，免得两处不一致。
+UI_TEXT_RISK_COLUMN_LEVEL: str = "风险"
+UI_TEXT_RISK_CELL_UNKNOWN: str = "—"
+
+# 单任务与计划任务的确认框（Spec §12 / §16）。正文由报告自己产出
+# （``DownloadRiskReport.as_lines`` / ``PlanRiskReport.as_lines``），
+# 这里只放"结尾那一问"与标题，免得同一份数字在两处各格式化一次。
+UI_TEXT_RISK_CONFIRM_TITLE_LARGE: str = "任务规模确认"
+UI_TEXT_RISK_CONFIRM_TITLE_VERY_LARGE: str = "任务规模警告"
+UI_TEXT_RISK_CONFIRM_QUESTION: str = "确认开始下载吗？（不会修改任何配置，仅作提醒）"
+UI_TEXT_RISK_PLAN_CONFIRM_TITLE: str = "下载计划风险确认"
+UI_TEXT_RISK_PLAN_CONFIRM_QUESTION: str = "确认开始执行这份计划吗？"
+
+#: 计划风险确认框的四个去处（Spec §16）。**动作范围写进按钮文案**：
+#: 计划里有好几项，"禁用该项"到底指哪一项必须说清，否则用户只能猜。
+UI_TEXT_BUTTON_APPLY_RECOMMENDED_ALL: str = "采用推荐 Zoom"
+UI_TEXT_BUTTON_DISABLE_DANGEROUS: str = "停用危险项"
+UI_TEXT_BUTTON_BACK_TO_EDIT: str = "返回修改"
+
+#: 危险档的强确认（Spec §12）：要用户**手输**确认词
+UI_TEXT_DANGEROUS_CONFIRM_TITLE: str = "危险任务强确认"
+UI_TEXT_DANGEROUS_CONFIRM_QUESTION: str = (
+    "这个规模已经进入「危险」档：可能几天都下不完、把磁盘写满、"
+    "并大量消耗天地图调用配额。\n\n"
+    "确实要执行的话，请在下面输入 {word}（区分大小写）后点「{button}」。"
+)
+UI_TEXT_DANGEROUS_CONFIRM_PLACEHOLDER: str = "在这里输入 {word}"
+UI_TEXT_BUTTON_CONTINUE_ANYWAY: str = "仍然继续"
+
+# --------------------------------------------------------------------------- #
 # 日志
 # --------------------------------------------------------------------------- #
 LOG_LEVEL: int = 20  # logging.INFO，避免在此 import logging 造成额外耦合

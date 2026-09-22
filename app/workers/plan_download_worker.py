@@ -221,6 +221,14 @@ class PlanDownloadWorker(QThread):
                 self.failed.emit(f"计划执行异常终止：{exc}")
                 return
 
+            if execution is None:
+                # 线程还没起跑，界面就已经把这一页关掉了（Spec §25：关页不是
+                # 杀掉，但也没什么可发布的了）。**必须显式挡一下**：直接往下走
+                # 会拿 ``None`` 去 :meth:`_publish` 读 ``status``，抛出的
+                # AttributeError 会被 ``run()`` 记成"计划执行线程异常终止" ——
+                # 用户看到一条没有意义的报错，而实际上什么都没发生。
+                return
+
             self._publish(execution)
             execution = await self._replay_pending(execution)
             # 常驻：等界面的下一条指令，直到计划进入终态或界面要求收尾

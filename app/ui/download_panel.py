@@ -39,6 +39,8 @@ from app.config.settings import (
     DEFAULT_OUTPUT_DIR,
     MAX_SUPPORTED_ZOOM,
     MIN_SUPPORTED_ZOOM,
+    UI_TEXT_BUTTON_APPLY_RECOMMENDED_ZOOM,
+    UI_TEXT_BUTTON_RISK_DETAILS,
     UI_TEXT_ESTIMATED_MAP_TYPE,
     UI_TEXT_ESTIMATED_REQUESTS_MERGED,
     UI_TEXT_ESTIMATED_REQUESTS_SINGLE,
@@ -47,6 +49,10 @@ from app.config.settings import (
     UI_TEXT_LAYER_OUTPUT_SINGLE,
     UI_TEXT_LAYER_PLAN,
     UI_TEXT_MBTILES_OUTPUT_NOTICE,
+    UI_TEXT_RISK_APPLY_DISABLED,
+    UI_TEXT_RISK_APPLY_TOOLTIP,
+    UI_TEXT_RISK_GROUP_TITLE,
+    UI_TEXT_RISK_NONE,
 )
 from app.geo import (
     DownloadRegion,
@@ -107,6 +113,13 @@ ACTION_PLAN_OPEN = "plan_open"
 #: 而任务区要"导入航线 + 定缓冲半径"，有自己的对话框。它同样与任务状态无关 ——
 #: 下载中一样可以准备下一个任务区。
 ACTION_MISSION_OPEN = "mission_open"
+
+#: 风险提示区的两个按钮（Slice 23，Spec §10 / §11）。
+#:
+#: 它们不产生新任务，操作的是**已经算出来的结论**（打开详情 / 按推荐值改 Zoom），
+#: 因此和计划那两个入口一样不属于 :class:`~app.ui.task_actions.TaskAction`。
+ACTION_RISK_DETAILS = "risk_details"
+ACTION_RISK_APPLY_ZOOM = "risk_apply_zoom"
 
 #: :class:`~app.ui.task_actions.TaskAction` → 动作标识。
 #:
@@ -238,6 +251,21 @@ class DownloadPanel(QGroupBox):
     #: 由主窗口统一接线，与「加入下载计划」同一条路数。
     mission_region_requested = Signal()
 
+    #: 用户点了「查看详情」（Slice 23，Spec §11）。
+    #:
+    #: 面板只发信号、不自己开对话框：详情窗口要读的是一整份风险报告，
+    #: 而报告由主窗口持有的分析器产出（面板刻意不 import 分析器 ——
+    #: 那会把 ``app.geo.region_estimator`` 拉进来，见本模块顶部的一贯约定）。
+    risk_details_requested = Signal()
+
+    #: 用户点了「采用推荐 Zoom」（Slice 23，Spec §11）。
+    #:
+    #: **只有用户点这个按钮**才会改 Zoom 输入框。分析过程绝不自动修改用户
+    #: 填好的值 —— 那会让"我明明填了 Z18"变成"它自己变成了 Z10"。
+    #: 面板负责发信号，改哪个值、改完要不要重算由主窗口决定（它才知道
+    #: 重算的完整链路）。
+    apply_recommended_zoom_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("地图配置 / 下载区域", parent)
 
@@ -267,6 +295,7 @@ class DownloadPanel(QGroupBox):
         self._build_buttons()
         self._build_plan_row()
         self._build_result_area()
+        self._build_risk_area()
         self._build_download_result_area()
         self._build_connection_area()
 
@@ -279,6 +308,7 @@ class DownloadPanel(QGroupBox):
         layout.addLayout(self._plan_button_row)
         layout.addWidget(self._plan_summary_label)
         layout.addWidget(self._result_group)
+        layout.addWidget(self._risk_group)
         layout.addWidget(self._download_result_group)
         layout.addWidget(self._connection_group)
         layout.addStretch(1)
@@ -1176,6 +1206,60 @@ class DownloadPanel(QGroupBox):
         group_layout = QVBoxLayout(self._result_group)
         group_layout.addWidget(self._result_label)
 
+    def _build_risk_area(self) -> None:
+        """风险提示区（Slice 23，Spec §10 / §11）。
+
+        与「预估结果」分成两块，因为它们回答的是两个问题：
+
+        * 「预估结果」说的是**这次配置会下多少**（事实：张数、容量、输出文件）；
+        * 「风险提示」说的是**这个量意味着什么**（判断：等级、是否超推荐、要不要换 Zoom）。
+
+        把判断混进事实列表里，用户会把"风险：危险"当成又一个算出来的数字 ——
+        而它其实是**策略**（阈值表）对那两个数字的评价。
+
+        面板在这里只做渲染：等级、张数、容量、超推荐占比全部来自报告的
+        ``headline_lines()``，符号来自 ``level.symbol``。面板**不 import 分析器**，
+        也不碰任何阈值 —— 阈值只有 :mod:`app.planning.risk_policy` 一处。
+
+        初始隐藏（与「下载结果」「天地图连接」同一处理）：没有结论时它只是
+        一条"尚未分析"的空行，而左侧配置列本来就紧，白占一行会挤出滚动条。
+        """
+        self._risk_label = _WrappingLabel(UI_TEXT_RISK_NONE, self)
+
+        self._risk_details_button = QPushButton(UI_TEXT_BUTTON_RISK_DETAILS, self)
+        self._risk_details_button.setToolTip(
+            "逐 Zoom 查看选中张数、预计容量与该等级的推荐区间"
+        )
+        self._risk_apply_button = QPushButton(
+            UI_TEXT_BUTTON_APPLY_RECOMMENDED_ZOOM, self
+        )
+        self._risk_apply_button.setToolTip(UI_TEXT_RISK_APPLY_TOOLTIP)
+
+        #: 按钮顺序即从左到右（与 ``_action_buttons`` / ``_plan_buttons`` 同一约定）
+        self._risk_buttons: dict[str, QPushButton] = {
+            ACTION_RISK_DETAILS: self._risk_details_button,
+            ACTION_RISK_APPLY_ZOOM: self._risk_apply_button,
+        }
+        self._risk_details_button.clicked.connect(
+            self.risk_details_requested.emit
+        )
+        self._risk_apply_button.clicked.connect(
+            self.apply_recommended_zoom_requested.emit
+        )
+
+        buttons_row = QHBoxLayout()
+        for raise_button in self._risk_buttons.values():
+            buttons_row.addWidget(raise_button)
+        buttons_row.addStretch(1)
+
+        self._risk_group = QGroupBox(UI_TEXT_RISK_GROUP_TITLE, self)
+        group_layout = QVBoxLayout(self._risk_group)
+        group_layout.addWidget(self._risk_label)
+        group_layout.addLayout(buttons_row)
+        # 还没有结论，"采用推荐 Zoom" 更是无从谈起
+        self._risk_apply_button.setEnabled(False)
+        self._risk_group.setVisible(False)
+
     def _build_download_result_area(self) -> None:
         """下载结果区（Slice 4）。
 
@@ -1650,8 +1734,76 @@ class DownloadPanel(QGroupBox):
         self._result_label.set_text(f"计算失败：{message}")
 
     def clear_calculation_result(self) -> None:
-        """恢复成未计算状态。"""
+        """恢复成未计算状态（含风险区）。"""
         self._result_label.set_text(_RESULT_PLACEHOLDER)
+        # 风险结论与预估值同生共死：它们是**同一份估算**的两种表达。
+        # 只清"预估结果"而把"风险：危险"留在界面上，用户看到的将是一条
+        # 不再对应任何配置的警告（Slice 16 的作废规则同样管这里）。
+        self.clear_risk_report()
+
+    # ------------------------------------------------------------------ #
+    # 风险提示（Slice 23）
+    # ------------------------------------------------------------------ #
+    def set_risk_report(self, report) -> None:
+        """展示风险结论（Slice 23，Spec §10 / §11）。
+
+        Args:
+            report: :class:`~app.planning.DownloadRiskReport`（任何提供
+                ``headline_lines()`` / ``level`` / ``has_recommendation``
+                的对象都行 —— 面板不认识分析器，只认识这份报告的形状）。
+
+        Raises:
+            ValueError: ``report`` 缺少渲染需要的成员。
+        """
+        missing = [
+            name
+            for name in ("headline_lines", "level", "has_recommendation")
+            if not hasattr(report, name)
+        ]
+        if missing:
+            raise ValueError(
+                f"report 必须提供 headline_lines / level / has_recommendation，"
+                f"实际缺少：{'、'.join(missing)}"
+            )
+
+        lines = list(report.headline_lines())
+        # 记号与等级同一行（``风险：危险（DANGEROUS）✕``）：Spec §11 要求不许
+        # 只靠颜色表达风险 —— 打印成黑白、或用户色觉不同时，符号仍然分得开。
+        lines[0] = f"{lines[0]} {report.level.symbol}"
+        self._risk_label.set_text("\n".join(lines))
+
+        recommended = getattr(report, "recommended_range_text", None)
+        unchanged = bool(
+            report.has_recommendation
+            and recommended == getattr(report, "actual_range_text", None)
+        )
+        # 悬停说明**跟着按钮状态走**："点得动"才说"点了会怎样"，"点不动"就得说清
+        # 为什么 —— 一个置灰却写着"点这里"的按钮比没有提示更让人迷惑。
+        usable = bool(report.has_recommendation) and not unchanged
+        self._risk_apply_button.setEnabled(usable)
+        self._risk_apply_button.setToolTip(
+            UI_TEXT_RISK_APPLY_TOOLTIP if usable else UI_TEXT_RISK_APPLY_DISABLED
+        )
+        self._risk_group.setVisible(True)
+
+    def clear_risk_report(self) -> None:
+        """把风险区退回"尚未分析"并隐藏。"""
+        self._risk_label.set_text(UI_TEXT_RISK_NONE)
+        self._risk_apply_button.setEnabled(False)
+        self._risk_apply_button.setToolTip(UI_TEXT_RISK_APPLY_DISABLED)
+        self._risk_group.setVisible(False)
+
+    def risk_group(self) -> QGroupBox:
+        """风险提示分组框（测试与验收脚本用）。"""
+        return self._risk_group
+
+    def risk_label(self) -> QLabel:
+        """风险结论标签。"""
+        return self._risk_label
+
+    def risk_buttons(self) -> dict[str, QPushButton]:
+        """风险区的两个按钮（``risk_details`` / ``risk_apply_zoom``）。"""
+        return self._risk_buttons
 
     @property
     def result_label(self) -> QLabel:

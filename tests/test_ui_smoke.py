@@ -47,6 +47,10 @@ from app.models import (
     describe_map_type,
 )
 from app.planning import RegionLevel
+from app.planning.risk_policy import (
+    LARGE_SIZE_THRESHOLD as RISK_LARGE_SIZE_THRESHOLD,
+    LARGE_TILE_THRESHOLD as RISK_LARGE_TILE_THRESHOLD,
+)
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import AndroidTransferService, build_output_path
 from app.tasks import TaskService, TaskStore
@@ -1379,7 +1383,14 @@ def test_map_name_is_sanitized_into_filename(
 
 
 def _fill_large_region(window: MainWindow, work_dir: Path) -> int:
-    """把表单填成"预计超过 10,000 张"的大任务，返回预计瓦片数。"""
+    """把表单填成"预计超过 10,000 张、但还不到风险阈值"的任务，返回预计瓦片数。
+
+    这个 1°×1° 的框刻意停在 **Z16**（约 5.9 万张 / 1.7 GiB）：Slice 23 起
+    启动前有两道闸门，1 万张以上先看**风险等级**（10 万张 / 2 GiB 起），
+    过了它才轮到本组用例守的这条旧阈值。夹具落在两条线之间，本组用例因此
+    不会被风险确认框接管 —— 那是 ``tests/test_risk_protection_ui.py`` 的事。
+    越界时下面两条断言会立刻失败，而不是让用例悄悄测到另一条路径上去。
+    """
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
     panel._west_spin.setValue(116.0)
@@ -1387,10 +1398,14 @@ def _fill_large_region(window: MainWindow, work_dir: Path) -> int:
     panel._east_spin.setValue(117.0)
     panel._north_spin.setValue(40.0)
     panel._min_zoom_spin.setValue(8)
-    panel._max_zoom_spin.setValue(17)
+    panel._max_zoom_spin.setValue(16)
     panel._output_edit.setText(str(work_dir))
     panel.map_name_edit.setText("big")
-    return _expected_tile_count(window)
+    total = _expected_tile_count(window)
+    assert total > settings.GUI_LARGE_TASK_CONFIRM_TILES, total
+    assert total < RISK_LARGE_TILE_THRESHOLD, total
+    assert estimate_size_bytes(total) < RISK_LARGE_SIZE_THRESHOLD, total
+    return total
 
 
 def test_large_task_asks_for_confirmation_without_starting(

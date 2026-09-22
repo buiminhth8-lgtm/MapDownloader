@@ -75,9 +75,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config.settings import UI_TEXT_BUTTON_CLOSE
+from app.config.settings import (
+    UI_TEXT_BUTTON_CLOSE,
+    UI_TEXT_RISK_CELL_UNKNOWN,
+    UI_TEXT_RISK_COLUMN_LEVEL,
+)
 from app.geo.tile_math import format_size
 from app.planning.download_plan import DownloadPlan, DownloadPlanItem
+from app.planning.download_risk_analyzer import DownloadRiskAnalyzer
 from app.planning.plan_estimator import PlanEstimateProgress
 from app.planning.plan_execution import (
     PlanExecution,
@@ -88,7 +93,9 @@ from app.planning.plan_execution import (
 from app.planning.plan_scheduler import PlanScheduler
 from app.planning.plan_service import PlanService, PlanTaskCreationError
 from app.planning.plan_validator import PlanValidationResult
+from app.planning.risk_models import PlanRiskReport
 from app.ui.plan_estimate_worker import PlanEstimateWorker
+from app.ui.risk_details_dialog import PlanRiskConfirmDialog
 from app.ui.widgets import WrappingLabel, apply_secondary_text
 from app.workers.plan_download_worker import PlanDownloadWorker
 
@@ -127,7 +134,26 @@ PLAN_ACTION_SKIP = "skip_current"
 
 #: 表格列（顺序即界面顺序）。勾选框与区域名同占第一列：一行只有一个
 #: "这块地"，把它拆成两列会让宽度本来就紧张的表格更难读。
-_COLUMNS: tuple[str, ...] = ("区域", "等级", "缩放", "预计瓦片", "预计容量", "状态")
+_COLUMNS: tuple[str, ...] = (
+    "区域",
+    "等级",
+    "缩放",
+    "预计瓦片",
+    "预计容量",
+    "状态",
+    # 风险列放在最后：它是前五列的"结论"（这块地按这个 Zoom 下，风险是几档），
+    # 紧跟在状态后面读起来才是"这一项能不能下 → 下起来有多险"。
+    # 追加在末尾而不是插在中间，也让"区域 / 等级 / 缩放 / 张数 / 容量 / 状态"
+    # 这六列的既有下标保持不变（切片前几轮做的界面断言不受影响）。
+    UI_TEXT_RISK_COLUMN_LEVEL,
+)
+
+#: 表格各列的下标。**不要用 ``len(_COLUMNS) - 1`` 指代最后一列**：
+#: Slice 23 在末尾追加了「风险」列之后，"最后一列"就不再是状态列了 ——
+#: 结果执行符号被写进了风险列（``✕ 危险`` 变成 ``✓ 已完成``），而状态列退回
+#: "可参与下载"。Slice 21 的执行用例当场抓到了这个（它断言那一格以 ``✓`` 开头）。
+_COLUMN_STATUS = _COLUMNS.index("状态")
+_COLUMN_RISK = _COLUMNS.index(UI_TEXT_RISK_COLUMN_LEVEL)
 
 #: 表格里"这一项能不能用"的两种人话（不显示 ``PlanItemStatus`` 的枚举名）
 _STATUS_OK = "可参与下载"
@@ -184,6 +210,18 @@ class DownloadPlanDialog(QDialog):
         self._auto_estimate_done = False
         self._worker: PlanEstimateWorker | None = None
         self._last_validation: PlanValidationResult | None = None
+        #: 风险分析器（Slice 23，Spec §15）。复用计划服务那一个 Zoom 策略实例：
+        #: "建议按 Z9~13 下载省域"这句话在本页与主窗口必须是同一张策略表说的。
+        #: 它**只读**条目已经存下的估算（``analyze_plan``），不重算瓦片。
+        self._risk_analyzer = DownloadRiskAnalyzer(
+            strategy=self._plan_service.strategy
+        )
+        #: 最近一次刷出来的计划风险（合计行与「开始计划」的闸门都读它）
+        self._plan_risk: PlanRiskReport | None = None
+        #: 计划风险确认窗口（非模态，主引用放在这里防 GC）。LARGE / VERY_LARGE 与
+        #: 危险档**共用一个窗口** —— 危险档多出来的只是一个确认词输入框
+        #: （见 :class:`~app.ui.risk_details_dialog.PlanRiskConfirmDialog`）。
+        self._risk_confirm_dialog: PlanRiskConfirmDialog | None = None
         #: 正在重建表格 —— 用来挡住"程序自己改单元格"回调进来的信号（同
         #: ``DownloadPanel._syncing`` 的理由：否则刷新会递归并改坏选中态）。
         self._refreshing = False
@@ -402,6 +440,25 @@ class DownloadPlanDialog(QDialog):
         """当前计划。"""
         return self._plan_service.plan
 
+    def plan_risk(self) -> PlanRiskReport | None:
+        """最近一次刷出来的计划风险（合计行与启动闸门读的是同一份）。"""
+        return self._plan_risk
+
+    def risk_analyzer(self) -> DownloadRiskAnalyzer:
+        """风险分析器（用例要构造"这次就是危险"的场景时换它的策略）。"""
+        return self._risk_analyzer
+
+    def risk_confirm_dialog(self) -> PlanRiskConfirmDialog | None:
+        """计划风险确认窗口（没弹过时为 ``None``）。
+
+        结果由窗口的 ``finished(int)`` 带回（四个退出码见
+        :class:`~app.ui.risk_details_dialog.PlanRiskConfirmDialog`），
+        因此用例与验收脚本要点的是它自己那几个按钮访问器
+        （``continue_button()`` / ``apply_zoom_button()`` …），而不是去某个
+        ``QMessageBox`` 上找标准按钮。
+        """
+        return self._risk_confirm_dialog
+
     def buttons(self) -> dict[str, QPushButton]:
         """按钮字典（``PLAN_ACTION_*`` → 按钮）。"""
         return dict(self._buttons)
@@ -502,6 +559,9 @@ class DownloadPlanDialog(QDialog):
         """
         plan = self.plan
         self._last_validation = self._plan_service.validate()
+        # 风险结论文本与表格都读它：先算一次，画表与合计用的是**同一份**
+        # （各算一次迟早会出现"表格写危险、合计写正常"这种没法解释的差异）
+        self._plan_risk = self._plan_risk_report()
         self._refreshing = True
         try:
             self._fill_table()
@@ -572,7 +632,7 @@ class DownloadPlanDialog(QDialog):
         entry = self._run_entry(item.id)
         if entry is None:
             return
-        cell = self._table.item(row, len(_COLUMNS) - 1)
+        cell = self._table.item(row, _COLUMN_STATUS)
         if cell is None:  # pragma: no cover - 防御性分支
             return
         cell.setText(f"{entry.status.symbol} {entry.status.display_name}")
@@ -586,16 +646,48 @@ class DownloadPlanDialog(QDialog):
             return None
         return execution.find(plan_item_id)
 
-    @staticmethod
-    def _row_texts(item: DownloadPlanItem) -> tuple[str, ...]:
-        """一行里除区域名之外的各列文本。"""
+    def _row_texts(self, item: DownloadPlanItem) -> tuple[str, ...]:
+        """一行里除区域名之外的各列文本（含 Slice 23 的「风险」列）。"""
         return (
             item.level_text,
             item.zoom_text,
             item.tiles_text,
             item.size_text,
             _status_text(item),
+            self._risk_text(item),
         )
+
+    def _risk_text(self, item: DownloadPlanItem) -> str:
+        """「风险」列的文本（Spec §15 / §11）。
+
+        三种取值，各自都要能解释：
+
+        * **可用**：等级中文名 + 记号（``危险 ✕`` / ``正常 ✓``）——
+          记号是为了"不许只靠颜色"（打印成黑白、色觉不同也分得开）；
+        * **不可用**：``—``。这一项连估算都没有（不可用时估算被清空），
+          给一个"正常"会是在替一块算不出来的地打包票；
+        * 尚未估算但可用：同样落到 ``正常``（0 张就是最小风险），
+          表格里那一行的「状态」列已经写着"尚未估算"。
+
+        等级与张数都取自**条目已存下的估算**（``analyze_item``），不重算。
+        """
+        if not item.is_valid:
+            return UI_TEXT_RISK_CELL_UNKNOWN
+        report = self._risk_analyzer.analyze_item(item)
+        return f"{report.level.display_name} {report.level.symbol}"
+
+    def _plan_risk_report(self) -> PlanRiskReport | None:
+        """当前计划的风险结论（只读已存下的估算，Spec §15 / §21）。
+
+        分析失败（例如某个条目的 Zoom 区间不成立 —— 计划文件是外部输入）
+        只记一行并返回 ``None``：整页照常画得出来，只是风险列与合计退回
+        "未分析"。**不抛异常**：一个坏条目不该让用户打不开自己的计划。
+        """
+        try:
+            return self._risk_analyzer.analyze_plan(self.plan)
+        except ValueError as exc:
+            self._log(f"风险分析未完成：{exc}")
+            return None
 
     def _coverage_text(self) -> str:
         """层级覆盖提示（Spec §19：是**提示**，不是硬依赖）。"""
@@ -608,7 +700,12 @@ class DownloadPlanDialog(QDialog):
         return f"当前覆盖：{names}（可以再补上一级）"
 
     def _totals_text(self) -> str:
-        """合计行：张数与容量是"启用且可用"的条目之和（Spec §12）。"""
+        """合计行：张数与容量是"启用且可用"的条目之和（Spec §12）。
+
+        Slice 23 起再带一句**总风险**（Spec §15）：合计多少是事实，风险多大是
+        结论 —— 用户要拿后者决定"要不要现在就点开始"。等级行取自报告自己的
+        ``level_line``（带机器可读名），因此与面板、日志里的是同一个字符串。
+        """
         plan = self.plan
         if plan.is_empty:
             return "合计：计划里还没有区域"
@@ -619,6 +716,12 @@ class DownloadPlanDialog(QDialog):
         )
         if disabled:
             text += f"（另有 {disabled} 项未启用，不计入合计）"
+        risk = self._plan_risk
+        if risk is not None:
+            text += f"　{risk.level_line} {risk.level.symbol}"
+            names = risk.dangerous_names()
+            if names:
+                text += f"（危险任务：{'、'.join(names)}）"
         return text
 
     def _issues_text(self, result: PlanValidationResult | None) -> str:
@@ -771,15 +874,34 @@ class DownloadPlanDialog(QDialog):
     # ------------------------------------------------------------------ #
     @Slot()
     def start_plan(self) -> None:
-        """开始（或接管）执行这份计划（Spec §7 / §15）。"""
+        """开始（或接管）执行这份计划（Spec §7 / §15；Slice 23 加风险保护）。
+
+        风险闸门放在最前面（Spec §16）：``LARGE`` 起弹一次"继续 / 采用推荐
+        Zoom / 停用危险项 / 返回修改"的四选一；``DANGEROUS`` 用的是**同一个
+        窗口**，只是多出一个必须敲对的确认词输入框。闸门在**起线程之前** ——
+        一旦跑起来就不再弹任何框（执行中的计划不该被自己的提示打断）。
+        """
         if self.is_running_plan() or self.is_estimating():
-            return
-        scheduler = self._ensure_scheduler()
-        if scheduler is None:  # pragma: no cover - 按钮此时是禁用的
-            self._status_label.setText("当前无法执行计划（没拿到调度入口）")
             return
         if self.plan.is_empty:
             self._status_label.setText("计划里还没有区域，先「加入下载计划」")
+            return
+
+        risk = self._plan_risk_report()
+        self._plan_risk = risk
+        if risk is not None and risk.requires_confirmation:
+            # 危险档也走这一个入口：窗口自己按 ``requires_strong_confirmation``
+            # 决定要不要多问一句确认词。"到哪一档要强确认"只有策略层有资格回答
+            # —— 界面在这里再判一次等级，就等于把那张阈值表抄了第二份。
+            self._confirm_plan_risk(risk)
+            return
+        self._do_start_plan()
+
+    def _do_start_plan(self) -> None:
+        """真正起线程（风险确认之后才走到这里）。"""
+        scheduler = self._ensure_scheduler()
+        if scheduler is None:  # pragma: no cover - 按钮此时是禁用的
+            self._status_label.setText("当前无法执行计划（没拿到调度入口）")
             return
 
         self._run_logs.clear()
@@ -797,6 +919,130 @@ class DownloadPlanDialog(QDialog):
         self._status_label.setText("正在开始计划…")
         self._sync_editable()
         worker.start()
+
+    # ------------------------------------------------------------------ #
+    # 计划级风险保护（Slice 23，Spec §16）
+    # ------------------------------------------------------------------ #
+    def _confirm_plan_risk(self, risk: PlanRiskReport) -> None:
+        """整份计划的风险确认（**非模态**，Spec §16）：四个去处，一个窗口。
+
+        计划里通常有好几项，所以"采用推荐 Zoom"与"停用危险项"都是**对整份计划**
+        生效的（按钮上写明了范围），而不是让用户先猜指的是哪一项：
+
+        * **仍然继续**：照着现在的规模跑；
+        * **采用推荐 Zoom**：把所有超出本等级推荐区间的项改回推荐值，
+          改完**立刻重新估算**（改 Zoom 会作废那些项的估算，拿旧数字开跑
+          等于按一个看不见的规模下载），本轮不启动；
+        * **停用危险项**：把危险项停用（合计与风险立刻重算），本轮不启动；
+        * **返回修改**：什么都不动。
+
+        危险档走的是**同一个窗口**：它只是多出一个确认词输入框，且"仍然继续"
+        在敲对之前点不动。于是"到哪一档才要强确认"由报告自己说了算
+        （``requires_strong_confirmation`` 出自策略层），界面不再判一次等级。
+
+        三个带副作用的选项都不启动下载：用户拿到的是一个"已经变小 / 变清楚"的
+        计划，要不要跑由他再点一次决定。
+        """
+        self._close_risk_dialog()  # 重复点「开始计划」不该叠出第二屏
+        dialog = PlanRiskConfirmDialog(risk, self)
+        dialog.finished.connect(self._on_plan_risk_answered)
+        self._risk_confirm_dialog = dialog
+        need_word = "，需要输入确认词才能继续"
+        self._log(
+            f"计划风险 {risk.level.label(with_value=True)}："
+            f"{risk.tiles_text} 张 / {risk.size_text}"
+            f"{need_word if risk.requires_strong_confirmation else '，已弹出确认框'}"
+        )
+        for line in risk.recommendations:
+            self._log(f"计划风险建议 · {line}")
+        self._status_label.setText("等待确认计划风险…")
+        dialog.show()
+
+    @Slot(int)
+    def _on_plan_risk_answered(self, result: int) -> None:
+        """四个去处的回调（退出码与按钮文案一一对应）。
+
+        退出码是 :class:`PlanRiskConfirmDialog` 自己定义的常量，**不是**
+        ``QMessageBox.StandardButton`` 那一套：那个框上根本没出现过标准按钮，
+        照它的码来读会把"返回修改"（``Rejected == 0``）误当成别的东西。
+        """
+        risk = self._plan_risk
+        self._risk_confirm_dialog = None
+        if result == PlanRiskConfirmDialog.RESULT_CONTINUE:
+            self._log("用户确认按当前规模执行计划")
+            self._do_start_plan()
+            return
+        if result == PlanRiskConfirmDialog.RESULT_APPLY_ZOOM:
+            self._apply_recommended_zoom_to_plan()
+            return
+        if result == PlanRiskConfirmDialog.RESULT_DISABLE_DANGEROUS:
+            self._disable_dangerous_items(risk)
+            return
+        self._log("用户选择返回修改计划（本轮不启动）")
+        self._status_label.setText("已返回修改，计划没有改动")
+
+    def _close_risk_dialog(self) -> None:
+        """关掉还挂着的风险确认窗口（换一份新结论时用）。
+
+        关它之前先 :meth:`QObject.blockSignals`：``close()`` 会发出
+        ``finished(Rejected)``，而这一声在语义上是"用户选了返回修改"——
+        程序自己收摊不该写进"用户做了什么"的日志里。
+        """
+        dialog = self._risk_confirm_dialog
+        if dialog is None:
+            return
+        self._risk_confirm_dialog = None
+        dialog.blockSignals(True)
+        dialog.close()
+        dialog.deleteLater()
+
+    def _apply_recommended_zoom_to_plan(self) -> None:
+        """把所有"超出推荐区间"的项改回推荐值，然后重新估算（Spec §12）。"""
+        risk = self._plan_risk
+        if risk is None:  # pragma: no cover - 走到这里时一定有一份结论
+            return
+        changed: list[str] = []
+        for entry in risk.items:
+            report = entry.report
+            if not report.has_recommendation:
+                continue  # 自定义等级没有推荐值可套
+            if not report.is_above_recommendation(report.actual_max_zoom):
+                continue
+            if self._plan_service.set_zoom(
+                entry.region_id,
+                int(report.recommended_min_zoom),
+                int(report.recommended_max_zoom),
+            ):
+                changed.append(f"{entry.region_name} → Z{report.recommended_min_zoom}~{report.recommended_max_zoom}")
+        if not changed:
+            self._log("没有需要调整 Zoom 的条目（都已经在推荐区间内）")
+            self._status_label.setText("没有需要调整的条目")
+            return
+        self._log(f"已按推荐值调整 {len(changed)} 项：{'；'.join(changed)}")
+        self._status_label.setText(
+            f"已按推荐值调整 {len(changed)} 项，正在重新估算（完成后请再点「开始计划」）"
+        )
+        # 改 Zoom 作废了那些项的估算 → 立刻重算，别让用户看着旧数字
+        self._after_change()
+        self.estimate()
+
+    def _disable_dangerous_items(self, risk: PlanRiskReport | None) -> None:
+        """停用所有危险项（Spec §16）。"""
+        if risk is None:  # pragma: no cover - 防御性分支
+            return
+        names: list[str] = []
+        for entry in risk.dangerous_items:
+            if self._plan_service.set_enabled(entry.region_id, False):
+                names.append(entry.region_name)
+        if not names:
+            self._log("没有可停用的危险项")
+            self._status_label.setText("没有可停用的危险项")
+            return
+        self._log(f"已停用 {len(names)} 项危险任务：{'、'.join(names)}")
+        self._status_label.setText(
+            f"已停用 {len(names)} 项危险任务，合计已重算（确认后可以再点「开始计划」）"
+        )
+        self._after_change()
 
     @Slot()
     def pause_plan(self) -> None:
@@ -1178,6 +1424,7 @@ class DownloadPlanDialog(QDialog):
                 self._log("关闭下载计划页时，执行线程没有在 30 秒内收干净")
         self._close_message_box()
         self._message_box = None
+        self._close_risk_dialog()
         super().closeEvent(event)
 
 

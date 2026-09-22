@@ -276,6 +276,43 @@ class DownloadPlanBuilder:
             self._plan.recalculate_totals()
         return changed
 
+    def set_zoom(self, region_id: str, min_zoom: int, max_zoom: int) -> bool:
+        """改写某一项的 Zoom 区间（Slice 23，Spec §12）。
+
+        **会作废该项的估算**（改 Zoom 就是换了一批瓦片），所以调用方之后必须
+        重新估算 —— 合计、风险结论与生成的任务都以估算为准。
+
+        值已经等于目标区间时返回 ``False`` **且什么都不做**：那种情况下清掉估算
+        纯属破坏（用户点一次「采用推荐 Zoom」，把本来算好的结果白白作废）。
+
+        Returns:
+            ``True`` 表示真的改了；``False`` 表示计划里没有这个区域，或本来就是
+            这对值。
+
+        Raises:
+            ValueError: Zoom 非法。**先校验再改**：否则一个非法值会先清掉估算，
+                再在写回时抛异常，留下一个"配置没变、估算没了"的条目。
+        """
+        item = self._plan.item(region_id)
+        if item is None:
+            return False
+        low = validate_zoom(min_zoom)
+        high = validate_zoom(max_zoom)
+        if low > high:
+            raise ValueError(f"min_zoom 不能大于 max_zoom，实际为 {low} > {high}")
+        if (item.min_zoom, item.max_zoom) == (low, high):
+            return False
+        item.set_zoom(low, high)
+        self._plan.recalculate_totals()
+        _logger.info(
+            "计划 %s 改 Zoom：%s → Z%d~%d（估算已作废）",
+            self._plan.id,
+            region_id,
+            low,
+            high,
+        )
+        return True
+
     # ------------------------------------------------------------------ #
     # 交付
     # ------------------------------------------------------------------ #

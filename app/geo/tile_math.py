@@ -61,6 +61,8 @@ __all__ = [
     "tms_y_to_xyz_y",
     "estimate_size_bytes",
     "format_size",
+    "format_tile_count",
+    "TILE_COUNT_COMPACT_THRESHOLD",
 ]
 
 
@@ -525,4 +527,55 @@ def format_size(size_bytes: int) -> str:
         if value < 1024.0 or unit == _SIZE_UNITS[-1]:
             return f"{value:.2f} {unit}"
         value /= 1024.0
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+#: 张数超过它才开始用 ``K`` / ``M`` / ``B`` 这类紧凑写法。
+#:
+#: 阈值取 10 万而不是 1 万：五位数以内带千分位的原值（``28,452``）比
+#: ``28.45 K`` 更可读，也让"上次说 28,452、这次说 28.4 K"这种看起来像变了的
+#: 展示消失。跨过阈值之后原值已经读不出量级（``2,735,435,470``），紧凑写法才
+#: 真正有用。
+TILE_COUNT_COMPACT_THRESHOLD: int = 100_000
+
+#: 紧凑张数的单位表（1000 进制：它是"多少个"而不是字节，别混用 1024）
+_TILE_UNITS: tuple[str, ...] = ("", "K", "M", "B", "T")
+
+
+def format_tile_count(tile_count: int) -> str:
+    """把瓦片张数格式化为可读字符串（Spec §20）。
+
+    三条规则，与 :func:`format_size` 刻意不同：
+
+    1. **10 万以下保留原值 + 千分位**（``28,452``）—— 这个量级下用户要的是
+       精确数字（"还差 3 张"这种事只在几万张的规模上有意义）；
+    2. **10 万以上换 1000 进制紧凑写法**（``1.25 M`` / ``2.73 B``）——
+       十位数原值在界面上一眼看不出量级，而它恰恰是风险判断要的信息；
+    3. **单位不带空格**（``2.73 B`` 里的 B 是 billion，不是字节）。
+       与 ``format_size`` 的 ``76.43 TB`` 放在一起时不会混淆（一个是容量、
+       一个是张数，各自带在自己的行里）。
+
+    >>> format_tile_count(28452)
+    '28,452'
+    >>> format_tile_count(1_250_000)
+    '1.25 M'
+    >>> format_tile_count(2_735_435_470)
+    '2.74 B'
+    """
+    count = operator.index(tile_count)
+    if count < 0:
+        raise ValueError(f"tile_count 不能为负，实际为 {count}")
+    if count < TILE_COUNT_COMPACT_THRESHOLD:
+        return f"{count:,}"
+
+    value = float(count)
+    for index, unit in enumerate(_TILE_UNITS):
+        scaled = value / (1000.0 ** index)
+        # 按**四舍五入之后**的值决定要不要升单位：999,999 张如果不这样处理
+        # 会变成 "1000 K"，而它显然是 1 M。
+        if round(scaled, 2) >= 1000.0 and index < len(_TILE_UNITS) - 1:
+            continue
+        # 去掉无意义的尾零：``100.00 K`` 读起来像伪精度，``100 K`` 才诚实。
+        text = f"{scaled:.2f}".rstrip("0").rstrip(".")
+        return f"{text} {unit}" if unit else text
     raise AssertionError("unreachable")  # pragma: no cover

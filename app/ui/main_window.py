@@ -34,6 +34,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QGroupBox,
     QLabel,
@@ -107,6 +108,9 @@ from app.config.settings import (
     UI_TEXT_PACKAGE_BUTTON_VALIDATE,
     UI_TEXT_PACKAGE_BUTTON_VALIDATE_HINT,
     UI_TEXT_RESUME_TOKEN_REQUIRED,
+    UI_TEXT_RISK_CONFIRM_QUESTION,
+    UI_TEXT_RISK_CONFIRM_TITLE_LARGE,
+    UI_TEXT_RISK_CONFIRM_TITLE_VERY_LARGE,
     UI_TEXT_SCANNING_EXISTING,
     UI_TEXT_TASK_DELETE_HINT,
     UI_TEXT_TASK_RECOVERED,
@@ -156,6 +160,7 @@ from app.mission import (
     MissionRegionStore,
     mission_reference_files,
 )
+from app.planning.download_risk_analyzer import DownloadRiskAnalyzer
 from app.planning.plan_execution_store import (
     PlanExecutionStore,
     PlanExecutionStoreError,
@@ -163,6 +168,9 @@ from app.planning.plan_execution_store import (
 from app.planning.plan_scheduler import MapDownloadTaskRunner, PlanScheduler
 from app.planning.plan_service import PlanService
 from app.planning.plan_store import PlanStore, PlanStoreError
+from app.planning.region_level import RegionLevel
+from app.planning.risk_level import RiskLevel
+from app.planning.risk_models import DownloadRiskReport
 from app.planning.zoom_strategy import ZoomStrategyService
 from app.providers import TiandituProvider, TileTestResult, mask_url
 from app.regions.models import RegionCatalogError
@@ -201,6 +209,7 @@ from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import RegionSelection, UiPreferences
 from app.ui.region_selection import ZoomMode
+from app.ui.risk_details_dialog import DangerousTaskConfirmDialog, RiskDetailsDialog
 from app.ui.task_actions import UiTaskState
 from app.ui.task_panel import TaskPanel
 from app.ui.task_progress_panel import TaskProgressPanel
@@ -443,6 +452,12 @@ class MainWindow(QMainWindow):
         #: 与行政区必须查同一张策略表 —— 两处各建一个实例，就等于"推荐 Z15~18"
         #: 这句话有两个来源，而它们迟早会因为有人只改了一处而不同。
         self.strategy = ZoomStrategyService()
+        #: 下载风险分析器（Slice 23，Spec §5）。必须用**窗口这一个** Zoom 策略实例：
+        #: 否则"界面上的推荐区间"与"风险报告里的推荐区间"会来自两个实例
+        #: （默认值下一样，但注入自定义策略时立刻分叉）。
+        #: 它只吃估算结果，不枚举瓦片（``tests/test_download_risk_analyzer.py`` 用
+        #: AST 守着这条），所以放在 UI 线程里同步跑没有性能问题。
+        self.risk_analyzer = DownloadRiskAnalyzer(strategy=self.strategy)
         #: 任务区（Slice 22，Spec §13）。落在 ``data/mission_regions/`` 下
         #: （跟着 ``task_service`` 走，理由同 ``plans.json``）。
         #: 引用检查要看的正是同一个目录里的三份文件 —— 界面必须把它自己那一份
@@ -503,6 +518,9 @@ class MainWindow(QMainWindow):
         self._current_task: DownloadTask | None = None
         #: 等待用户确认的下载计划（大任务确认 / 已有文件选择 / 取消，都是非模态）
         self._pending_plan: _DownloadPlan | None = None
+        #: 与该计划一起等待确认的风险报告（Slice 23）。确认回调要写进日志，
+        #: 而日志里的等级必须来自**拦住用户的那一份**报告。
+        self._pending_risk: DownloadRiskReport | None = None
         #: 用户已经在"取消吗"的弹窗里变成确认后，等待扫描结果的那份计划
         self._scan_followup = None
         #: 已请求暂停、但引擎还没确认（Spec §13 的 PAUSING 阶段）
@@ -560,6 +578,15 @@ class MainWindow(QMainWindow):
         #: 候选 / 过滤 / Zoom 明细那几行——只留张数的话，改个文件名就会把
         #: "这是一个被裁剪过的任务"这条信息抹掉。
         self._last_calculation: tuple[int, str, RegionTileEstimate] | None = None
+        #: 最近一次"计算"附带的风险结论（Slice 23）。与 ``_last_calculation``
+        #: 同生共死：它描述的正是那份估算。分开存是因为风险报告要拿去开详情窗口、
+        #: 也要在启动前复用一次（详情与启动保护必须是**同一份**结论）。
+        self._last_risk: DownloadRiskReport | None = None
+        #: 风险详情窗口（Slice 23）。与检查器 / 打包窗口同一约定：主窗口持有引用，
+        #: **不带** ``WA_DeleteOnClose``（关掉再打开复用同一个实例）。
+        self._risk_dialog: RiskDetailsDialog | None = None
+        #: 危险档强确认窗口（Slice 23）。同样由主窗口持有。
+        self._dangerous_dialog: DangerousTaskConfirmDialog | None = None
 
         self._build_menu_bar()
         self._build_central_widget()
@@ -734,6 +761,16 @@ class MainWindow(QMainWindow):
             self._on_mission_region_requested
         )
 
+        # Slice 23：风险提示区的两个按钮（Spec §11）。
+        # 「采用推荐 Zoom」**只在这里**接线 —— 界面自己不会去改用户的输入，
+        # 分析过程也不会（用户点一下才改，且改完立刻重算重绘）。
+        self.download_panel.risk_details_requested.connect(
+            self._on_risk_details_requested
+        )
+        self.download_panel.apply_recommended_zoom_requested.connect(
+            self._on_apply_recommended_zoom
+        )
+
     # ------------------------------------------------------------------ #
     # 槽：下载动作
     # ------------------------------------------------------------------ #
@@ -799,6 +836,7 @@ class MainWindow(QMainWindow):
         """
         had_result = self._last_calculation is not None
         self._last_calculation = None
+        self._last_risk = None
         self.download_panel.clear_calculation_result()
         if not had_result:
             return
@@ -839,6 +877,9 @@ class MainWindow(QMainWindow):
         )
         self._last_calculation = (total, size_text, estimate)
         self._status_values["tile_total"].setText(f"{total:,}")
+        # Slice 23：同一份估算立刻过一次风险分析（Spec §5 / §10）。
+        # 它只读估算结果（不重算瓦片）、等级与建议都来自策略层（界面不判）。
+        self._analyze_risk(estimate, int(data["min_zoom"]), int(data["max_zoom"]))
         self.log_panel.append_log(
             f"瓦片计算完成：范围={bounds.as_tuple()}，"
             f"区域={estimate.region_name}（{estimate.region_type.value}），"
@@ -857,6 +898,101 @@ class MainWindow(QMainWindow):
             + "，".join(f"z{item.zoom}={item.selected_tiles:,}" for item in estimate.per_zoom)
         )
         self.statusBar().showMessage(f"预计瓦片 {total:,} · 预计容量 {size_text}", 8000)
+
+    def _analyze_risk(
+        self, estimate: RegionTileEstimate, min_zoom: int, max_zoom: int
+    ) -> DownloadRiskReport | None:
+        """对"刚算出来的这份估算"做一次风险分析并展示（Slice 23，Spec §5 / §10）。
+
+        「计算」与「采用推荐 Zoom」都走这里，因此界面上那一刻显示的风险结论
+        与随后启动下载时用的**必然是同一份**（启动保护直接复用 :attr:`_last_risk`
+        的那份报告，不重算）。
+
+        分析失败（等级拿不到、Zoom 不成立）时：把风险区收回去，并记一行 WARNING。
+        刻意**不**把结果区一起清掉 —— "风险没算出来"不该把已经算好的张数与容量
+        也弄没，那会让用户以为整个计算失败了。
+
+        Returns:
+            风险报告；失败时 ``None``。
+        """
+        try:
+            report = self.risk_analyzer.analyze(
+                self.download_panel.current_region_level(), min_zoom, max_zoom, estimate
+            )
+        except ValueError as exc:
+            self._last_risk = None
+            self.download_panel.clear_risk_report()
+            self.log_panel.append_log(f"风险分析未完成：{exc}", "WARNING")
+            return None
+
+        self._last_risk = report
+        self.download_panel.set_risk_report(report)
+        # 日志里带机器可读的等级名（``危险（DANGEROUS）``）与逐条原因 / 建议：
+        # 用户事后翻日志时能直接对上验收报告里的结论（Spec §8 / §9）。
+        self.log_panel.append_log(f"风险分析：{report.describe()}")
+        for line in report.reasons:
+            self.log_panel.append_log(f"风险原因 · {line}")
+        for line in report.recommendations:
+            self.log_panel.append_log(f"风险建议 · {line}")
+        return report
+
+    @Slot()
+    def _on_risk_details_requested(self) -> None:
+        """打开风险详情窗口（Slice 23，Spec §14）。
+
+        非模态（``show()``）：详情是只读的，用户可能想一边看逐 Zoom 明细、
+        一边改主界面上的 Zoom 再算一次 —— 模态框会把这条路堵死。
+        """
+        report = self._last_risk
+        if report is None:
+            self.log_panel.append_log("还没有风险结论，请先点「计算」", "WARNING")
+            self.statusBar().showMessage("请先点「计算」", 5000)
+            return
+
+        dialog = self._risk_dialog
+        if dialog is None:
+            dialog = RiskDetailsDialog(report, self)
+            self._risk_dialog = dialog
+        elif dialog.report is not report:
+            # 结论换了（用户重算过）：就地换成新报告，而不是让用户看着旧数字。
+            # 关掉再新建也可以，但"同一个窗口"对用户更友好（位置和大小都还在）。
+            dialog = RiskDetailsDialog(report, self)
+            self._risk_dialog = dialog
+        self.log_panel.append_log(f"打开风险详情：{report.describe()}")
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    @Slot()
+    def _on_apply_recommended_zoom(self) -> None:
+        """用户点了「采用推荐 Zoom」：改 Zoom 输入框并立刻重算（Spec §11）。
+
+        三条约定：
+
+        1. **只有用户点了才会执行**。分析、重绘、启动保护都不会调用它 ——
+           "我明明填了 Z18"不该变成"它自己变成了 Z10"。
+        2. 采用的方式是**切到「按推荐值」模式**（而不是把两个数硬写进自定义模式）：
+           推荐区间会因为"换了一块地"而变，模式跟着走才能一直对得上（Spec §6）。
+        3. 改完**立刻重算**：否则界面会停在旧的张数上，而它对应的已经不是
+           当前 Zoom 了（这正是 Slice 16 那条"结论作废"规则要防的事）。
+        4. 自定义区域（不套用等级建议）没有推荐区间 → 只记一行日志。
+        """
+        report = self._last_risk
+        if report is None or not report.has_recommendation:
+            self.log_panel.append_log("当前区域不套用等级建议，没有可采用的推荐 Zoom", "WARNING")
+            self.statusBar().showMessage("当前区域没有推荐 Zoom", 5000)
+            return
+
+        min_zoom = int(report.recommended_min_zoom)
+        max_zoom = int(report.recommended_max_zoom)
+        self.log_panel.append_log(
+            f"采用推荐 Zoom：Z{report.actual_min_zoom}~{report.actual_max_zoom} → "
+            f"Z{min_zoom}~{max_zoom}（{report.region_level.display_name}，"
+            f"这部分原本是 {report.over_tiles_text} 张瓦片）"
+        )
+        self.download_panel.set_zoom_mode(ZoomMode.RECOMMENDED)
+        # 改完 Zoom 必须重算：估算与风险结论都绑定在"当时那个区间"上
+        self._run_tile_math()
 
     def _require_region(self) -> DownloadRegion:
         """读表单并拿到**可信的**下载区域；拿不到就抛 ``ValueError``（人话）。
@@ -947,6 +1083,7 @@ class MainWindow(QMainWindow):
         no_text: str | None = None,
         default_yes: bool = False,
         log: str = "",
+        icon: QMessageBox.Icon = QMessageBox.Icon.Question,
     ) -> QMessageBox:
         """弹一个"是 / 否"确认框（**非模态**），把结果交给回调。
 
@@ -962,11 +1099,14 @@ class MainWindow(QMainWindow):
             yes_text / no_text: 两个按钮的文案；``None`` 表示用 Qt 默认。
             default_yes: 默认按钮是"是"还是"否"。破坏性操作应默认"否"。
             log: 写进日志的一句话。
+            icon: 弹窗图标。默认问号；"规模很大 / 危险"这类**警告**用
+                :attr:`QMessageBox.Icon.Warning` —— 用户第一眼就该看出
+                这不是一次普通的"要不要继续"。
 
         Returns:
             弹窗对象（已 ``show()``）。
         """
-        dialog = QMessageBox(QMessageBox.Icon.Question, title, message, parent=self)
+        dialog = QMessageBox(icon, title, message, parent=self)
         dialog.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -1174,12 +1314,62 @@ class MainWindow(QMainWindow):
         )
         self._ask_existing_file(plan)
 
-    def _continue_plan(self, plan: _DownloadPlan) -> None:
-        """"已有文件"这一关过了之后：先看规模，再决定要不要弹大任务确认框。
+    def _plan_risk(self, plan: _DownloadPlan) -> DownloadRiskReport | None:
+        """给"正要启动的这份计划"算一份风险结论（Slice 23，Spec §5 / §12）。
 
-        阈值判断用的是 ``effective_tiles``（真正要下的张数）而不是 ``total``：
-        续传一个"已有 19 万、只缺 3 千"的任务不该被当成大任务来吓唬。
+        **按启动时的那份估算现算**，而不是复用面板上缓存的那一份：用户可能在
+        "计算"之后又改了 Zoom 或换了区域（那正是 Spec §16 要求作废旧结论的时刻），
+        拦住他的结论必须描述**将要真正执行的任务**。
+
+        复用同一个 :attr:`risk_analyzer`（同一个 Zoom 策略实例），因此"面板上的
+        推荐区间"与"确认框里的推荐区间"永远是同一张表算出来的。
+
+        历史任务（从任务列表恢复）可能没有估算对象 —— 那就返回 ``None``，
+        由调用方退回旧的大任务阈值，而不是编一份数字出来。
+
+        Returns:
+            风险报告；没有可分析的估算时为 ``None``。
         """
+        estimate = plan.estimate
+        if estimate is None:
+            return None
+        level = getattr(plan.region, "region_level", RegionLevel.CUSTOM)
+        try:
+            return self.risk_analyzer.analyze(
+                level, plan.min_zoom, plan.max_zoom, estimate
+            )
+        except ValueError as exc:
+            # 分析失败不该拦住下载：退回旧阈值，并留一行说明（用户看不懂"为什么
+            # 这次没有风险提示"时，日志里有答案）。
+            self.log_panel.append_log(
+                f"风险分析未完成（改按大任务阈值判断）：{exc}", "WARNING"
+            )
+            return None
+
+    def _continue_plan(self, plan: _DownloadPlan) -> None:
+        """"已有文件"这一关过了之后：先看风险等级，再决定要不要请用户确认。
+
+        两道闸门，**每个任务只过一道**（否则一个 20 万张的任务会被连问两次）：
+
+        1. **风险等级**（Slice 23，Spec §12）：``LARGE`` / ``VERY_LARGE`` 各弹一次
+           确认（后者是警告图标），``DANGEROUS`` 走手输确认词的强确认。
+           判据一律来自报告（``requires_confirmation`` / ``requires_strong_confirmation``），
+           本方法里**没有任何阈值数字**。
+        2. **旧的大任务阈值**（1 万张，Slice 4）：只在风险等级为 ``NORMAL`` 时才走它。
+           新阈值更严（10 万张起），所以两个都命中的任务必然走第 1 条 ——
+           "问两次"这件事不会发生。
+
+        关于续传：报告描述的是**这块地的总规模**（面板上显示的就是它），而第 2 道
+        闸门用的是 ``effective_tiles``（真正还要下的张数）。续传大任务时确认框里会
+        额外写清"已有多少 / 还要下多少"，不让用户以为要把整块地重下一遍。
+        """
+        report = self._plan_risk(plan)
+        if report is not None and report.requires_strong_confirmation:
+            self._confirm_dangerous_task(plan, report)
+            return
+        if report is not None and report.requires_confirmation:
+            self._confirm_risky_task(plan, report)
+            return
         if plan.effective_tiles > GUI_LARGE_TASK_CONFIRM_TILES:
             # 只提示，不限制：用户确认后照常下载，规模上不封顶。
             self._confirm_large_task(plan)
@@ -1437,6 +1627,149 @@ class MainWindow(QMainWindow):
         )
         self._discard_plan(plan)
         self.statusBar().showMessage("已取消下载", 5000)
+
+    # ------------------------------------------------------------------ #
+    # 槽：启动前的风险保护（Slice 23，Spec §12）
+    # ------------------------------------------------------------------ #
+    def _confirm_risky_task(
+        self, plan: _DownloadPlan, report: DownloadRiskReport
+    ) -> None:
+        """``LARGE`` / ``VERY_LARGE`` 的风险确认（**非模态**）。
+
+        与「大任务确认」是同一套交互（``show()`` + ``finished``），差别只在
+        图标、标题与正文全部来自风险报告：
+
+        * ``LARGE`` → 问号图标（"要不要继续，你定"）；
+        * ``VERY_LARGE`` → 警告图标（"这个规模值得停下来看一眼"）。
+
+        正文用 ``report.as_lines()``（等级 / 张数 / 容量 / 实际与推荐区间 / 原因 /
+        建议），因此用户能看出**为什么**被拦，而不只是"你点多了"。
+        续传场景补一行"已有 / 还要下"，免得用户以为整块地要重下一遍。
+        """
+        self._pending_plan = plan
+        self._pending_risk = report
+        self._refresh_action_state()
+        warning = report.level.at_least(RiskLevel.VERY_LARGE)
+        body = "\n".join(
+            [
+                *report.as_lines(),
+                *self._resume_note(plan),
+                "",
+                UI_TEXT_RISK_CONFIRM_QUESTION,
+            ]
+        )
+        self._ask_confirmation(
+            UI_TEXT_RISK_CONFIRM_TITLE_VERY_LARGE
+            if warning
+            else UI_TEXT_RISK_CONFIRM_TITLE_LARGE,
+            body,
+            icon=QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Question,
+            on_answered=self._on_risk_answered,
+            attr="_confirm_dialog",
+            yes_text=UI_TEXT_BUTTON_CONFIRM,
+            no_text=UI_TEXT_BUTTON_CANCEL,
+            log=(
+                f"风险等级 {report.level.label(with_value=True)}："
+                f"{report.tiles_text} 张 / {report.size_text}，"
+                "已弹出确认框，等待用户确认"
+            ),
+        )
+        self.statusBar().showMessage("等待确认任务风险…")
+
+    @Slot(int)
+    def _on_risk_answered(self, result: int) -> None:
+        """用户对"这个规模还要不要下"做出选择。"""
+        plan = self._pending_plan
+        report = self._pending_risk
+        self._pending_plan = None
+        self._pending_risk = None
+        self._confirm_dialog = None
+        if plan is None:  # pragma: no cover - 防御性分支
+            return
+
+        level_text = report.level.label(with_value=True) if report else ""
+        if result == int(QMessageBox.StandardButton.Yes):
+            self.log_panel.append_log(
+                f"用户确认继续（风险等级 {level_text}）"
+            )
+            self._launch_download(plan)
+            return
+
+        self.log_panel.append_log(
+            f"用户取消了下载（风险等级 {level_text}）", "WARNING"
+        )
+        self._discard_plan(plan)
+        self.statusBar().showMessage("已取消下载", 5000)
+
+    def _confirm_dangerous_task(
+        self, plan: _DownloadPlan, report: DownloadRiskReport
+    ) -> None:
+        """``DANGEROUS`` 的强确认：必须手输确认词（Spec §12）。
+
+        为什么不用"再来一次 Yes/No"：LARGE 档已经教过用户"闭眼点右边那个"了。
+        危险档要求把确认词敲进输入框 —— 这个动作**无法无脑完成**，它买到的是
+        "用户确实看过这一屏"。窗口由 :class:`DangerousTaskConfirmDialog` 提供，
+        本方法只负责接线与日志。
+
+        刻意把"已经强确认过"记进日志：事后复盘"谁把 500 TB 的任务跑起来了"时，
+        这一行是唯一的答案。
+        """
+        self._pending_plan = plan
+        self._pending_risk = report
+        self._refresh_action_state()
+        dialog = DangerousTaskConfirmDialog(report, self)
+        dialog.set_resume_note(self._resume_note(plan))
+        dialog.finished.connect(self._on_dangerous_answered)
+        self._dangerous_dialog = dialog
+        self.log_panel.append_log(
+            f"风险等级 {report.level.label(with_value=True)}："
+            f"{report.tiles_text} 张 / {report.size_text}，"
+            f"需要输入确认词才能继续（{report.region_name or '当前区域'}）",
+            "WARNING",
+        )
+        for line in report.recommendations:
+            self.log_panel.append_log(f"风险建议 · {line}")
+        self.statusBar().showMessage("等待危险任务强确认…")
+        dialog.show()
+
+    @Slot(int)
+    def _on_dangerous_answered(self, result: int) -> None:
+        """强确认结果：``Accepted`` 才算确认，其余（含关窗 / Esc）一律视为放弃。"""
+        plan = self._pending_plan
+        report = self._pending_risk
+        self._pending_plan = None
+        self._pending_risk = None
+        self._dangerous_dialog = None
+        if plan is None:  # pragma: no cover - 防御性分支
+            return
+
+        if result == int(QDialog.DialogCode.Accepted):
+            self.log_panel.append_log(
+                f"用户已通过强确认（风险等级 "
+                f"{report.level.label(with_value=True) if report else ''}），开始下载",
+                "WARNING",
+            )
+            self._launch_download(plan)
+            return
+
+        self.log_panel.append_log("用户放弃了危险任务下载", "WARNING")
+        self._discard_plan(plan)
+        self.statusBar().showMessage("已取消下载", 5000)
+
+    @staticmethod
+    def _resume_note(plan: _DownloadPlan) -> list[str]:
+        """续传时补的那一行（"已有 / 还要下"）。
+
+        没有已有瓦片时返回**空列表**（而不是一个恒为 0 的行）：一个"已有 0 张"
+        的行只会让人多读一遍才发现它没用。
+        """
+        if plan.existing_tiles <= 0:
+            return []
+        remaining = max(0, plan.total - plan.existing_tiles)
+        return [
+            f"续传：已有 {plan.existing_tiles:,} 张，"
+            f"本次实际还要下 {remaining:,} 张。"
+        ]
 
     # ------------------------------------------------------------------ #
     # 槽：目标文件已存在时的三选一（Slice 5，Spec §15）

@@ -71,6 +71,18 @@ from app.planning.region_level import (
     RegionLevel,
 )
 
+# 风险等级是**零依赖**的叶子模块（只 import Enum），因此它紧跟 region_level。
+# 风险报告与策略只依赖它 + config + tile_math，也可以安全地在本层被装好。
+# 分析器（``download_risk_analyzer``）**刻意不在这里转出**：它会拉
+# ``app.geo`` 的估算层与计划模型，理由与下面那段导入顺序说明完全一样。
+from app.planning.risk_level import RISK_LEVEL_ORDER, RISK_LABEL, RiskLevel
+from app.planning.risk_models import (
+    DownloadRiskReport,
+    PlanItemRisk,
+    PlanRiskReport,
+)
+from app.planning.risk_policy import DEFAULT_RISK_POLICY, RiskPolicy
+
 # 先导入 region_level 再导入其余模块：`app.geo.region` 依赖它，而
 # `app.planning` 的 __init__ 有可能正是被那条依赖触发的（见 zoom_strategy 文档）。
 from app.planning.models import (
@@ -141,6 +153,15 @@ __all__ = [
     "ZOOM_WARNING_PREFIX",
     "PLAN_TILES_LABEL",
     "PLAN_SIZE_LABEL",
+    # --- 下载风险分析（Slice 23）：同样只有模型 + 策略 ---
+    "RiskLevel",
+    "RISK_LEVEL_ORDER",
+    "RISK_LABEL",
+    "DownloadRiskReport",
+    "PlanItemRisk",
+    "PlanRiskReport",
+    "RiskPolicy",
+    "DEFAULT_RISK_POLICY",
     # --- 多级下载计划（Slice 20）：只有模型 ---
     "DownloadPlan",
     "DownloadPlanItem",

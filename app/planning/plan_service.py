@@ -148,6 +148,17 @@ class PlanService:
         return self._store
 
     @property
+    def strategy(self) -> ZoomStrategyService:
+        """本服务用的 Zoom 策略表。
+
+        Slice 23 起界面上也要用：风险报告里的"推荐区间"必须与计划层校验、
+        建议文案是同**一张**表算出来的。让调用方去 ``builder.strategy`` 里
+        掏一个，等于把"这张表在哪里"这件事暴露给界面 —— 将来换个装配方式
+        （比如 builder 换成远程实现）就会静静地分叉。
+        """
+        return self._strategy
+
+    @property
     def builder(self) -> DownloadPlanBuilder:
         """编辑器。"""
         return self._builder
@@ -299,6 +310,22 @@ class PlanService:
     ) -> bool:
         """启用 / 禁用一个条目（Spec §12）。"""
         changed = self._builder.set_enabled(region_id, enabled)
+        if changed and save:
+            self.save()
+        return changed
+
+    def set_zoom(
+        self, region_id: str, min_zoom: int, max_zoom: int, *, save: bool = True
+    ) -> bool:
+        """改某一项的 Zoom 区间（Slice 23，Spec §12「采用推荐 Zoom」）。
+
+        **会作废该项的估算** —— 调用方必须在之后重新估算，否则界面上的张数 /
+        容量与真正的下载范围不一致（那种不一致比"没给出数字"危险得多）。
+
+        Returns:
+            ``True`` 表示改动了；``False`` 表示没有这个区域或值没变。
+        """
+        changed = self._builder.set_zoom(region_id, min_zoom, max_zoom)
         if changed and save:
             self.save()
         return changed

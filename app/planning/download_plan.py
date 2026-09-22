@@ -61,7 +61,7 @@ from app.config.settings import (
     DEFAULT_PLAN_NAME,
     MBTILES_FILE_SUFFIX,
 )
-from app.geo.tile_math import format_size
+from app.geo.tile_math import format_size, validate_zoom
 from app.models.naming import sanitize_map_name
 from app.planning.region_level import RegionLevel
 
@@ -289,6 +289,27 @@ class DownloadPlanItem:
     def level_text(self) -> str:
         """等级的中文展示名（``全国级`` / ``省级`` …）。"""
         return self.region_level.display_name
+
+    def set_zoom(self, min_zoom: int, max_zoom: int) -> None:
+        """改写这一项的 Zoom 区间（Slice 23，Spec §12「采用推荐 Zoom」）。
+
+        改 Zoom 就是换了一批要下的瓦片：已有的估算（张数 / 容量 / 逐级明细）
+        描述的是**旧区间**，所以这里顺手清掉，而不是留一份属于旧区间的数字
+        （与 Slice 16 的"结论依赖的输入一变就作废"同一条规则）。调用方之后
+        **必须重新估算**，否则界面上的合计与风险结论都对不上实际要下的东西。
+
+        Raises:
+            ValueError: Zoom 超出支持范围，或 ``min_zoom > max_zoom``。
+        """
+        low = validate_zoom(min_zoom)
+        high = validate_zoom(max_zoom)
+        if low > high:
+            raise ValueError(
+                f"min_zoom 不能大于 max_zoom，实际为 {low} > {high}"
+            )
+        self.min_zoom = low
+        self.max_zoom = high
+        self.clear_estimate()
 
     def clear_estimate(self) -> None:
         """把估算结果清回"尚未估算"（区域或 Zoom 变了时必须调）。"""
