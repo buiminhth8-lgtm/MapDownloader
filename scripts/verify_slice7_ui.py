@@ -319,7 +319,16 @@ def scene_b_large_task(
                   "计划规模确实超过 10,000 张",
                   f"total={plan.total if plan else None}")
     print(f"    确认框标题：{dialog.windowTitle()}")
-    checker.check("请求" in dialog.text(), "确认框里给了请求量")
+    # Slice 23 起这个框的正文由风险报告拼出来（``report.as_lines()`` + 一句提问），
+    # 措辞从"请求"变成了"预计下载 N 张瓦片"。要守的性质没变 ——
+    # **框里必须给出这次的瓦片量**，而不是只说一句"任务很大"。
+    # 所以按"含张数"断言而不是锁死措辞：锁措辞的结果是每次文案优化都要改验收脚本。
+    _body = dialog.text()
+    checker.check(
+        "张瓦片" in _body and any(char.isdigit() for char in _body),
+        "确认框里给了这次要下的瓦片量",
+        _body.replace("\n", " / ")[:160],
+    )
     # 大任务只提示、不限制：这里点「否」（= 放弃本次）收尾，免得为了一条检查
     # 真的去下十几万张——"确认后照常开跑"那条路径由场景 D 用小区域覆盖。
     labels = [button.text() for button in dialog.buttons()]

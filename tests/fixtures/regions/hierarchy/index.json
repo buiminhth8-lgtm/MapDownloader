@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "regions": [
+    {
+      "id": "democountry",
+      "name": "示例国",
+      "level": "country",
+      "parentId": null,
+      "geojson": "country.geojson",
+      "boundaryVersion": "2026-09-hierarchy"
+    },
+    {
+      "id": "demoprovince",
+      "name": "示例省",
+      "level": "province",
+      "parentId": "democountry",
+      "geojson": "province.geojson",
+      "boundaryVersion": "2026-09-hierarchy"
+    },
+    {
+      "id": "democity",
+      "name": "示例市",
+      "level": "city",
+      "parentId": "demoprovince",
+      "geojson": "city.geojson",
+      "boundaryVersion": "2026-09-hierarchy"
+    }
+  ]
+}

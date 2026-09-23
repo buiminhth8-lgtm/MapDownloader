@@ -10,8 +10,12 @@
 > | A. 制作 | A1 – A7 | Windows |
 > | B. 传输 | B8 – B11 | Windows（`adb`） |
 > | C. 导入与使用 | C12 – C20 | Android 设备 |
+> | D. 分级体系（全国/省/市/任务区） | D21 – D25 | 两端都跑 |
 >
-> 全程约 15 分钟。建议**第一次验收按顺序全跑**；之后回归可以只跑标了 ★ 的那几步。
+> A~C 验的是**一个矩形包**的整条链路；D 验的是**层级**（四级区域各自的 Zoom 区间
+> 与等级怎么跨端，以及手机按 Zoom 选对那一档）。第一次验收按顺序全跑；
+> 之后回归可以只跑标了 ★ 的那几步。D 段有**全自动版本**，
+> 见文末「全自动版本」。
 
 ---
 
@@ -353,6 +357,111 @@ cd D:/project/osmdroid && grep -rn "OFFLINE_MAP_RUNTIME_VERSION =" OpenStreetMap
 
 ---
 
+## D. 分级体系（全国 → 省 → 市 → 任务区）
+
+A~C 阶段验的是**一个矩形包**的整条链路。这一段验的是**层级**：四级区域各自
+带着自己的 Zoom 区间与等级，从 Windows 一路走到手机，并且在手机上**按 Zoom
+选对那一档**。分级的细节见 `hierarchical_offline_map.md`。
+
+> 这一段可以全自动跑（见文末「全自动版本」的 `hierarchical_map_e2e.py`）。
+> 下面写的是**手工版本**，用来在自动化之外独立确认一遍。
+
+### D21 ★ 准备一块有层级的区域
+
+工具 → 「区域」选「行政区域」。如果目录里还没有省市数据，**先用仓库里的
+合成夹具**（`tests/fixtures/regions/hierarchy/`）代替 —— 那份夹具是自造的
+几何，**不是真实国界**，只用于验收流程本身：
+
+```bash
+# 把夹具复制成一个临时资源目录，然后临时指向它（不改仓库里的 resources/）
+cd D:/project/MapDownloader
+cp -r tests/fixtures/regions/hierarchy /tmp/hier-regions
+```
+
+**通过判据**：
+- 下拉里能看到 `示例国 / 示例北省 / 示例河市` 三级，选择后**候选范围行**跟着变
+- 任务区（航线 + Buffer）能建出来，走廊半径改大 → 选中瓦片数变大
+
+### D22 ★ 四个区域各估一次，看推荐区间对不对
+
+依次选四级区域，点「计算」。
+
+**通过判据**（这是 §5 的硬契约）：
+
+| 选中的等级 | 推荐区间必须是 |
+| --- | --- |
+| 全国 | `Z4~10` |
+| 省级 | `Z9~13` |
+| 市级 | `Z12~16` |
+| 任务区 | `Z15~18` |
+
+- 手填一个**超出**推荐上界的 Zoom → 出警告；手填区间内 → 无警告
+- **手填的值不许被自动改掉**（"我填 Z18，它偷偷改成 Z10" 是缺陷，不是贴心）
+- 选中「自定义矩形」→ 不套用任何等级建议（没有警告，也没有推荐）
+
+### D23 ★ 建一个四级下载计划
+
+把 `示例国`、`示例北省`、`示例河市`、任务区**依次**加入下载计划。
+
+**通过判据**：
+- 计划里四行的顺序是 **全国 → 省 → 市 → 任务区**（大范围先下）
+- 每行都有自己的 Zoom 区间与预估张数，合计 = 各行之和
+- 停用其中一行 → 合计立刻变小（停用的项**不计入**合计）
+- 合计跨过风险阈值时弹确认框，文案说清是哪一维触发（张数 / 容量）
+
+> 规模提醒：夹具的市级区域若照推荐区间（Z12~16）跑是十几万张。
+> 手工验收时把每级的 Zoom 缩到**推荐区间的下界一两级**（如市级只填 Z12），
+> 十几分钟能跑完。
+
+### D24 ★ 下载、检查、打包，然后核对 manifest
+
+计划跑完后，对**行政区**和**任务区**各打一个包。
+
+**通过判据**（这一段是 Slice 25 修的元数据缺陷的现场）：
+
+| 包 | `manifest.region` 必须有 | 必须**没有** |
+| --- | --- | --- |
+| 行政区（市级为例） | `type=polygon`、`id`、`boundaryVersion`、**`level=city`** | `bufferMeters`、`geometryVersion` |
+| 任务区 | 上面那些 + `level=mission` | — |
+| 任务区 | `bufferMeters`（走廊半径） | — |
+| 任务区 | `geometryVersion`（== `boundaryVersion`） | — |
+
+```bash
+cd D:/project/MapDownloader
+.venv/Scripts/python.exe -c "
+import json,sys; sys.path.insert(0,'.')
+from app.package.models import parse_manifest_dict
+p=r'<包目录>/manifest.json'
+m=parse_manifest_dict(json.load(open(p, encoding='utf-8')))
+print(json.dumps(m.region.to_dict(), ensure_ascii=False))
+"
+```
+
+> **`level` 是最容易漏的一项**，因为它漏了不报错：包照常导入、照常显示，
+> 只是 Android 侧把它当成"未知等级"。见 `troubleshooting.md` 第 15 条。
+
+### D25 ★ 传到手机，验证"按 Zoom 选对那一档"
+
+把四个包都推到设备并导入（B 阶段的命令照旧，逐个包做一遍）。
+
+**通过判据**：切到 AUTO 模式，把地图 Zoom 依次调到下面这几档，
+地图页状态行第一行的**等级**应当跟着换：
+
+| Zoom | 期望选到的等级 |
+| --- | --- |
+| ~7 | 全国 |
+| ~11 | 省级 |
+| ~14 | 市级 |
+| ~17 | 任务区 |
+| ~19 | 退回在线（没有包覆盖这一档） |
+
+- 同一档里来回微调 Zoom（±0.3 级）**不应**反复换底图（迟滞在起作用）
+- 拔网 / 飞行模式下走到上面每一档，图都还在（这是整条线的意义）
+
+> 若某一档写的是「未知」→ 那个包的 `level` 没落进包里，回 D24 核对。
+
+---
+
 ## 验收结论记录
 
 | 步骤 | 结果 | 证据 / 备注 |
@@ -377,6 +486,11 @@ cd D:/project/osmdroid && grep -rn "OFFLINE_MAP_RUNTIME_VERSION =" OpenStreetMap
 | C18 删除回退 | | |
 | C19 多地图 | | |
 | C20 版本核对 | | |
+| D21 层级区域可选 | | 用的哪份目录： |
+| D22 推荐区间四级 | | |
+| D23 计划顺序 | | 合计张数： |
+| D24 manifest.region 的 level | | 行政区 level: / 任务区 level: |
+| D25 按 Zoom 选等级 | | Z7/11/14/17/19 → |
 
 **环境快照**：Windows 工具版本 ______ / Package Format ______ /
 Android 运行时 ______ / 设备 ______ / Android 版本 ______
@@ -389,16 +503,27 @@ Android 运行时 ______ / 设备 ______ / Android 版本 ______
 
 | 脚本 | 覆盖 |
 | --- | --- |
+| `scripts/e2e_smoke_test.py`（Windows） | A 阶段的**离线**等价链路（Tile Math → MBTiles → Inspector → Package → SHA256 → Validator） |
+| `scripts/hierarchical_map_e2e.py`（Windows） | **D21 – D24 全部**：层级目录 → Zoom 策略 → 多边形估算 → 任务区 → 风险 → 下载计划 → 调度 → MBTiles → Inspector → 打包。全程离线（Mock 瓦片源），10 段全 PASS 才算过 |
 | `scripts/verify_slice11_offline_import.py` | C12–C14（导入、目录、校验） |
 | `scripts/verify_slice12_offline_runtime.py` | C15–C17（OFFLINE / AUTO / 拔网） |
 | `scripts/verify_slice13_offline_management.py` | C18–C19（删除、多地图） |
 | `scripts/verify_slice14_offline_stability.py` | 稳定性（长时间切换、压力） |
+| `scripts/verify_slice24_auto_selection.py` | **D25 的自动化版本**：真机上的 AUTO 阶梯与迟滞 |
 
 跑法：
 
 ```bash
 cd D:/project/osmdroid
 python scripts/verify_slice11_offline_import.py --serial <serial>
+```
+
+Windows 侧的分级全链路：
+
+```bash
+cd D:/project/MapDownloader
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py
+# 退出码 0 = 10 段全过；加 --keep 保留工作目录去翻产物（.mbtiles / manifest.json）
 ```
 
 截图落在 `docs/`（**该目录在 .gitignore 里**，是本地证据，不进提交）。

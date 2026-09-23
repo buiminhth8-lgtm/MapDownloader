@@ -65,7 +65,7 @@ from app.geo.region import (
 )
 from app.planning.zoom_strategy import ZoomPlanEstimate, ZoomStrategyService
 from app.regions.models import RegionCatalogError, RegionPreset
-from app.regions.service import RegionService
+from app.regions.service import RegionService, install_region_catalog_resolver
 from app.mission.models import (
     MISSION_REGION_LEVEL,
     MissionRegion,
@@ -564,6 +564,18 @@ class CompositeRegionService:
         self._base = base if base is not None else RegionService()
         self._mission = mission if mission is not None else MissionRegionService()
         self._mission_prefix = str(mission_prefix)
+        # 两个几何解析器**在这里一起装上**（Slice 25 修）。
+        #
+        # 续传与 Inspector 手上只有一个 `region_id`，必须能把 id 变回几何。
+        # 任务区那一路在 Slice 22 就写好了，但没人调用 `MissionRegionService.install()`
+        # —— 行政区目录那一路更是从 Slice 18 换成目录之后就断了线（`app.geo` 只认
+        # 内置的 `china` 预设）。后果是：**目录里的多边形任务一进续传路径就报
+        # "找不到对应的行政区边界"**，而计划调度器走的正是续传路径。
+        #
+        # 装在这个"界面唯一入口"的构造函数里，是为了让"忘了在启动时调用"变成
+        # 一件不可能的事 —— 这类缺陷的特点就是运行很久都不报错，只在续传时发作。
+        install_region_catalog_resolver(self._base)
+        self._mission.install()
 
     # ------------------------------------------------------------------ #
     # 分流

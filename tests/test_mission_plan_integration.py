@@ -223,7 +223,9 @@ def build_package(
         region_type=RegionType.POLYGON.value,
         region_id=region_id if region_id is not None else region.region_id,
         boundary_version=region.boundary_version or "",
-        region_level=(region.region_level.value if region.is_mission else ""),
+        # Slice 25 起生产代码**所有区域都写等级**（矩形 custom / 行政区 country…
+        # / 任务区 mission），夹具跟着一起写 —— 判据多严，夹具就得多真。
+        region_level=region.region_level.value,
         buffer_meters=(region.buffer_meters if region.is_mission else ""),
     )
     with MBTilesWriter(path) as writer:
@@ -439,16 +441,43 @@ def test_the_manifest_region_declares_level_and_corridor_width(
     assert payload["geometryVersion"] == payload["boundaryVersion"]
 
 
-def test_an_admin_polygon_does_not_gain_the_mission_keys(
+def test_an_admin_polygon_carries_its_level_but_not_the_mission_keys(
     region_service: CompositeRegionService,
 ) -> None:
-    """行政区包一个字节都不多 —— 任务区字段不许污染既有区域。"""
+    """行政区包要写等级、不写任务区字段（Slice 25 修正）。
+
+    ``region_level`` 从 Slice 25 起**所有区域都写**：Android 没有区域目录，
+    反查不出等级，不写的话行政区包在那边一律落到 ``UNKNOWN``，
+    Slice 24 的等级优先级整条失效。它因此不再算"任务区字段"。
+
+    真正的任务区字段（``buffer_meters`` / ``bufferMeters`` / ``geometryVersion``）
+    照旧只有任务区写 —— 那些东西换个区域类型就没有意义。
+    """
     region = region_service.get_download_region("demoland")
     assert region.is_mission is False
-    assert "region_level" not in region.metadata_rows()
-    assert "buffer_meters" not in region.metadata_rows()
-    assert "level" not in region.manifest_region()
-    assert "bufferMeters" not in region.manifest_region()
+
+    rows = region.metadata_rows()
+    assert rows["region_level"] == "country"
+    assert "buffer_meters" not in rows
+
+    payload = region.manifest_region()
+    assert payload["level"] == "country"
+    assert "bufferMeters" not in payload
+    assert "geometryVersion" not in payload
+
+
+def test_a_plain_rectangle_declares_itself_custom() -> None:
+    """纯矩形（没有区域目录条目）写 ``custom``，而不是留空。
+
+    留空在 Android 侧与"老包没有这条信息"收敛到同一个 ``UNKNOWN``，
+    而这两件事不一样：一个明确是"用户画的一块矩形"，一个是"不知道"。
+    """
+    region = region_module.DownloadRegion.rectangle(
+        "自定义矩形", GeoBounds(west=0.0, south=0.0, east=1.0, north=1.0)
+    )
+    assert region.is_mission is False
+    assert region.metadata_rows()["region_level"] == "custom"
+    assert region.manifest_region()["level"] == "custom"
 
 
 def test_a_missing_mission_is_reported_not_silently_substituted(

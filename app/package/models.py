@@ -201,8 +201,10 @@ class PackageRegion:
             也走这个字段（下载链路上它们的语义完全相同：**这批瓦片是按哪一版
             几何裁的**）。
         level: 区域等级（``country`` / ``province`` / ``city`` / ``mission`` /
-            ``custom``）。**只有任务区写**：行政区等级能从 ``region_id`` 反查，
-            任务区不能（Slice 22）。
+            ``custom``）。**只要有等级就写**（Slice 25 起）：它是跨端契约，
+            Android 侧没有区域目录、反查不出等级，靠这个键才能排"哪一级更贴地"
+            （Slice 22 只给任务区写，见 ``app/geo/region.py::metadata_rows``
+            的说明）。老包没有这个键 → 读到时为 ``None``。
         buffer_meters: 任务区走廊半径（米）；非任务区为 ``None``。
         geometry_version: 任务区几何版本号；非任务区为 ``None``。
 
@@ -246,12 +248,12 @@ class PackageRegion:
             object.__setattr__(self, "buffer_meters", radius)
 
     def to_dict(self) -> dict[str, Any]:
-        """转成 JSON 结构（Slice 16 的三个键 + 任务区的三个可选键）。
+        """转成 JSON 结构（Slice 16 的三个键 + 区域等级等可选键）。
 
         空字段**不写**：``"id": null`` 与"没有 id"在 Android 侧是两种语义
         （前者可能被反序列化成字符串 ``"null"``），与 ``description`` 同一处理。
-        这也保证了**加了新键不会改变任何既有包的字节**：行政区包与矩形包
-        里这三个键根本不会出现（协议用例守着这件事）。
+        键的**出现与否**因此完全由"这个包知不知道自己这一项"决定 ——
+        老包（Slice ≤21）里 ``level`` 不会出现，读到时按"没有等级信息"处理。
         """
         data: dict[str, Any] = {"type": self.region_type}
         if self.region_id:

@@ -266,6 +266,25 @@ def test_service_download_region_is_a_polygon(region_root) -> None:
     assert region.region_level is RegionLevel.CITY
 
 
+def test_every_catalog_level_survives_into_the_package_metadata(region_root) -> None:
+    """目录里声明的等级要原样落进 MBTiles metadata 与 manifest（Slice 25 §4）。
+
+    "Windows 侧能反查等级"与"产物里带着等级"是两件事：Android 只读产物。
+    Slice 22 正是把这两件事混为一谈（只给任务区写等级），
+    结果行政区包在 Android 侧全是"未知等级"。这条用例逐条目录守着它。
+    """
+    service = _service(region_root)
+    checked = 0
+    for preset in service.catalog.presets:
+        region = service.get_download_region(preset.id)
+
+        assert region.metadata_rows()["region_level"] == preset.level.value, preset.id
+        assert region.manifest_region()["level"] == preset.level.value, preset.id
+        checked += 1
+
+    assert checked == len(service.catalog.ids) > 0, "目录里一条都没查到，断言是空转的"
+
+
 # --------------------------------------------------------------------------- #
 # 等级 → Zoom（Spec §9）
 # --------------------------------------------------------------------------- #

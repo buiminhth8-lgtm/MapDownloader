@@ -1159,14 +1159,16 @@ class MapDownloadService:
             region_type=region.region_type.value if region else "rectangle",
             region_id=region.region_id if region else "",
             boundary_version=region.boundary_version if region else "",
-            # Slice 22（Spec §20）：任务区额外记两项 —— 等级与走廊半径。
-            # 行政区的这两项**保持为空**：等级能从 region_id 反查，
-            # 而任务区的几何在用户数据目录里，反查不出来，必须落在包里。
-            # 「按不含任务区的输入跑出来的字节与 Slice ≤21 逐位一致」由
-            # tests/test_mbtiles_region_metadata.py 守着。
-            region_level=(
-                region.region_level.value if region and region.is_mission else ""
-            ),
+            # Slice 25（Spec §20 修正）：等级**所有区域都写** —— 矩形是 custom、
+            # 行政区是 country/province/city、任务区是 mission。
+            # Slice 22 只给任务区写，理由是"行政区的等级能从 region_id 反查"；
+            # 那只对 Windows 自己成立 —— Android 侧没有区域目录，反查不出来，
+            # 行政区包在那边全落到 RegionLevel.UNKNOWN，Slice 24 的等级优先级
+            # （"更具体的一级才能换下当前包"）整条失效。
+            # 没有 region（纯矩形下载）时写 custom 而不是留空：留空在 Android 侧
+            # 与"老包没有这条信息"收敛到同一个 UNKNOWN，而这两件事不一样。
+            region_level=(region.region_level.value if region else "custom"),
+            # 走廊半径只对任务区有意义（Spec §20），别的区域类型不写。
             buffer_meters=(
                 region.buffer_meters if region and region.is_mission else ""
             ),

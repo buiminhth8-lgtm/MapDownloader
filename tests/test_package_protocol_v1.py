@@ -47,6 +47,12 @@ from app.package.models import (
     UnsupportedFormatVersion,
     parse_manifest_dict,
 )
+# Slice 25：``_region_from_metadata`` 是 metadata → manifest 的**唯一**翻译点。
+# 从私有位置取它是有意的 —— 这条翻译规则（哪几项透传、``geometryVersion``
+# 归谁）就是本文件要钉的协议内容，绕到 ``build()`` 之外再断言一次只会更松。
+from app.package.package_builder import _region_from_metadata
+from app.planning.download_plan import PLAN_LEVEL_ORDER
+from app.planning.region_level import RegionLevel
 
 # --------------------------------------------------------------------------- #
 # 路径
@@ -330,3 +336,161 @@ def test_fixture_round_trips_through_the_windows_model(v1_manifest_dict: dict) -
     """
     manifest = parse_manifest_dict(v1_manifest_dict)
     assert manifest.to_dict() == v1_manifest_dict
+
+
+# --------------------------------------------------------------------------- #
+# Slice 25：区域等级（``region.level``）的跨端契约
+# --------------------------------------------------------------------------- #
+#: Android 侧等级枚举的源码（**跨仓库**，与 :data:`ANDROID_MANIFEST_JAVA` 同一条理由）。
+#:
+#: "哪些等级存在"必须两端一致 —— 不一致的后果不是报错，而是**静默降级**：
+#: Android 的 ``RegionLevel.parse`` 认不出来就返回 ``UNKNOWN``，包照常能用，
+#: 只是永远排在同级候选的最后。这类问题只能在真机上慢慢看出来。
+ANDROID_REGION_LEVEL_JAVA = (
+    ANDROID_ROOT
+    / "OpenStreetMapViewer"
+    / "src"
+    / "main"
+    / "java"
+    / "org"
+    / "osmdroid"
+    / "map"
+    / "offline"
+    / "model"
+    / "RegionLevel.java"
+)
+
+#: Java 枚举常量：``NAME（"展示名", 具体度）,`` —— 最后一项以 ``;`` 结尾而不是 ``,``，
+#: 早先只认逗号的版本会静默漏掉 ``UNKNOWN``（那正是本用例要盯住的那一个）。
+_JAVA_ENUM_CONSTANT = re.compile(
+    r"^\s*([A-Z][A-Z0-9_]*)\s*\(\s*\"([^\"]*)\"\s*,\s*(-?\d+)\s*\)\s*[,;]\s*$",
+    re.MULTILINE,
+)
+
+
+def _java_region_levels() -> dict[str, int]:
+    """``{等级名（小写）: 具体度}`` —— 从 Android 源码里**抽**出来，不是抄一份。"""
+    source = ANDROID_REGION_LEVEL_JAVA.read_text(encoding="utf-8")
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    source = re.sub(r"//[^\n]*", "", source)
+    found = _JAVA_ENUM_CONSTANT.findall(source)
+    assert found, f"没能从 {ANDROID_REGION_LEVEL_JAVA.name} 里解析出任何枚举常量"
+    return {name.lower(): int(specificity) for name, _display, specificity in found}
+
+
+@pytest.mark.skipif(
+    not ANDROID_REGION_LEVEL_JAVA.is_file(),
+    reason=f"读不到 Android 等级枚举（{ANDROID_REGION_LEVEL_JAVA}），跳过跨仓库比对",
+)
+def test_both_ends_share_one_region_level_vocabulary() -> None:
+    """``region.level`` 的取值集合两端一致（Slice 25 §4）。
+
+    ``app/planning/region_level.py`` 的 docstring 写着等级值"便于将来 Android 侧
+    用同一个字符串沟通"，Android 的 ``RegionLevel.parse`` 也确实在认同一套字符串。
+    两边清单一旦分叉，行政区包就会静默降级成"未知等级" —— 这正是 Slice 25
+    修掉的那个 Bug（Windows 侧压根没给行政区写这个键）。
+    """
+    java = _java_region_levels()
+    python_levels = {level.value for level in RegionLevel}
+
+    unknown_on_python_side = sorted(python_levels - set(java))
+    assert not unknown_on_python_side, (
+        f"Windows 会写出这些等级 {unknown_on_python_side}，"
+        f"但 Android 的 RegionLevel 认不出来（会静默降级成 UNKNOWN）"
+    )
+    assert set(java) - python_levels == {"unknown"}, (
+        "Android 只应比 Windows 多一个 unknown（老包 / 认不出的等级），"
+        f"实际多出：{sorted(set(java) - python_levels - {'unknown'})}"
+    )
+    assert not hasattr(RegionLevel, "UNKNOWN"), (
+        "Windows 侧不该有 UNKNOWN 这个成员：写不出具体等级时写 custom"
+        "（明确的自定义），把'不知道'写进产物会让两端对同一个包的理解产生分歧"
+    )
+
+
+@pytest.mark.skipif(
+    not ANDROID_REGION_LEVEL_JAVA.is_file(),
+    reason="读不到 Android 等级枚举，跳过跨仓库比对",
+)
+def test_both_ends_agree_on_which_level_is_more_specific() -> None:
+    """层次越细越"具体"这条排序两端一致（Slice 24 §5-3）。
+
+    Windows 的 ``PLAN_LEVEL_ORDER`` 是**下载顺序**（由粗到细）；
+    Android 的 ``RegionLevel.getSpecificity()`` 是**选包优先级**（越大越具体）。
+    两者在"全国 < 省 < 市 < 任务区"这一段必须互为逆序 —— 否则 AUTO 选包在
+    Zoom 区间**重叠**的那几档（9~10 / 12~13 / 15~16）会优先留下更粗的那张图。
+    """
+    java = _java_region_levels()
+    ladder = [
+        RegionLevel.COUNTRY,
+        RegionLevel.PROVINCE,
+        RegionLevel.CITY,
+        RegionLevel.MISSION,
+    ]
+    assert tuple(PLAN_LEVEL_ORDER[: len(ladder)]) == tuple(ladder), (
+        "下载顺序不再是「全国→省→市→任务区」，这条断言的前提变了，"
+        "要么改这里要么改 PLAN_LEVEL_ORDER"
+    )
+
+    specificities = [java[level.value] for level in ladder]
+    assert specificities == sorted(specificities), (
+        f"Android 的具体度应随层级递增，实际为 {dict(zip([l.value for l in ladder], specificities))}"
+    )
+    assert len(set(specificities)) == len(specificities), (
+        "具体度必须两两不同：一旦相等，§5-3 在这一对等级之间就退化成"
+        f"「谁也不比谁优先」，选包会依赖输入顺序。实际为 {specificities}"
+    )
+
+
+def test_an_admin_region_keeps_its_level_and_gains_no_mission_keys() -> None:
+    """MBTiles metadata → manifest 这一步不许把等级弄丢（Slice 25 §4）。
+
+    这个用例直接打 ``_region_from_metadata``（metadata → manifest 的**唯一**
+    翻译点）：它是本次 Bug 的现场 —— 原来 ``geometryVersion`` 跟着
+    "有没有 level"走，而 level 只给任务区写；现在 level 人人都写，
+    那条推导必须改成认等级，否则行政区包会凭空多出一个 ``geometryVersion``，
+    与 ``boundaryVersion`` 说同一件事（同一个事实存两处的经典起点）。
+    """
+    admin = _region_from_metadata(
+        {
+            "region_type": "polygon",
+            "region_id": "hangzhou",
+            "boundary_version": "2026-09",
+            "region_level": "city",
+        }
+    )
+    assert admin is not None
+    assert admin.to_dict() == {
+        "type": "polygon",
+        "id": "hangzhou",
+        "boundaryVersion": "2026-09",
+        "level": "city",
+    }, "行政区包只该多一个 level；geometryVersion 是任务区专属的"
+
+    mission = _region_from_metadata(
+        {
+            "region_type": "polygon",
+            "region_id": "mission-001",
+            "boundary_version": "1:3000.0:abcdef",
+            "region_level": "mission",
+            "buffer_meters": "3000",
+        }
+    )
+    assert mission is not None
+    assert mission.to_dict() == {
+        "type": "polygon",
+        "id": "mission-001",
+        "boundaryVersion": "1:3000.0:abcdef",
+        "level": "mission",
+        "bufferMeters": 3000.0,
+        "geometryVersion": "1:3000.0:abcdef",
+    }, "任务区那一份与 Slice 22 逐字段一致，一个都不许动"
+
+    # 老包（Slice ≤21 的 metadata 没有 region_level）依旧读得出来，
+    # 只是没有 level —— "老包仍可导入"这条不能因为加了等级而破。
+    legacy = _region_from_metadata(
+        {"region_type": "polygon", "region_id": "china", "boundary_version": "2019"}
+    )
+    assert legacy is not None
+    assert legacy.level is None
+    assert "level" not in legacy.to_dict()

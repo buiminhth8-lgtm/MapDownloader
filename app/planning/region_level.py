@@ -111,6 +111,17 @@ class RegionLevel(Enum):
         return self is RegionLevel.CITY
 
     @property
+    def is_mission(self) -> bool:
+        """是不是任务区 / 作业区（航线走廊）。
+
+        这个谓词放在枚举上而不是让使用方写 ``level is RegionLevel.MISSION``：
+        "哪些等级的几何不在资源目录里""哪些等级带走廊半径"这类判断散出去以后，
+        加一级区域时总有人漏改一处。``tests/test_zoom_policy.py`` 的静态守卫
+        正是拦"在 planning 层之外写等级成员名"的那种写法，这个属性就是它的正解。
+        """
+        return self is RegionLevel.MISSION
+
+    @property
     def is_administrative(self) -> bool:
         """是否纳入行政层级规则（全国 / 省 / 市）。
 

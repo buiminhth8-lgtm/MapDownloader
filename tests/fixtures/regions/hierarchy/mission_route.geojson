@@ -1,0 +1,16 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "示例作业航线",
+    "id": "mission-hierarchy",
+    "note": "LineString —— 任务区由这条航线做米制 Buffer 生成，不是行政区边界"
+  },
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [112.2, 32.2],
+      [112.7, 32.9],
+      [113.3, 33.5]
+    ]
+  }
+}

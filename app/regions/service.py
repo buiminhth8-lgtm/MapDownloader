@@ -51,7 +51,11 @@ from app.regions.validator import validate_catalog
 if TYPE_CHECKING:  # pragma: no cover - 只给类型检查器看
     from app.planning.models import ZoomRecommendation
 
-__all__ = ["RegionService"]
+__all__ = [
+    "RegionService",
+    "install_region_catalog_resolver",
+    "uninstall_region_catalog_resolver",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -218,6 +222,48 @@ class RegionService:
             region_id, bounds=bounds, document=document, geometry=geometry
         )
 
+    def resolve_region_geometry(
+        self, region_id: str, bounds: GeoBounds
+    ) -> "tuple[geo_region.DownloadRegion | None, str] | None":
+        """把 ``region_id`` 还原成几何，供 :mod:`app.geo.region` 的动态解析表使用。
+
+        **为什么需要它**（Slice 25 修）：续传与 Inspector 都是从**任务记录 /
+        MBTiles metadata** 出发的，那里只有一个 ``region_id``。``app.geo`` 的
+        :func:`~app.geo.region.region_from_task` 会先查内置扁平预设
+        （``REGION_PRESETS``，目前只有 ``china``），查不到就问一遍动态解析器。
+
+        在 Slice 18 把"内置预设"换成"目录"之后，**目录里的区域**（真实使用时
+        的省市、夹具里的 ``demoland``）恰好两边都不认识 —— 于是"行政区目录里的
+        多边形任务"一旦进入续传路径（计划调度器走的就是这条路）就会报
+        "找不到对应的行政区边界"。这不是防御性代码，而是把一条断掉的线接上。
+
+        返回契约与 :data:`~app.geo.region.RegionResolver` 一致：
+
+        - ``None``：**我不认识这个 id** —— 让后面的解析器（任务区）接着试；
+        - ``(region, "")``：认出来了，几何可用；
+        - ``(None, note)``：认出来了但边界文件不可用。此时调用方**不许**退回
+          矩形（那会悄悄改变任务的定义），而要如实报"几何不可用"。
+
+        Args:
+            region_id: 任务记录 / metadata 里的区域标识。
+            bounds: 当初下单用的候选矩形。**必须用它**而不是从几何重推 ——
+                换一个 bbox 就等于换了一批瓦片，恢复出来的集合与上次对不上。
+        """
+        wanted = str(region_id or "").strip()
+        if not wanted:
+            return None
+        try:
+            preset = self.get_region(wanted)
+        except RegionCatalogError:  # pragma: no cover - get_region 不抛这个
+            return None
+        if preset is None:
+            # 目录里没有 → 不是行政区这一路，交给别的解析器（例如任务区）。
+            return None
+        if not self.boundary_available(wanted):
+            # 认识这个 id，但边界文件不在了。**不要**退回矩形。
+            return None, self.missing_message(wanted)
+        return self.get_download_region(wanted, bounds=bounds), ""
+
     def resolve_path(self, region_id: str) -> Path:
         """边界文件的规范路径（**不检查是否存在**）。"""
         return self.loader.peek_path(region_id)
@@ -340,3 +386,46 @@ class RegionService:
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<RegionService root={self.root} 区域数={len(self.catalog)}>"
+
+
+# --------------------------------------------------------------------------- #
+# 与 app.geo 的挂接（Slice 25）
+# --------------------------------------------------------------------------- #
+#: 当前生效的目录解析器。
+#:
+#: **只保留一个**（后装的顶掉先前的）：允许并存时，"上一个用例 / 上一份配置
+#: 留下的实例"会赢，于是续传拿到的是**另一个目录**里的几何 —— 一个看起来很像
+#: 真的错误结论。任务区那一路（:func:`~app.mission.install_mission_region_resolver`）
+#: 用的是同一条规矩。
+_ACTIVE_CATALOG_RESOLVER: "geo_region.RegionResolver | None" = None
+
+
+def install_region_catalog_resolver(service: RegionService) -> None:
+    """把「按 id 在行政区目录里找几何」的能力挂到 :mod:`app.geo.region` 上。
+
+    为什么需要它：续传（``DownloadTask``）与 Inspector（MBTiles metadata）都只
+    拿得到一个 ``region_id``，它们必须能自己把 id 变回几何。而 ``app.geo`` 是纯
+    计算层，不认识"目录"这件事 —— 所以这里注册一个回调，``app.geo`` 只在
+    "内置扁平预设里找不到这个 id"时问一句。
+
+    与 :func:`~app.mission.install_mission_region_resolver` **同形**（两者注册的
+    是同一个表，按注册顺序询问，不认识就返回 ``None`` 让下一个接着试）。
+    :class:`~app.mission.CompositeRegionService` 在构造时把两者一起装上，
+    所以"忘了在启动时调用"不会悄悄变成"续传不好使"。
+    """
+    global _ACTIVE_CATALOG_RESOLVER
+    if _ACTIVE_CATALOG_RESOLVER is not None:
+        geo_region.unregister_region_resolver(_ACTIVE_CATALOG_RESOLVER)
+    _ACTIVE_CATALOG_RESOLVER = service.resolve_region_geometry
+    geo_region.register_region_resolver(_ACTIVE_CATALOG_RESOLVER)
+    _logger.debug("已注册行政区目录解析器：%s", service.root)
+
+
+def uninstall_region_catalog_resolver(service: RegionService) -> None:
+    """撤掉 :func:`install_region_catalog_resolver` 注册的那个回调。"""
+    global _ACTIVE_CATALOG_RESOLVER
+    geo_region.unregister_region_resolver(service.resolve_region_geometry)
+    if _ACTIVE_CATALOG_RESOLVER is not None and (
+        _ACTIVE_CATALOG_RESOLVER.__self__ is service
+    ):
+        _ACTIVE_CATALOG_RESOLVER = None

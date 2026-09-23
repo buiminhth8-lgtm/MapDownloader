@@ -562,29 +562,38 @@ class DownloadRegion:
         "没有这个键"来猜。``region_id`` / ``boundary_version`` 只在有值时写，
         避免矩形包多出两个空值键。
 
-        **任务区（Slice 22）多写两个键**：``region_level=mission`` 与
-        ``buffer_meters``。这两个键在别的区域类型上依旧不写 ——
-        行政区包多写一个"等级"是噪声（等级能从 ``region_id`` 反查出来），
-        而任务区**反查不出来**（它的几何不在资源目录里），
-        所以必须把"这是什么级别的区域"落在包里（Spec §20）。
+        **``region_level`` 只要有等级就写（Slice 25 修正）**：矩形是 ``custom``、
+        行政区是 ``country`` / ``province`` / ``city``、任务区是 ``mission``。
+        Slice 22 曾以"等级能从 ``region_id`` 反查"为由只给任务区写 ——
+        那句话只对**本工具自己**成立：Android 侧没有区域目录，反查不出来，
+        于是行政区包在那边一律落到"未知等级"，分层选包的等级优先级整条失效。
+        等级是跨端契约（见 ``app/planning/region_level.RegionLevel`` 的
+        docstring："便于将来 Android 侧用同一个字符串沟通"），
+        必须在打包时落进产物里，而不是指望每个读取方都持有同一份目录。
+
+        **``buffer_meters`` 仍然只给任务区写**：走廊半径只对航线有意义（Spec §20）。
         """
         rows = {"region_type": self.region_type.value}
         if self.region_id:
             rows["region_id"] = self.region_id
         if self.boundary_version:
             rows["boundary_version"] = self.boundary_version
-        if self.is_mission:
-            rows["region_level"] = self.region_level.value
-            if self.buffer_meters:
-                rows["buffer_meters"] = _format_meters(self.buffer_meters)
+        rows["region_level"] = self.region_level.value
+        if self.is_mission and self.buffer_meters:
+            rows["buffer_meters"] = _format_meters(self.buffer_meters)
         return rows
 
     def manifest_region(self) -> dict[str, Any]:
         """写进地图包 manifest 的 ``region`` 子对象（Spec §21）。
 
-        任务区多写 ``level`` / ``bufferMeters`` / ``geometryVersion`` 三个键
-        （Spec §19 的字段名）。``type`` 仍然是**几何类型**（``polygon``）而不是
-        ``mission``：这个键在 Slice 16 就定成"矩形还是多边形"，
+        ``level`` **任何有等级的区域都写**（Slice 25 修正，理由同
+        :meth:`metadata_rows`）；``bufferMeters`` 与 ``geometryVersion`` 仍然
+        只有任务区写 —— 走廊半径只对航线有意义，而 ``geometryVersion`` 回答的是
+        "任务区那份**不在资源目录里**的几何是第几版"，行政区那份版本号已经由
+        ``boundaryVersion`` 表达了。
+
+        ``type`` 仍然是**几何类型**（``polygon``）而不是 ``mission``：
+        这个键在 Slice 16 就定成"矩形还是多边形"，
         它的读取方（含 Android）对认不出的取值一律按矩形兜底 ——
         把 ``mission`` 塞进去，等于让老读取方把一个多边形包当矩形看，
         "是哪种区域"改由 ``level`` 表达，两者各管一件事、互不挤占。
@@ -598,8 +607,8 @@ class DownloadRegion:
             data["id"] = self.region_id
         if self.boundary_version:
             data["boundaryVersion"] = self.boundary_version
+        data["level"] = self.region_level.value
         if self.is_mission:
-            data["level"] = self.region_level.value
             if self.buffer_meters:
                 data["bufferMeters"] = float(self.buffer_meters)
             if self.boundary_version:

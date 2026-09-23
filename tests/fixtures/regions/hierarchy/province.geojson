@@ -1,0 +1,21 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "示例省",
+    "id": "demoprovince",
+    "boundaryVersion": "2026-09-hierarchy"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [111.0, 31.0],
+        [114.5, 31.0],
+        [114.5, 33.5],
+        [113.0, 34.5],
+        [111.0, 34.5],
+        [111.0, 31.0]
+      ]
+    ]
+  }
+}

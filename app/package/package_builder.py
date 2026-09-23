@@ -113,6 +113,10 @@ from app.package.models import (
     render_manifest_json,
 )
 from app.package.package_validator import MapPackageValidator, default_inspection_service
+# ``app.planning.region_level`` 是零依赖模块（纯 enum，"刻意不 import 任何东西"），
+# 因此 app.package 依赖它不构成层次倒挂，也不会造出循环 —— 与 app.geo.region
+# 依赖它是同一条边。这里只借它回答一个问题：这个包的几何是不是"任务区自己那份"。
+from app.planning.region_level import RegionLevel
 from app.providers import describe_exception
 
 __all__ = [
@@ -223,10 +227,11 @@ def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
     同时，同一条规则也让"新工具打老包"和"老工具打新包"两个方向都安全：
     前者不凭空多出一个字段，后者只是多读到一个不认识的键（Android 侧忽略）。
 
-    Slice 22 追加两项（只有**任务区**会写它们）：``region_level`` 与
-    ``buffer_meters``。任务区的几何在用户数据目录里，反查不出等级，
-    所以"这是什么级别的区域"必须落在包里；而行政区的等级能从 ``id`` 反查，
-    多写一份只会多一处不同步的地方 —— 因此这两项原样透传、不做任何猜测。
+    Slice 22 追加两项（``region_level`` 与 ``buffer_meters``）；Slice 25 起
+    ``region_level`` **所有区域都写**（矩形 ``custom`` / 行政区 ``country`` 等 /
+    任务区 ``mission``）—— 它是跨端契约，Android 侧没有区域目录，反查不出等级。
+    ``buffer_meters`` 与 ``geometryVersion`` 仍然只有任务区有。
+    这四项都原样透传、不做任何猜测。
     """
     region_type = str(metadata.get("region_type") or "").strip().lower()
     region_id = str(metadata.get("region_id") or "").strip()
@@ -240,10 +245,19 @@ def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
         boundary_version=version or None,
         level=level or None,
         buffer_meters=_optional_float(metadata.get("buffer_meters")),
-        # 写 region_level 的区域（当前只有任务区）其 boundary_version 就是
-        # **几何版本号** —— 两者是同一个事实，因此从同一个来源取值，
-        # 不会出现"boundaryVersion 说 A、geometryVersion 说 B"。
-        geometry_version=((version or None) if level else None),
+        # ``geometryVersion`` 回答的是"任务区那份**不在资源目录里**的几何是第几版"
+        # （Spec §19），所以只有任务区写 —— 行政区的几何版本已经由
+        # ``boundaryVersion`` 表达了，再往 ``geometryVersion`` 抄一份就是
+        # 同一个事实存两处：迟早有人只改一处（Slice 19 的精度回归同源）。
+        # 判据用等级枚举上的 ``is_mission`` 谓词，而不是在这里写
+        # ``RegionLevel.MISSION``：等级成员只许出现在 planning 层
+        # （tests/test_zoom_policy.py 的 AST 守卫会红），
+        # 而"任务区算不算特殊"这件事本来就该由枚举自己回答。
+        geometry_version=(
+            (version or None)
+            if RegionLevel.parse(level).is_mission
+            else None
+        ),
     )
 
 

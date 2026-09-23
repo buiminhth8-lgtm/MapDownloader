@@ -640,8 +640,16 @@ def scene_pipeline(checker: Checker, work_dir: Path, region, panel) -> Path | No
     )
     checker.check(
         manifest.get("region")
-        == {"type": "polygon", "id": REGION_ID, "boundaryVersion": BOUNDARY_VERSION},
-        "manifest.region 三项齐全",
+        == {
+            "type": "polygon",
+            "id": REGION_ID,
+            "boundaryVersion": BOUNDARY_VERSION,
+            # Slice 25（§4）：等级从这一年起**所有区域都写**（行政区反查得出来
+            # 不代表 Android 那边查得到 —— 它没有区域目录）。这个区域是中国，
+            # 所以是 country。
+            "level": "country",
+        },
+        "manifest.region 三项齐全（含 Slice 25 的 level）",
         repr(manifest.get("region")),
     )
     checker.check(

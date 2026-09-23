@@ -27,6 +27,7 @@
 - [计划批量调度（串行执行 / 暂停 / 继续 / 取消 / 重试 / 跳过）](docs/plan_scheduler.md) —— Slice 21
 - [任务区域：航线走廊的高精度离线图](docs/mission_region.md) —— Slice 22
 - [下载风险分析（等级 / 详情 / 强确认 / 计划级四选一）](docs/download_risk_analysis.md) —— Slice 23
+- [**分级离线地图体系（全国 → 省 → 市 → 任务区）**](docs/hierarchical_offline_map.md) —— Slice 16~25 总入口
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -128,19 +129,36 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 23：下载风险分析（把"这一单大不大"从**一个 1 万张的阈值**升级成**一层结论**：
-按张数与容量两个维度分四档 —— 正常 / 较大 / 很大 / 危险，给出原因、建议与逐 Zoom
-明细；面板、日志、确认框读的是同一份报告。启动前按等级保护：较大与很大各确认一次
-（问号 / 警告图标），危险档要求**手输确认词**；计划页有「风险」列与总风险，开始计划
-时四选一（继续 / 采用推荐 Zoom / 停用危险项 / 返回修改）。阈值全在
-`app/planning/risk_policy.py` 一处，界面里没有任何阈值数字）
+Slice 25：分级离线地图体系 E2E + 稳定性收尾（把 Slice 16~24 那条线**接成一个整体**：
+一条可自动跑的 10 段全链路验收 `scripts/hierarchical_map_e2e.py` 覆盖
+层级目录 → Zoom 策略 → 多边形估算 → 任务区 → 风险 → 下载计划 → 调度 → MBTiles →
+Inspector → 打包；补齐分级夹具、三份文档与 README 架构图；并修掉两个跨端缺陷 ——
+**行政区包的 `region.level` 从来没写进包里**（Android 侧只能把它当"未知等级"，
+等级优先级整条失效），以及**目录里的多边形区域无法续传 / 无法被 Inspector 认出来**
+（`region_from_task` 只认内置预设）。详见
+[`docs/hierarchical_offline_map.md`](docs/hierarchical_offline_map.md)）
 
-上一个 Slice（Windows 侧）：Slice 22 —— 任务区域（航线走廊的高精度离线图：
-以航线中心为原点的米制投影上 buffer，得到一块与行政区**完全同构**的多边形区域）
+上一个 Slice（Android 侧）：Slice 24 —— AUTO 按「位置 + Zoom + 区域等级」选包）
+
+再往前（Windows 侧）：Slice 23 —— 下载风险分析（把"这一单大不大"从**一个 1 万张的阈值**
+升级成**一层结论**：按张数与容量两个维度分四档 —— 正常 / 较大 / 很大 / 危险，给出原因、
+建议与逐 Zoom 明细；面板、日志、确认框读的是同一份报告。启动前按等级保护：较大与很大
+各确认一次（问号 / 警告图标），危险档要求**手输确认词**；计划页有「风险」列与总风险，
+开始计划时四选一（继续 / 采用推荐 Zoom / 停用危险项 / 返回修改）。阈值全在
+`app/planning/risk_policy.py` 一处，界面里没有任何阈值数字）
 
 完整链路：
 
 ```text
+    ┌──────────────── 分级的三件事实（Slice 16~25）────────────────┐
+    │ RegionCatalog          (Slice 18：行政层级 国 ⊃ 省 ⊃ 市，      │
+    │    ↓                    目录校验；边界数据不进仓库)            │
+    │ RegionLevel            (Slice 17：country/province/city/       │
+    │    ↓                    mission/custom —— 它是**跨端契约**)    │
+    │ ZoomStrategyService    (Slice 17：等级 → 推荐 Zoom 区间，      │
+    │                         全项目唯一的阈值来源；界面只显示，    │
+    │                         绝不改写用户输入)                      │
+    └───────────────────────────────────────────────────────────────┘
 BoundingBox            (Slice 1：范围与合法性校验)
     ↓
 validate_form          (Slice 7：唯一的下载前校验入口，一次报出全部问题)
@@ -229,8 +247,11 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 `manifest.json` 里有：`formatVersion` / `id` / `name` / `provider` / `mapType` /
 `labels` / `composition` / `tileScheme` / `tileFormat` / `minZoom` / `maxZoom` /
 `bounds { west, south, east, north }` / `tileCount` / `mbtiles { file, size, sha256 }` /
-`createdAt`，以及**可选**的 `region { type, id, boundaryVersion }`（Slice 16：
-多边形包带上"按哪块区域、哪版边界裁的"；老包没有这个键，读作矩形）。三条硬约束：
+`createdAt`，以及**可选**的
+`region { type, id, boundaryVersion, level [, bufferMeters, geometryVersion] }`
+（Slice 16：多边形包带上"按哪块区域、哪版边界裁的"；Slice 25 起 `level` **所有区域都写** ——
+它是唯一一条把"这是什么级别的区域"带过端的通道，Android 没有区域目录、反查不出来；
+`bufferMeters` / `geometryVersion` 只有任务区有。老包没有这些键，读作矩形 + 未知等级）。三条硬约束：
 
 - **不许出现绝对路径**——`mbtiles.file` 永远是 `map.mbtiles`，包换个盘符、换台机器
   都得能用；
@@ -241,6 +262,94 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 25：分级离线地图体系 E2E + 稳定性收尾
+
+到 Slice 24 为止，分级这条线上的每一环单独都测过了：多边形估算、Zoom 策略、
+任务区、风险、计划、调度、打包、Android 选包。**但没有一次"从一块地一路走到一个能导入
+的包"的完整验收** —— 而断裂的恰恰是接缝处。这一版补的就是接缝。
+
+### 一条可自动跑的 10 段全链路
+
+```bash
+cd D:/project/MapDownloader
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py     # 10 段全 PASS，退出码 0
+```
+
+| # | 段 | 验什么 |
+| --- | --- | --- |
+| ① | Region hierarchy | 国 ⊃ 省 ⊃ 市 严格嵌套且**非矩形**（轴对齐矩形会让"相交"退化成"在外包框里"） |
+| ② | Zoom strategy | 四级推荐区间 == `DEFAULT_ZOOM_POLICIES`；自定义等级永不警告 |
+| ③ | Polygon estimate | 候选 > 选中；边界瓦片按**相交**判而不是按中心点 |
+| ④ | Mission region | 500m / 5km / 20km → 走廊面积与选中瓦片**严格单调** |
+| ⑤ | Risk analysis | 全国 Z4~10 = 正常；全国 Z8~18 = 危险；小任务区高 Zoom **不**因 Zoom 高而危险 |
+| ⑥ | Download plan | 顺序 全国 → 省 → 市 → 任务区；停用项不计入合计 |
+| ⑦ | Scheduler | 严格串行（回调里断言"同时只有一项在跑"）；服务端收到的请求数 == 计划总量 |
+| ⑧ | MBTiles | 四份产物落盘、张数与 Zoom 区间对得上 |
+| ⑨ | Inspector | 四个包全 PASS，且**没有**"缺失 N 张"这种按矩形算出来的假结论 |
+| ⑩ | Package | 行政区与任务区各打一个包，核对 `manifest.region` 的每一项 |
+
+全程**离线**：`httpx.MockTransport` 供瓦片，不访问天地图、不需要 Token。
+夹具是自造的合成几何（`tests/fixtures/regions/hierarchy/`），**不是真实国界**。
+跑一遍约 22 秒；四段合计 2,647 张瓦片。
+
+### 这一 Slice 抓出来并修掉的两个缺陷
+
+**① 行政区包的 `region.level` 从来没写进包里。** Slice 22 只给**任务区**写等级，
+理由是"行政区的等级能从 `region_id` 反查" —— 那句话只对 Windows 自己成立。
+Android 没有区域目录：
+
+```text
+Windows:  region_id=hangzhou → 查区域目录 → CITY           ✅
+Android:  region_id=hangzhou → 查不到     → UNKNOWN        ❌ 静默降级
+```
+
+后果**不报错**：包照常导入、照常显示，只是 `OfflineMapSelector` 的 §5-3
+（等级越具体越优先）退化成"谁也不比谁优先"。修法是让产品把等级写进产物
+（`metadata_rows()` / `manifest_region()` / `map_download_service` 三处同源），
+矩形写 `custom` 而不是留空 —— 留空在 Android 侧与"老包没有这条信息"是同一个值，
+而"用户画的一块矩形"与"不知道"不是一回事。
+
+**② 目录里的多边形区域无法续传、也无法被 Inspector 认出来。**
+`region_from_task` 只认内置预设（`china`）与任务区；从**区域目录**里选的行
+（`hangzhou` 之类）走到续传时反查不到几何，于是报"在本版本找不到对应的行政区边界，
+无法安全续传"。修法是给 `app.geo.region` 加一个**目录解析器**注册点，
+由 `app.regions` 在界面入口处装上 —— 这样 `app.geo` 依然是纯计算层，
+不需要反过来 import 业务层（那会立刻造出一个循环）。
+
+两个都是**单测全绿也抓不到**的类型：一个跨端、一个只在"目录里的区域 + 续传"这条
+组合路径上。这也是第 ⑩ 段必须打**真实包**、而不是断言一个字典的原因。
+
+### 验收
+
+```bash
+# 全量单测（Windows）
+cd D:/project/MapDownloader && .venv/Scripts/python.exe -m pytest -q          # 2404 passed
+
+# 主链路（离线）
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py                            # 6 段
+
+# 分级全链路（离线）
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py                      # 10 段
+
+# 历史 Slice 回归（真窗口 / 真按钮）
+for s in verify_slice7_ui verify_slice8_inspector verify_slice9_package \
+         verify_slice10_android verify_slice16_polygon verify_slice17_zoom \
+         verify_slice18_regions verify_slice19_region_ui verify_slice20_plan \
+         verify_slice21_plan_execution verify_slice22_mission_region \
+         verify_slice23_risk verify_resume; do
+  .venv/Scripts/python.exe scripts/$s.py --no-shots
+done
+
+# Android
+cd D:/project/osmdroid && ./gradlew :OpenStreetMapViewer:testDebugUnitTest :OpenStreetMapViewer:assembleDebug
+```
+
+文档：新增 [`docs/hierarchical_offline_map.md`](docs/hierarchical_offline_map.md)
+（体系总览）、`docs/e2e_acceptance_checklist.md` 增加 D 段（D21–D25 分级验收）、
+`docs/troubleshooting.md` 增加 4 条分级相关排查。
+
+---
 
 ## Slice 23：下载风险分析
 
@@ -1456,7 +1565,7 @@ python -m app.main
 ## 测试
 
 ```bash
-python -m pytest                # 1711 passed
+python -m pytest                # 2404 passed
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
@@ -2155,6 +2264,9 @@ cd D:/project/MapDownloader
 # 端到端冒烟（离线，不访问天地图，几秒）
 .venv/Scripts/python.exe scripts/e2e_smoke_test.py
 
+# 分级全链路（离线）：层级 → Zoom → 估算 → 任务区 → 风险 → 计划 → 调度 → MBTiles → Inspector → 包
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py
+
 # 冒烟 + 保留产物便于人工翻看
 .venv/Scripts/python.exe scripts/e2e_smoke_test.py --work-dir ./smoke_keep
 ```
@@ -2180,14 +2292,30 @@ cd D:/project/MapDownloader
 `requireXxx(json, "字段名")` 的键名，与 Windows 的 `MANIFEST_FIELD_ORDER`
 做**双向差集**断言。任何一端单方面改字段，这个测试立刻变红。
 
+Slice 25 在这条思路上又加了一层：**`region.level` 的取值集合两端一致**。
+它同样读 Java 源码（`RegionLevel.java` 的枚举常量），断言 Windows 的值域
+不超出 Android 的、且 Android 只多一个 `UNKNOWN`；还断言两端对"哪一级更具体"
+的排序一致（Windows 的下载顺序 `PLAN_LEVEL_ORDER` 与 Android 的
+`getSpecificity()` 在行政三级 + 任务区这段互为逆序）。
+读不到兄弟仓库时整个模块 **skip 而不是 fail**，但 skip 是看得见的。
+
 ---
 
 ## 端到端验收
 
-真机验收的完整流程（20 步，A1–A7 / B8–B11 / C12–C20）见
+真机验收的完整流程（25 步，A1–A7 / B8–B11 / C12–C20 / **D21–D25**）见
 [`docs/e2e_acceptance_checklist.md`](docs/e2e_acceptance_checklist.md)。
 
 它覆盖了单测覆盖不到的部分：**真窗口、真设备、真的拔网**。
+
+Windows 侧的自动化验收（都是**离线**的，不访问天地图）：
+
+| 脚本 | 覆盖 |
+| --- | --- |
+| `scripts/e2e_smoke_test.py` | 主链路 6 段：Tile Math → MBTiles → Inspector → Package → SHA256 → Validator |
+| `scripts/hierarchical_map_e2e.py` | **分级全链路 10 段**：层级 → Zoom → 估算 → 任务区 → 风险 → 计划 → 调度 → MBTiles → Inspector → 包 |
+| `scripts/verify_slice7_ui.py` … `verify_slice23_risk.py` | 各 Slice 的**真窗口 / 真按钮**验收（13 个脚本） |
+| `scripts/verify_resume.py` | 断点续传（两轮下载，第二轮零请求） |
 
 Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 
@@ -2197,13 +2325,14 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 | `scripts/verify_slice12_offline_runtime.py` | OFFLINE / AUTO / 拔网 |
 | `scripts/verify_slice13_offline_management.py` | 删除、多地图 |
 | `scripts/verify_slice14_offline_stability.py` | 长时间切换、压力 |
+| `scripts/verify_slice24_auto_selection.py` | 真机 AUTO 阶梯（位置 + Zoom + 区域等级）与迟滞 |
 
 ---
 
 ## 常见问题
 
-**完整版见 [`docs/troubleshooting.md`](docs/troubleshooting.md)**（14 类问题）。
-这里是最常遇到的四条：
+**完整版见 [`docs/troubleshooting.md`](docs/troubleshooting.md)**（18 类问题，含分级体系 4 条）。
+这里是最常遇到的几条：
 
 | 症状 | 先查这个 |
 | --- | --- |
@@ -2212,6 +2341,9 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
 | 手机上导入报"校验失败" | 回包目录核对 `mbtiles.size` 与 `sha256` |
 | 切离线后地图空白 | 当前地图页的缩放层级 / 视野位置，是否在包的 zoom 区间与 bounds 内 |
 | 行政区下拉里没有自己加的省 | `resources/regions/index.json` 里补了记录没有；路径写成绝对路径或带 `..` 的条目会被**整条丢弃**并在日志里留一条 `unsafe_path` |
+| 手机上行政区包显示"未知等级" | 包里 `manifest.region.level` 在不在（老包不补，重新打一次） |
+| 续传说"找不到对应的行政区边界" | 那块地的 GeoJSON 还在不在 `resources/regions/` |
+| 计划里后面的项一直"待下载" | 调度是**严格串行**的，这是设计如此 |
 
 **几条"看起来像 bug 其实是设计如此"**：
 
@@ -2223,6 +2355,10 @@ Android 侧有配套的自动化脚本（在 osmdroid 仓库）：
   "还没放文件"是正常中间态；把它算错误，`validate()` 在任何一台干净机器上都会红。
 - **`index.json` 的版本号不认识也不会让目录不可用** —— 那是前向兼容信号，
   已有字段照读，问题只在校验报告里出现。
+- **推荐区间是 Z4~10，界面却允许你填 Z18** —— 推荐只提示、不限制，也**绝不改写**
+  用户填的值。
+- **计划里各项逐项串行、后面全写着"待下载"** —— 严格串行是设计（日志与进度不交错，
+  失败归属明确），不是卡住。
 - **只选中一个省、界面只显示一个范围** —— Slice 18 提供的是**数据源**，
   组合下载计划（全国 + 重点省）是 Slice 19 的事。
 

@@ -1,0 +1,21 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "示例国",
+    "id": "democountry",
+    "boundaryVersion": "2026-09-hierarchy"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [110.0, 30.0],
+        [116.0, 30.0],
+        [116.0, 32.5],
+        [114.0, 36.0],
+        [110.0, 36.0],
+        [110.0, 30.0]
+      ]
+    ]
+  }
+}

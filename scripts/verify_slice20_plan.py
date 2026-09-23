@@ -260,14 +260,18 @@ def scene_entries(app, window, checker: Checker, shots: bool) -> None:
     buttons = panel.plan_buttons()
 
     checker.check(
-        set(buttons) == {ACTION_PLAN_ADD, ACTION_PLAN_OPEN},
+        {ACTION_PLAN_ADD, ACTION_PLAN_OPEN} <= set(buttons),
         "面板上有「加入下载计划」与「查看下载计划」两个按钮",
         str(sorted(buttons)),
     )
+    # 文案用"含"而不是"等于"：Slice 22 在同一条按钮行里加了「任务区域…」，
+    # 那是它的 Slice，不是本脚本的回归。本脚本要守的是"这两个按钮还在、
+    # 文案还是 Spec §10 写的那两句"。
+    texts = [button.text() for button in buttons.values()]
     checker.check(
-        [button.text() for button in buttons.values()] == ["加入下载计划", "查看下载计划"],
+        all(text in texts for text in ("加入下载计划", "查看下载计划")),
         "按钮文案就是 Spec §10 写的那两个",
-        str([button.text() for button in buttons.values()]),
+        str(texts),
     )
     checker.check(
         all(button.isEnabled() for button in buttons.values()),
@@ -313,7 +317,7 @@ def scene_entries(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 # 场景 B：加入计划（推荐 / 自定义两种 Zoom 模式）
 # --------------------------------------------------------------------------- #
-def scene_add_to_plan(app, window, checker: Checker) -> None:
+def scene_add_to_plan(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 B：点「加入下载计划」（真按钮）")
     from app.planning.region_level import RegionLevel
     from app.regions.service import RegionService
@@ -1042,11 +1046,11 @@ def scene_static_guards(checker: Checker) -> None:
         "生成任务时用的是 planned_output_paths（界面 / 校验 / 生成三处共用同一函数）",
         "",
     )
-    checker.check(
-        not list((PROJECT_ROOT / "app" / "planning").glob("*scheduler*")),
-        "没有提前实现 Slice 21 的调度器（Spec §25）",
-        str(sorted(p.name for p in (PROJECT_ROOT / "app" / "planning").glob("*"))),
-    )
+    # 「不许提前实现 Slice 21 的调度器」这条守卫在 Slice 20 当时是对的、现在
+    # 必须去掉：Slice 21 已经落地，`plan_scheduler.py` 是**该有**的文件。
+    # 这类"不许做下一个 Slice"的断言天然只在编写它的那一个 Slice 里成立 ——
+    # 留着它只会在验收脚本里制造一条永远为假的结论（本脚本因为
+    # `scene_add_to_plan` 的 `NameError` 一直没跑到这里，所以没人发现）。
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         window = make_window()
         scene_entries(app, window, checker, shots)
-        scene_add_to_plan(app, window, checker)
+        scene_add_to_plan(app, window, checker, shots)
         page = scene_dialog(app, window, checker, shots)
         if page is not None:
             scene_estimate(app, window, page, checker, shots)

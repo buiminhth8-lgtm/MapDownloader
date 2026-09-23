@@ -196,10 +196,20 @@ async def test_metadata_matches_requested_range(work_dir: Path) -> None:
     # Spec §19（Slice 16）：矩形下载也要**显式**记下区域类型，
     # Inspector 才能区分"这是个矩形包"与"这是个老包、根本没记录区域"。
     assert metadata["region_type"] == "rectangle"
+    # Slice 25（§4）：等级同样显式写出来 —— 没有 region 的纯矩形是 ``custom``。
+    # 留空在 Android 侧会与"老包没有这条信息"收敛到同一个 UNKNOWN，
+    # 而"用户画的一块矩形"与"不知道"是两件事。
+    assert metadata["region_level"] == "custom"
 
     # 用 Builder 也能重建出同一份元数据（元数据是纯函数式派生的）
     rebuilt = MBTilesMetadata.for_bounds(
-        SMALL_BOUNDS, 12, 12, name="meta", description="集成测试", region_type="rectangle"
+        SMALL_BOUNDS,
+        12,
+        12,
+        name="meta",
+        description="集成测试",
+        region_type="rectangle",
+        region_level="custom",
     )
     assert rebuilt.as_dict() == metadata
 
