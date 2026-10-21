@@ -222,8 +222,9 @@ MapResourceManager.applyAuto(lat, lon, zoom)
 | 主链路（离线） | `.venv\Scripts\python.exe scripts\e2e_smoke_test.py` | 6 段：Tile Math → MBTiles → Inspector → Package → SHA256 → Validator |
 | **分级全链路** | `.venv\Scripts\python.exe scripts\hierarchical_map_e2e.py` | 10 段：层级 / Zoom / 多边形估算 / 任务区 / 风险 / 计划 / 调度 / MBTiles / Inspector / 包 |
 | 历史 Slice 回归 | `scripts\verify_slice7_ui.py` … `verify_slice23_risk.py` | 真窗口、真按钮（不是 offscreen） |
-| Android | `cd D:\project\osmdroid && ./gradlew :OpenStreetMapViewer:testDebugUnitTest` | 497 条单测 |
+| Android | `cd D:\project\osmdroid && ./gradlew :OpenStreetMapViewer:testDebugUnitTest` | 538 条单测（含 Slice 25 的 7 条 AUTO 稳定性） |
 | Android 真机 | `python scripts\verify_slice24_auto_selection.py --serial <serial>` | AUTO 阶梯与迟滞 |
+| Android 最终验收 | `python scripts\verify_slice25_final_acceptance.py --serial <serial>` | §26 二十步：导入 / 阶梯 / 回退 / 重启 / 无崩溃 |
 
 `hierarchical_map_e2e.py` 的退出码：`0` 全通过 / `1` 有失败 / `2` 夹具缺失。
 加 `--keep` 可以保留工作目录去翻产物：
