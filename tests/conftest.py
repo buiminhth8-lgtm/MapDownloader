@@ -133,6 +133,51 @@ def region_root(work_dir: Path) -> Path:
 
 
 @pytest.fixture
+def undeployed_region_root(work_dir: Path, monkeypatch) -> Path:
+    """一个**空的**行政区目录：模拟"还没部署边界数据"的机器。
+
+    为什么需要它：``resources/regions/`` 在开发/验收机上可能被部署方放进真实的
+    授权边界数据（仓库本身不带任何边界文件，见 ``app.config.settings`` 里
+    ``REGION_RESOURCE_DIR`` 的说明）。"边界文件缺失"那一类用例因此**不能**依赖
+    默认目录的状态 —— 否则同一份代码在别人的机器上结论相反：Slice 25 实测开发机
+    放入 ``china.geojson`` 之后，四条用例两红一挂一红；挂住的那条是因为 calculate
+    真的去估算全中国 Z8~18，瓦片数是天文数字，永远算不完。
+
+    重定向到空目录：目录读不出来 → 服务退回内置预设（只剩 china 一条、没有层级）
+    → 边界文件不在 → 正是"未部署"那个状态，且与机器上有没有部署数据无关。
+    """
+    from app.geo import region as region_module
+
+    target = work_dir / "regions_undeployed"
+    target.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(region_module, "REGION_RESOURCE_DIR", target)
+    return target
+
+
+@pytest.fixture
+def shipped_catalog_root(work_dir: Path) -> Path:
+    """**随仓库发行**的行政区目录状态：只有 ``index.json``，没有任何边界文件。
+
+    仓库分发的是元数据，边界数据要部署方自己放入（中国国界属法定地图内容，
+    见 ``app.config.settings`` 里 ``REGION_RESOURCE_DIR`` 的说明）。"发行状态"
+    相关的用例（缺边界只报警告、省市还没有数据）因此不能直接读
+    ``resources/regions/`` —— 开发/验收机上可能已经放了授权数据：Slice 25 实测
+    放入 ``china.geojson`` 之后，两条"缺边界只报警告"的用例直接红。
+
+    这里把发行版 ``index.json``（它本身随仓库分发，不受部署影响）复制进空树，
+    重建那个状态，与机器上部署了什么无关。
+    """
+    import shutil as _shutil
+
+    from app.config import settings
+
+    target = work_dir / "regions_shipped"
+    target.mkdir(parents=True, exist_ok=True)
+    _shutil.copy(settings.REGION_RESOURCE_DIR / settings.REGION_INDEX_FILENAME, target)
+    return target
+
+
+@pytest.fixture
 def region_catalog(region_root: Path):
     """挂在可写副本上的目录。"""
     from app.regions import RegionCatalog

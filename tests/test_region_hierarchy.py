@@ -430,9 +430,16 @@ def test_shipped_catalog_contains_no_province_or_city_yet() -> None:
     assert service.catalog.ids == ("china",)
 
 
-def test_shipped_catalog_missing_boundary_is_only_a_warning() -> None:
-    """仓库里没有国界数据 —— 那是**提醒**不是错误，程序照常可用。"""
-    result = RegionService().validate()
+def test_shipped_catalog_missing_boundary_is_only_a_warning(
+    shipped_catalog_root: Path,
+) -> None:
+    """仓库里没有国界数据 —— 那是**提醒**不是错误，程序照常可用。
+
+    ``shipped_catalog_root``：验的是**发行状态**（仓库只带 index.json）。
+    开发/验收机上可能已经部署了授权边界数据，直接读默认目录会让这条用例
+    在别人的机器上结论相反（Slice 25 实测）。
+    """
+    result = RegionService(root=shipped_catalog_root).validate()
 
     assert result.ok is True
     assert result.has(CatalogIssueCode.GEOJSON_NOT_FOUND)

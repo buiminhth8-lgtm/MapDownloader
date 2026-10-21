@@ -360,9 +360,16 @@ def test_service_validation_reports_a_broken_file(region_root: Path) -> None:
     assert result.has(CatalogIssueCode.BOUNDARY_UNREADABLE)
 
 
-def test_shipped_catalog_is_valid_but_warns_about_the_missing_boundary() -> None:
-    """仓库自带目录：本身合法（ok=True），只是还缺那份要用户自己提供的国界数据。"""
-    result = RegionService().validate()
+def test_shipped_catalog_is_valid_but_warns_about_the_missing_boundary(
+    shipped_catalog_root: Path,
+) -> None:
+    """仓库自带目录：本身合法（ok=True），只是还缺那份要用户自己提供的国界数据。
+
+    ``shipped_catalog_root``：验的是**发行状态**（仓库只带 index.json，不带边界）。
+    开发/验收机上可能已经部署了授权边界数据，直接读默认目录会让这条用例
+    在别人的机器上结论相反（Slice 25 实测）。
+    """
+    result = RegionService(root=shipped_catalog_root).validate()
 
     assert result.ok is True
     assert result.checked == 1

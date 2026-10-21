@@ -3461,9 +3461,13 @@ def test_switching_region_type_invalidates_the_previous_estimate(
 
 
 def test_output_edit_cannot_resurrect_a_stale_estimate(
-    window: MainWindow, monkeypatch
+    window: MainWindow, monkeypatch, undeployed_region_root: Path
 ) -> None:
-    """改输出目录 / 勾注记触发的那次重绘，不许把旧结论（或错误提示）盖回来。"""
+    """改输出目录 / 勾注记触发的那次重绘，不许把旧结论（或错误提示）盖回来。
+
+    ``undeployed_region_root``：这条要走的是"边界文件还没部署"的分支，
+    不能看开发机上 ``resources/regions/`` 恰好有没有数据（见夹具说明）。
+    """
     monkeypatch.setattr(window, "_show_error_dialog", lambda *a, **k: None)
     panel = window.download_panel
     _rect_estimate_text(window)
@@ -3484,9 +3488,14 @@ def test_output_edit_cannot_resurrect_a_stale_estimate(
 
 
 def test_polygon_without_boundary_reports_where_to_put_the_file(
-    window: MainWindow, monkeypatch
+    window: MainWindow, monkeypatch, undeployed_region_root: Path
 ) -> None:
-    """边界文件缺失是**明确失败**：说清放哪，绝不退化成矩形。"""
+    """边界文件缺失是**明确失败**：说清放哪，绝不退化成矩形。
+
+    ``undeployed_region_root``：模拟一台还没部署边界数据的机器 —— 仓库不带
+    边界文件（法定地图内容），开发机上可能有部署方放的授权数据，用例不能因此
+    在别人的机器上结论相反。
+    """
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
         window, "_show_error_dialog", lambda title, message: calls.append((title, message))
@@ -3577,9 +3586,13 @@ def test_zoom_hint_follows_the_region_switch(window: MainWindow) -> None:
 
 
 def test_zoom_warning_does_not_block_calculation(
-    window: MainWindow, error_dialogs: list[tuple[str, str]]
+    window: MainWindow, error_dialogs: list[tuple[str, str]], undeployed_region_root: Path
 ) -> None:
-    """警告不阻塞：点「计算」照样走原流程，缩放级别与提示行都原样留着。"""
+    """警告不阻塞：点「计算」照样走原流程，缩放级别与提示行都原样留着。
+
+    ``undeployed_region_root``：没有它，这台开发机上"边界已部署"会让 calculate
+    真的去估算全中国 Z8~18（天文数字的瓦片）——用例挂死而不是失败。
+    """
     panel = window.download_panel
     panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(8, 18)
@@ -3640,8 +3653,16 @@ def _use_region_root(monkeypatch, root: Path) -> None:
     monkeypatch.setattr(region_module, "REGION_RESOURCE_DIR", root)
 
 
-def test_region_combo_is_filled_from_the_catalog(window: MainWindow) -> None:
-    """当前只有中国时，界面上就是那一条（Spec §15）。"""
+def test_region_combo_is_filled_from_the_catalog(
+    undeployed_region_root: Path, window: MainWindow
+) -> None:
+    """当前只有中国时，界面上就是那一条（Spec §15）。
+
+    ``undeployed_region_root`` 放在 ``window`` **前面**：重定向要先于窗口构造生效，
+    组合框在构造时就从空树（退回内置预设）填 —— 断言的正是"还没部署边界数据"时
+    界面怎么说（条目照列、注明未就绪）。开发机上若已部署授权数据，同一条断言
+    会反过来，所以必须重定向。
+    """
     panel = window.download_panel
 
     assert [preset.region_id for preset in panel.region_service.list_presets()] == ["china"]
