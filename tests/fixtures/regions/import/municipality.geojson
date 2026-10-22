@@ -1,0 +1,148 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_country",
+        "name": "测试国",
+        "level": "country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              114,
+              30
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_municipality",
+        "name": "测试直辖市",
+        "level": "直辖市",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              112,
+              32
+            ],
+            [
+              114,
+              32
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              112,
+              34
+            ],
+            [
+              112,
+              32
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_municipality_district",
+        "name": "测试直辖市区",
+        "level": "city",
+        "parent": "test_municipality"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              112,
+              32
+            ],
+            [
+              113,
+              32
+            ],
+            [
+              113,
+              33
+            ],
+            [
+              112,
+              33
+            ],
+            [
+              112,
+              32
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_plain_province",
+        "name": "测试无市省",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              112,
+              30
+            ],
+            [
+              112,
+              32
+            ],
+            [
+              110,
+              32
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

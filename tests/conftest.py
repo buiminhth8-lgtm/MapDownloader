@@ -113,6 +113,61 @@ def preferences():
 REGION_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "regions" / "catalog"
 
 
+# --------------------------------------------------------------------------- #
+# 行政区数据导入（Slice 26）
+# --------------------------------------------------------------------------- #
+#: 导入管线的源数据夹具（只读原件）：``tests/fixtures/regions/import/``。
+#:
+#: 全部是**自建几何**的 FeatureCollection（test_country ⊃ test_province_a/b
+#: ⊃ test_city_a1/a2），外加一批"故意坏"的变体（重复 id、断父级、环、
+#: 点线几何、越界坐标、自相交…）。**没有一条真实行政边界**（Spec §25：
+#: 自动测试不得依赖真实中国边界）。
+REGION_IMPORT_FIXTURE_ROOT = (
+    Path(__file__).resolve().parent / "fixtures" / "regions" / "import"
+)
+
+
+@pytest.fixture
+def region_import_output_root(work_dir: Path) -> Path:
+    """导入管线的默认发布目录（每个用例一个，随工作区清理）。"""
+    return work_dir / "generated"
+
+
+@pytest.fixture
+def import_config_factory(region_import_output_root: Path):
+    """造 :class:`RegionImportConfig` 的工厂（默认指向 sample 夹具）。
+
+    字段映射默认就是 sample 夹具用的那套（code / name / level / parent）；
+    换夹具（如 alt_fields）时在用例里显式传字段名 —— 默认值刻意不猜。
+    """
+
+    def factory(
+        source: str = "sample.geojson",
+        *,
+        output_root: Path | None = None,
+        boundary_version: str = "2026-10-test",
+        id_field: str = "code",
+        name_field: str = "name",
+        level_field: str = "level",
+        parent_field: str | None = "parent",
+        **kwargs,
+    ):
+        from app.regions.importer import RegionImportConfig
+
+        return RegionImportConfig(
+            source_file=REGION_IMPORT_FIXTURE_ROOT / source,
+            id_field=id_field,
+            name_field=name_field,
+            level_field=level_field,
+            parent_field=parent_field,
+            output_root=output_root or region_import_output_root,
+            boundary_version=boundary_version,
+            **kwargs,
+        )
+
+    return factory
+
+
 @pytest.fixture(scope="session")
 def region_fixture_root() -> Path:
     """合成目录的只读原件（用例只读它，不往里写东西）。"""

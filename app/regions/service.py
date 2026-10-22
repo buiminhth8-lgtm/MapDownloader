@@ -43,7 +43,11 @@ from app.geo import region as geo_region
 from app.geo.bounds import GeoBounds
 from app.geo.geojson_loader import GeoJSONDocument
 from app.planning.zoom_strategy import ZoomPlanEstimate, ZoomStrategyService
-from app.regions.catalog import RegionCatalog, region_resource_root
+from app.regions.catalog import (
+    RegionCatalog,
+    effective_region_root,
+    region_resource_root,
+)
 from app.regions.loader import RegionLoader
 from app.regions.models import CatalogValidationResult, RegionCatalogError, RegionPreset
 from app.regions.validator import validate_catalog
@@ -73,6 +77,7 @@ class RegionService:
         *,
         root: Path | None = None,
         strategy: ZoomStrategyService | None = None,
+        prefer_generated: bool = False,
     ) -> None:
         if catalog is not None and root is not None:
             raise ValueError("catalog 与 root 只能给一个：给了目录就不该再指定资源目录")
@@ -81,6 +86,11 @@ class RegionService:
         self._strategy = strategy if strategy is not None else ZoomStrategyService()
         self._cache: RegionCatalog | None = None
         self._catalog_error: str = ""
+        #: 生成数据集（import pipeline 发布的那种）是否优先（Slice 26，§16）。
+        #: **默认关**：默认路径与 Slice 18 逐字节一致，测试与验收脚本继续
+        #: monkeypatch ``REGION_RESOURCE_DIR`` 就行。要"导入后不用重启就看
+        #: 到新数据"的调用方（主窗口）显式打开它。
+        self._prefer_generated = bool(prefer_generated)
 
     # ------------------------------------------------------------------ #
     # 目录 / 加载器
@@ -89,7 +99,9 @@ class RegionService:
     def root(self) -> Path:
         """资源根目录。
 
-        显式给了 ``root`` / ``catalog`` 就用那个；否则**每次访问都重新读**
+        显式给了 ``root`` / ``catalog`` 就用那个；``prefer_generated=True``
+        且两者都没给时走 :func:`~app.regions.catalog.effective_region_root`
+        （生成数据集已发布则优先，否则手工目录）；否则**每次访问都重新读**
         ``app.geo.region.REGION_RESOURCE_DIR`` 这个模块全局 —— 验收脚本与测试
         把内置资源重定向到临时目录时，这个服务会自动跟着走，不必再多同步一处。
         """
@@ -97,6 +109,8 @@ class RegionService:
             return self._explicit_root.resolve()
         if self._explicit_catalog is not None:
             return self._explicit_catalog.root
+        if self._prefer_generated:
+            return effective_region_root().resolve()
         return region_resource_root().resolve()
 
     @property
@@ -150,6 +164,49 @@ class RegionService:
     def loader(self) -> RegionLoader:
         """与当前目录配套的加载器。"""
         return RegionLoader(self.catalog, root=self.root)
+
+    # ------------------------------------------------------------------ #
+    # 重载（Slice 26，Spec §17）
+    # ------------------------------------------------------------------ #
+    def reload(self) -> RegionCatalog:
+        """立刻重读目录（导入新数据集后调用，无需重启程序）。
+
+        语义（Spec §17）：
+
+        - 成功 → 返回新目录，:attr:`catalog_error` 清空；
+        - **失败 → 继续保留旧 Catalog**，错误原因记进 :attr:`catalog_error`
+          并打一条 ERROR 日志。一个刚发布失败 / 被手删的 index.json 不该
+          让整个"行政区域"功能当场炸掉 —— 用户此刻还可能正看着旧数据。
+
+        注意与 :attr:`catalog` 的自动失效（``stale()`` 比对 mtime/size）
+        的分工：那个是"文件被改过就重读"的兜底，本方法是"我刚发布完，
+        现在就重新读"的显式动作。根目录也会重新解析 —— 发布前它是手工
+        目录、发布后可能切到 generated（``prefer_generated=True`` 时）。
+
+        注入的目录（``catalog=``）不会自己变，reload 对它直接返回原对象。
+        """
+        if self._explicit_catalog is not None:
+            return self._explicit_catalog
+        root = self.root
+        try:
+            fresh = RegionCatalog.load(root=root)
+        except RegionCatalogError as exc:
+            previous = self._cache
+            self._catalog_error = str(exc)
+            _logger.error(
+                "行政区目录重读失败，继续使用%s：%s",
+                "旧目录" if previous is not None else "内置预设兜底",
+                exc,
+            )
+            if previous is not None and previous.root == root:
+                return previous
+            catalog = self._fallback_catalog(root)
+            self._cache = catalog
+            return catalog
+        self._cache = fresh
+        self._catalog_error = ""
+        _logger.debug("行政区目录已重读：%s（%d 条）", root, len(fresh))
+        return fresh
 
     # ------------------------------------------------------------------ #
     # 层级查询（Spec §10）

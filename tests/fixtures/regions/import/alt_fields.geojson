@@ -1,0 +1,113 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "GBCODE": "alt_country",
+        "NAME": "别名字段国",
+        "LEVEL": "1",
+        "PARENT": ""
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              100,
+              20
+            ],
+            [
+              104,
+              20
+            ],
+            [
+              104,
+              24
+            ],
+            [
+              100,
+              24
+            ],
+            [
+              100,
+              20
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "GBCODE": "alt_province",
+        "NAME": "别名字段省",
+        "LEVEL": "2",
+        "PARENT": "alt_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              100,
+              20
+            ],
+            [
+              102,
+              20
+            ],
+            [
+              102,
+              22
+            ],
+            [
+              100,
+              22
+            ],
+            [
+              100,
+              20
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "GBCODE": "alt_city",
+        "NAME": "别名字段市",
+        "LEVEL": "3",
+        "PARENT": "alt_province"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              100,
+              20
+            ],
+            [
+              101,
+              20
+            ],
+            [
+              101,
+              21
+            ],
+            [
+              100,
+              21
+            ],
+            [
+              100,
+              20
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

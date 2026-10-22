@@ -57,6 +57,7 @@ __all__ = [
     "REGION_ROOT_KEY",
     "RegionCatalog",
     "region_resource_root",
+    "effective_region_root",
     "parse_index_payload",
 ]
 
@@ -87,6 +88,41 @@ REGION_ROOT_KEY: str = "regions"
 def region_resource_root() -> Path:
     """行政区资源的根目录（**调用时**读全局，见模块文档）。"""
     return Path(region_module.REGION_RESOURCE_DIR)
+
+
+def effective_region_root() -> Path:
+    """当前生效的行政区数据根目录（Slice 26，Spec §16 / §17）。
+
+    生成数据集（:data:`app.config.settings.REGION_DATA_ROOT`，即
+    ``resources/regions/generated/``）**已发布**时选它，否则回退手工资源
+    目录（:func:`region_resource_root`）—— "如果 generated dataset 不存在，
+    继续使用现有 Region Root"（Spec §27 兼容性）。
+
+    目录层**不区分**两种来源：手工数据与导入器生成的数据用的是同一套
+    index.json 格式（Spec §16"RegionCatalog 无需知道数据是手工或 Importer
+    生成"）。判断只发生在"选哪个根目录"这一刻，且判断依据是**文件在不在**，
+    不是某个开关 —— 开关会骗人（"以为发了其实没发"），文件不会。
+
+    测试与验收脚本应继续 monkeypatch ``app.geo.region.REGION_RESOURCE_DIR``
+    （或显式传 ``root=``）：只有当调用方**明确要求**"生成数据优先"时才走
+    这里（见 :class:`~app.regions.service.RegionService` 的
+    ``prefer_generated``），默认路径的行为与 Slice 18 逐字节一致。
+    """
+    from app.config import settings as settings_module
+
+    generated = Path(settings_module.REGION_DATA_ROOT)
+    index = generated / INDEX_FILENAME
+    if index.is_file():
+        # 光有 index.json 还不够：发布是原子的，正常不会留下坏文件，但
+        # 目录可能被外部弄坏（手删、半截写入）。"文件在但读不出"时不能算
+        # "已发布"，否则用户会从上一份能用的数据退化成扁平内置预设
+        # （Spec §17"Reload 失败时继续保留旧 Catalog"）。
+        try:
+            RegionCatalog.load(root=generated)
+        except RegionCatalogError:
+            return region_resource_root()
+        return generated
+    return region_resource_root()
 
 
 # --------------------------------------------------------------------------- #

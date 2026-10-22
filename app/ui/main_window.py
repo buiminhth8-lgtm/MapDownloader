@@ -173,6 +173,7 @@ from app.planning.risk_level import RiskLevel
 from app.planning.risk_models import DownloadRiskReport
 from app.planning.zoom_strategy import ZoomStrategyService
 from app.providers import TiandituProvider, TileTestResult, mask_url
+from app.regions.importer import RegionImportService
 from app.regions.models import RegionCatalogError
 from app.regions.service import RegionService
 from app.services import (
@@ -205,6 +206,7 @@ from app.ui.download_worker import DownloadWorker
 from app.ui.download_plan_dialog import DownloadPlanDialog
 from app.ui.log_panel import LogPanel
 from app.ui.mission_region_dialog import MissionRegionDialog
+from app.ui.region_data_import_dialog import RegionDataImportDialog
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import RegionSelection, UiPreferences
@@ -475,11 +477,24 @@ class MainWindow(QMainWindow):
         #: 注册的是一个回调：``app.geo`` 不认识任务区，它只在"行政区预设里找不到
         #: 这个 id"时问一句。**后装上的会顶掉先前那一个**（见 app.mission 的说明）。
         self.mission_service.install()
+        #: 行政区目录服务（Slice 26：**生成数据集优先**）。
+        #: 窗口与下载面板共用这一个实例：导入发布后对它 reload() 一次，
+        #: 界面级联下拉与规划层（计划 / 续传 / Inspector）同时看到新数据，
+        #: 不需要重启程序（Spec §17）。``prefer_generated`` 的语义与默认关闭
+        #: 的理由见 :class:`~app.regions.service.RegionService`。
+        self.region_catalog_service = RegionService(
+            strategy=self.strategy, prefer_generated=True
+        )
+        #: Slice 26：行政区数据导入服务。发布目录默认
+        #: ``resources/regions/generated/``（``settings.REGION_DATA_ROOT``），
+        #: 与上面那个目录服务是"写"与"读"的两半 —— 导入窗口只认它，
+        #: 界面级联只认目录服务，两者在 ``dataset_imported`` 那一刻交接。
+        self.region_import_service = RegionImportService()
         #: 行政区 + 任务区合成一个入口（Spec §18）：规划层（计划构建 / 估算 /
         #: 校验）只认一套接口，合成之后"一个计划里既有中国又有某条航线"不需要
         #: 改动规划层的任何一行。
         self.region_service = CompositeRegionService(
-            RegionService(strategy=self.strategy), self.mission_service
+            self.region_catalog_service, self.mission_service
         )
         self.plan_service = (
             plan_service
@@ -498,7 +513,11 @@ class MainWindow(QMainWindow):
         )
 
         # 四大面板 + 当前任务进度区
-        self.download_panel = DownloadPanel(self)
+        #: 下载面板共用上面那个行政区目录服务（Slice 26）：导入发布后
+        #: reload + ``reload_region_cascade()`` 两步，级联下拉立刻换数据。
+        self.download_panel = DownloadPanel(
+            self, region_service=self.region_catalog_service
+        )
         #: 当前任务进度面板（Slice 7，Spec §5）。
         self.task_progress = TaskProgressPanel(self)
         self.device_panel = DevicePanel(self)
@@ -550,6 +569,10 @@ class MainWindow(QMainWindow):
         #: Slice 22：任务区域窗口。同上（它本身没有后台线程，但"关掉再打开
         #: 复用同一个实例"能保住用户刚填的名称 / 航线 / 半径，省得重填一遍）。
         self._mission_dialog: MissionRegionDialog | None = None
+        #: Slice 26：行政区数据管理窗口。同一条约定（复用实例能保住用户
+        #: 刚选的源文件与字段映射）；发布成功后面板级联由
+        #: ``dataset_imported`` 信号触发刷新。
+        self._region_data_dialog: RegionDataImportDialog | None = None
 
         # --- Slice 10：Android 传输的三个后台线程与三个非模态弹窗 --------
         #: 设备刷新线程（adb version + devices -l + getprop）
@@ -646,6 +669,18 @@ class MainWindow(QMainWindow):
             lambda: self.open_package_validator()
         )
         file_menu.addAction(self.validate_package_action)
+
+        #: Slice 26：行政区数据管理（导入授权 GeoJSON → 发布生成数据集）。
+        #: 与检查 / 打包一样是独立工具，放「文件」菜单；入口文案与窗口标题
+        #: 一致（Spec §18），不另起名字。
+        self.region_data_action = QAction("行政区数据管理(&R)…", self)
+        self.region_data_action.setToolTip(
+            "导入授权行政区 GeoJSON，发布成 RegionCatalog 直接可用的生成数据集"
+        )
+        self.region_data_action.triggered.connect(
+            lambda: self.open_region_data_dialog()
+        )
+        file_menu.addAction(self.region_data_action)
         file_menu.addSeparator()
 
         quit_action = QAction("退出(&Q)", self)
@@ -3422,6 +3457,48 @@ class MainWindow(QMainWindow):
         """任务区被新建 / 删除 → 只记一条日志（列表本身在窗口里已经刷新过了）。"""
         regions = self.mission_service.list_all()
         self.log_panel.append_log(f"任务区已更新：当前共 {len(regions)} 个")
+
+    @Slot()
+    def open_region_data_dialog(self) -> None:
+        """打开行政区数据管理窗口（Slice 26，Spec §18）。
+
+        与任务区窗口同一约定：主窗口持有引用、复用同一个实例，非模态。
+        窗口拿到的是**目录服务本身**（不是副本）—— 发布成功后它调
+        ``reload()``，本窗口再顺势重填下载面板的级联下拉，两边看到的是
+        同一份新数据（Spec §17 / §24）。
+        """
+        dialog = self._region_data_dialog
+        if dialog is None:
+            dialog = RegionDataImportDialog(
+                self.region_import_service,
+                self.region_catalog_service,
+                self,
+            )
+            dialog.dataset_imported.connect(self._on_region_dataset_imported)
+            self._region_data_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.log_panel.append_log(
+            "打开行政区数据管理：发布目录 "
+            f"{self.region_import_service.output_root}"
+        )
+
+    @Slot()
+    def _on_region_dataset_imported(self) -> None:
+        """行政区数据集发布成功 → 重填下载面板的级联下拉（Spec §24）。
+
+        目录服务已经在对话框里 reload 过，这里只做界面刷新：三段下拉的
+        数据来源自始至终是 ``RegionService``（面板不自己维护行政区列表），
+        所以"刷新"就是把同样的查询再做一遍。
+        """
+        self.download_panel.reload_region_cascade()
+        catalog = self.region_catalog_service.catalog
+        self.log_panel.append_log(
+            f"行政区数据集已更新：当前目录 {len(catalog)} 条"
+            f"（根目录 {catalog.root}）"
+        )
+        self.statusBar().showMessage("行政区数据已更新，国家 / 省 / 市下拉已刷新", 8000)
 
     def map_token(self) -> str:
         """当前天地图 Token（下载计划页要拿它建瓦片源）。

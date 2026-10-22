@@ -46,9 +46,15 @@ PLANNING_DIR = APP_DIR / "planning"
 #: "任务区这一级叫 MISSION"，并把这件事收在 :data:`MISSION_REGION_LEVEL`
 #: 一处 —— 任务区层里凡是要问"我是哪一级"的地方都引用它，而不是各写一遍
 #: ``RegionLevel.MISSION``（那才会让"任务区属于哪一级"散落成多份）。
+#:
+#: ``app/regions/importer/models.py``（Slice 26）同属**定义**：导入管线的
+#: ``DEFAULT_LEVEL_ALIASES`` 是"外部数据等级字面量 → RegionLevel"的唯一定义
+#: 点（"country→COUNTRY、直辖市→PROVINCE"），Spec §19 的统计标签也绑定等级。
+#: "谁挂谁"的嵌套规则仍只在 planning 层（hierarchy_builder 用谓词，不写成员名）。
 _LEVEL_LITERAL_ALLOWED = {
     APP_DIR / "geo" / "region.py",
     APP_DIR / "mission" / "models.py",
+    APP_DIR / "regions" / "importer" / "models.py",
 }
 
 #: Spec §3 点名的四个层级（顺序即文档顺序）。

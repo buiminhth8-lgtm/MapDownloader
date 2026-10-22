@@ -1,0 +1,112 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_country",
+        "name": "测试国",
+        "level": "country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              114,
+              30
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "dup_province",
+        "name": "重复省甲",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              112,
+              30
+            ],
+            [
+              112,
+              32
+            ],
+            [
+              110,
+              32
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "dup_province",
+        "name": "重复省乙",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              112,
+              32
+            ],
+            [
+              114,
+              32
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              112,
+              34
+            ],
+            [
+              112,
+              32
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

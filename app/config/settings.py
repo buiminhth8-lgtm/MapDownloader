@@ -326,6 +326,21 @@ REGION_RESOURCE_DIR: Path = (
     Path(__file__).resolve().parents[2] / "resources" / "regions"
 )
 
+#: 行政区数据导入管线的**默认发布目录**（Slice 26）：
+#: ``<仓库根>/resources/regions/generated``。
+#:
+#: 与 :data:`REGION_RESOURCE_DIR`（手工维护的目录）分开：手工数据是"人一条
+#: 条加进 index.json 的"，生成数据是"整批发布、整批替换"的，两者混在一个
+#: 目录里迟早互相覆盖。发布是原子的（见
+#: :mod:`app.regions.importer.region_exporter`），失败时旧目录原样。
+#:
+#: 生成数据集存在时（该目录下有 ``index.json``），
+#: :func:`app.regions.catalog.effective_region_root` 会优先选它 ——
+#: RegionCatalog 不需要知道数据是手工的还是导入器生成的（Slice 26 §16）。
+#: 生成目录本身也受 ``resources/regions/**/*.geojson`` 的 gitignore 规则
+#: 保护（授权数据的再分发条件由提供方决定，别顺手提交）。
+REGION_DATA_ROOT: Path = REGION_RESOURCE_DIR / "generated"
+
 #: 行政区域目录元数据的固定文件名（Slice 18）。它是**元数据**（有哪些区域、
 #: 谁是谁的上级、边界文件在哪），不是边界数据，因此随程序一起进仓库。
 REGION_INDEX_FILENAME: str = "index.json"

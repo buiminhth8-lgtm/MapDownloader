@@ -1,0 +1,76 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_country",
+        "name": "测试国",
+        "level": "country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              114,
+              30
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "bowtie_province",
+        "name": "自相交省",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110.0,
+              30.0
+            ],
+            [
+              112.0,
+              30.0
+            ],
+            [
+              110.0,
+              32.0
+            ],
+            [
+              112.0,
+              32.0
+            ],
+            [
+              110.0,
+              30.0
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_country",
+        "name": "测试国",
+        "level": "country",
+        "parent": "somewhere"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              114,
+              30
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "city_under_country",
+        "name": "直辖错市级",
+        "level": "city",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              112,
+              30
+            ],
+            [
+              112,
+              32
+            ],
+            [
+              110,
+              32
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "province_under_province",
+        "name": "省挂省",
+        "level": "province",
+        "parent": "city_under_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              112,
+              32
+            ],
+            [
+              114,
+              32
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              112,
+              34
+            ],
+            [
+              112,
+              32
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

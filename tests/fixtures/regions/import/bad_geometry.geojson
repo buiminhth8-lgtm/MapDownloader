@@ -1,0 +1,137 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "test_country",
+        "name": "测试国",
+        "level": "country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              114,
+              30
+            ],
+            [
+              114,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "point_feature",
+        "name": "点要素",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          111.0,
+          31.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "line_feature",
+        "name": "线要素",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            111.0,
+            31.0
+          ],
+          [
+            112.0,
+            32.0
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "null_geometry",
+        "name": "无几何",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": null
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "empty_geometry",
+        "name": "空几何",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": []
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "code": "out_of_range",
+        "name": "越界坐标",
+        "level": "province",
+        "parent": "test_country"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              110,
+              30
+            ],
+            [
+              200,
+              30
+            ],
+            [
+              200,
+              34
+            ],
+            [
+              110,
+              34
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -266,7 +266,12 @@ class DownloadPanel(QGroupBox):
     #: 重算的完整链路）。
     apply_recommended_zoom_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        region_service: RegionService | None = None,
+    ) -> None:
         super().__init__("地图配置 / 下载区域", parent)
 
         #: 当前界面状态（决定四个动作按钮的可用性）。必须在构建按钮**之前**
@@ -276,7 +281,15 @@ class DownloadPanel(QGroupBox):
         #: 行政区目录服务（Slice 18）。构造时不传参数 → 它跟随
         #: ``app.geo.region.REGION_RESOURCE_DIR`` 这个全局，验收脚本把资源重定向到
         #: 临时目录时面板会自动跟着走（与 Slice 16 的行为一致）。
-        self._region_service = RegionService()
+        #: Slice 26：主窗口显式注入 ``prefer_generated=True`` 的实例 ——
+        #: 导入发布的数据集（``resources/regions/generated/``）存在时优先选它，
+        #: 不存在时行为与本行原来的默认值逐字节一致。测试与验收脚本继续用
+        #: 默认构造（不传），免得开发机上的一份生成数据悄悄改变用例前提。
+        self._region_service = (
+            region_service
+            if region_service is not None
+            else RegionService()
+        )
 
         #: 级联选择 + Zoom 模式（Slice 19，Spec §12）。面板只画控件、转发事件、
         #: 渲染结论；"国家 → 省 → 市"的推导与"等级 → Zoom"的映射都在控制器里
@@ -529,6 +542,16 @@ class DownloadPanel(QGroupBox):
             self._fill_city_combo()
         finally:
             self._syncing = False
+
+    def reload_region_cascade(self) -> None:
+        """公开版 :meth:`_reload_region_cascade`（Slice 26，Spec §17 / §24）。
+
+        行政区数据导入发布成功后，主窗口调它把三段下拉重填一遍 ——
+        面板自己**不维护**行政区名称列表（数据一律来自
+        :class:`~app.regions.RegionService`），所以"刷新"就是把同样的
+        查询再做一遍，不存在两份状态要同步。
+        """
+        self._reload_region_cascade()
 
     def _fill_country_combo(self) -> None:
         """填「国家」下拉并选中当前那一个。"""
