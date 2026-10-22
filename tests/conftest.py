@@ -57,6 +57,54 @@ def work_dir() -> Path:
         shutil.rmtree(path, ignore_errors=True)
 
 
+@pytest.fixture(autouse=True)
+def isolate_generated_region_data(monkeypatch) -> Path:
+    """把「生成行政区数据集」的默认根**隔离**到一个空目录。
+
+    为什么必须 autouse
+    ------------------
+    :data:`app.config.settings.REGION_DATA_ROOT` 是**模块导入时算好的绝对路径**
+    （``<仓库根>/resources/regions/generated``）。而
+    :func:`app.regions.catalog.effective_region_root` 读的正是它 —— 只要该目录
+    里有 ``index.json`` 就优先用它。
+
+    于是"开发/验收机上跑过一遍导入脚本"这件事，会悄悄改变**整个测试套件**的
+    结论。实测（本机部署了 3253 条真实区域）：
+
+    * 19 条用合成夹具（``demoland`` 之类）的用例拿到真实数据，断言全错；
+    * 每个 :class:`~app.ui.main_window.MainWindow` 都要加载 3253 条，
+      ``test_ui_smoke.py`` 从 **44 秒**涨到 **400 秒以上**。
+
+    只 monkeypatch ``app.geo.region.REGION_RESOURCE_DIR`` 挡不住它：那是**另一个
+    模块的另一个常量**，与 ``settings.REGION_DATA_ROOT`` 在导入时就已经各自固化，
+    改一个不会带着另一个走。
+
+    隔离之后会发生什么
+    ------------------
+    ``effective_region_root()`` 看到这里没有 ``index.json`` → 回退到手工根
+    （``region_resource_root()``），而手工根由各用例用 :func:`region_root` /
+    :func:`undeployed_region_root` / :func:`shipped_catalog_root` 自己指定。
+    结论从此只取决于夹具，与机器上部署了什么无关。
+
+    需要真的读生成数据的用例（``test_region_import_service`` 里那几个）自己再
+    ``monkeypatch.setattr(settings_module, "REGION_DATA_ROOT", ...)``：函数参数
+    fixture 在 autouse 之后应用，后写的覆盖先写的。
+
+    Yields:
+        那个空目录（**存在**，但没有 ``index.json``）。
+    """
+    from app.config import settings as settings_module
+
+    # 与 :func:`work_dir` 同一个理由用 ``tempfile.mkdtemp`` 而不是 ``tmp_path``：
+    # 本机 ``pytest-of-<user>`` 根会被沙箱拦在 PermissionError 上。
+    path = Path(tempfile.mkdtemp(prefix="mbtiles-nogenerated-"))
+    try:
+        monkeypatch.setattr(settings_module, "REGION_DATA_ROOT", path)
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.fixture
 def tasks_file() -> Path:
     """任务记录文件（Slice 5 ``tasks.json``）的独立临时路径。

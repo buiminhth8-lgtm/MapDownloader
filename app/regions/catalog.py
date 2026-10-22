@@ -103,10 +103,16 @@ def effective_region_root() -> Path:
     生成"）。判断只发生在"选哪个根目录"这一刻，且判断依据是**文件在不在**，
     不是某个开关 —— 开关会骗人（"以为发了其实没发"），文件不会。
 
-    测试与验收脚本应继续 monkeypatch ``app.geo.region.REGION_RESOURCE_DIR``
-    （或显式传 ``root=``）：只有当调用方**明确要求**"生成数据优先"时才走
-    这里（见 :class:`~app.regions.service.RegionService` 的
-    ``prefer_generated``），默认路径的行为与 Slice 18 逐字节一致。
+    测试与验收脚本：只有想测"生成数据优先"这条分支时才走这里（见
+    :class:`~app.regions.service.RegionService` 的 ``prefer_generated``），
+    默认路径的行为与 Slice 18 逐字节一致。
+
+    **隔离时要注意两个常量是分开的**：本函数读
+    :data:`app.config.settings.REGION_DATA_ROOT`，而
+    :func:`region_resource_root` 读 ``app.geo.region.REGION_RESOURCE_DIR``
+    —— 两者都在各自模块导入时固化，patch 其中一个**不会**带动另一个。
+    测试里由 ``tests/conftest.py`` 的 ``isolate_generated_region_data``
+    统一把前者指到空目录，因此结论与"本机是否部署过真实行政区数据"无关。
     """
     from app.config import settings as settings_module
 

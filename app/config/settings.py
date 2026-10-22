@@ -339,6 +339,12 @@ REGION_RESOURCE_DIR: Path = (
 #: RegionCatalog 不需要知道数据是手工的还是导入器生成的（Slice 26 §16）。
 #: 生成目录本身也受 ``resources/regions/**/*.geojson`` 的 gitignore 规则
 #: 保护（授权数据的再分发条件由提供方决定，别顺手提交）。
+#:
+#: **测试注意**：这是模块导入时固化的绝对路径，patch ``app.geo.region`` 的
+#: ``REGION_RESOURCE_DIR`` **不会**带动它（两个不同模块的两个常量）。
+#: ``tests/conftest.py`` 的 ``isolate_generated_region_data`` 会在每个用例里
+#: 把它指到一个空目录 —— 否则本机部署过的真实数据会污染断言，并让每个
+#: ``MainWindow`` 都去加载几千条区域（实测 UI 套件慢十倍）。
 REGION_DATA_ROOT: Path = REGION_RESOURCE_DIR / "generated"
 
 #: 行政区域目录元数据的固定文件名（Slice 18）。它是**元数据**（有哪些区域、
