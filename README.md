@@ -28,6 +28,7 @@
 - [任务区域：航线走廊的高精度离线图](docs/mission_region.md) —— Slice 22
 - [下载风险分析（等级 / 详情 / 强确认 / 计划级四选一）](docs/download_risk_analysis.md) —— Slice 23
 - [**分级离线地图体系（全国 → 省 → 市 → 任务区）**](docs/hierarchical_offline_map.md) —— Slice 16~25 总入口
+- [行政区数据导入管线（授权 GeoJSON → RegionCatalog）](docs/region_data_pipeline.md) —— Slice 26
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
 - [地图包格式](#地图包格式)
@@ -129,7 +130,18 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 25：分级离线地图体系 E2E + 稳定性收尾（把 Slice 16~24 那条线**接成一个整体**：
+Slice 26：行政区数据导入管线（Region Data Pipeline）。真实工程不能靠手工维护
+`resources/regions/index.json` + `province/*.geojson` + `city/*.geojson`，本 Slice 提供
+一条完整管线把**合法授权的 GeoJSON FeatureCollection** 变成 RegionCatalog 直接可用的
+生成数据集：SourceReader（字段名可配置）→ GeometryNormalizer（is_valid / WGS84 / make_valid）
+→ HierarchyBuilder（COUNTRY→PROVINCE→CITY 校验 + 直辖市兼容）→ CatalogGenerator
+（GeoJSON + index.json + manifest）→ 全量校验 → **原子发布**到 `resources/regions/generated/`。
+配套：GUI「行政区数据管理」窗口（字段映射下拉从源数据键动态填、[验证] 显示统计、FAIL 禁导入）、
+CLI `scripts/import_regions.py`。RegionCatalog 加 `effective_region_root()`（生成目录优先但须
+"可解析"），`RegionService.reload()` 失败保留旧 Catalog。**本工具只提供导入能力，不下载、抓取
+或分发来源不明的行政边界数据**。详见 [`docs/region_data_pipeline.md`](docs/region_data_pipeline.md)
+
+上一个 Slice：Slice 25 —— 分级离线地图体系 E2E + 稳定性收尾（把 Slice 16~24 那条线**接成一个整体**：
 一条可自动跑的 10 段全链路验收 `scripts/hierarchical_map_e2e.py` 覆盖
 层级目录 → Zoom 策略 → 多边形估算 → 任务区 → 风险 → 下载计划 → 调度 → MBTiles →
 Inspector → 打包；补齐分级夹具、三份文档与 README 架构图；并修掉两个跨端缺陷 ——
@@ -262,6 +274,79 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 26：行政区数据导入管线（Region Data Pipeline）
+
+到 Slice 25 为止，分级链路的**数据**是手工维护的（`resources/regions/index.json` +
+`province/*.geojson` + `city/*.geojson`）。真实工程不能靠人肉手写全国几百个省市边界。
+这一版补的是"把授权数据导进目录"那条线。
+
+### 一条管线：授权 GeoJSON → RegionCatalog 生成数据集
+
+```text
+Authorized Region Dataset (GeoJSON FeatureCollection)
+  → SourceReader（字段名可配置，不假设外部数据用固定键名）
+  → GeometryNormalizer（is_valid / WGS84 / make_valid 修轻伤记 warning）
+  → HierarchyBuilder（COUNTRY→PROVINCE→CITY 校验：parent/duplicate/cycle/level）
+  → CatalogGenerator（逐 Region GeoJSON + index.json + dataset manifest）
+  → 全量校验（PASS / WARNING / FAIL）
+  → Atomic Publish（临时目录 → 原子替换 resources/regions/generated/）
+  → RegionCatalog（与手工数据同一套格式，无需知道来源）
+```
+
+### 关键取舍
+
+- **字段名不假设**：`id_field / name_field / level_field / parent_field` 都可由用户配置；
+  等级支持别名映射（`country/province/city`、`1/2/3`、`全国/省/市`、`直辖市→省级`）。
+- **Region id 稳定且文件名安全**：优先用源数据里的行政区 code，不合
+  `[A-Za-z0-9_.-]` 时统一 sanitize 并保留 `originalCode`，不拿中文名称随机生成。
+- **默认不 simplify**：行政边界是"裁到哪个瓦片"的唯一依据，默认禁用几何简化，
+  避免边界 Tile 漏下载。
+- **原子发布**：source → 临时 build 目录 → 全量校验 → 原子替换，失败保留旧数据。
+- **直辖市兼容**：直辖市经等级映射落省级；源数据没有市级层时省照常可用，**不伪造
+  不存在的 City Feature**。
+- **合规**：只提供导入工具，不下载、抓取或分发来源不明的行政边界数据；生成目录整体
+  gitignore（含其 index.json/manifest.json）。
+
+### 接入与 UI
+
+- `RegionCatalog` 支持 `REGION_DATA_ROOT`（默认 `resources/regions/generated/`），
+  `effective_region_root()` 选"已发布**且可解析**"的生成目录，否则回退手工目录；
+  `RegionService.reload()` 失败保留旧 Catalog。
+- GUI「行政区数据管理」（文件菜单）：字段映射下拉从源数据 properties 键动态填，
+  [验证] 显示 Spec §19 统计（FAIL 禁导入）、[导入] 原子发布；提示框非模态。
+- CLI `scripts/import_regions.py`：全参数、`--check` dry-run、失败 non-zero exit。
+
+### 这一 Slice 抓出来并修掉的缺陷
+
+1. **静态守卫冲突**：`test_zoom_policy.py` 用 AST 拦"planning 层外硬编码
+   `RegionLevel.COUNTRY`"。正解不是加白名单，而是让 importer 复用单一权威 ——
+   层级判断用谓词（`is_country/is_province/is_city`）、计数用 `ADMINISTRATIVE_LEVELS`
+   推导、沿用条目用 `entry.level`；只有 `DEFAULT_LEVEL_ALIASES`（外部字符串→等级映射，
+   定义性质）进白名单。
+2. **对话框构造即崩**：`_set_result_text` 初始化少传 `verdict` 关键字，从没测过构造
+   所以没暴露 —— UI 测试抓出来的。
+3. **坏 generated/index.json 会让用户退化成扁平预设**：`effective_region_root()` 从
+   "文件在就算已发布"改成"存在**且可解析**"，坏文件正确回退手工目录。
+
+### 验收
+
+```bash
+# 全量单测（含 6 组 importer/UI 用例 + 11 个自建几何夹具，不依赖真实中国边界）
+.venv/Scripts/python.exe -m pytest                                   # 2491 passed / 4 skipped
+
+# 主链路（离线）
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py                   # 6/6
+
+# 分级全链路（离线）
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py             # 10/10
+
+# CLI 导入夹具（10 项确认：Dataset PASS / GeoJSON / index.json / parent / bounds /
+# reload / Zoom Z4~10 Z9~13 Z12~16 / Polygon 估算）
+.venv/Scripts/python.exe scripts/import_regions.py \
+  --source tests/fixtures/regions/import/sample.geojson \
+  --boundary-version 2026-10 --output /tmp/out
+```
 
 ## Slice 25：分级离线地图体系 E2E + 稳定性收尾
 
