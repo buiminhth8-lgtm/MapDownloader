@@ -1,18 +1,20 @@
-# Region Data Pipeline —— 行政区数据导入管线（Slice 26）
+# Region Data Pipeline —— 行政区数据导入管线（Slice 26 / 27）
 
-> 这份文档回答一个问题：**合法授权的行政区边界数据，怎么从一份 GeoJSON
-> 变成 RegionCatalog 能直接用的「全国 → 省 → 市」目录。**
+> 这份文档回答一个问题：**合法授权的行政区边界数据，怎么从 GeoJSON
+> 变成 RegionCatalog 能直接用的「全国 → 省 → 市 → 县」目录。**
 >
 > 前置：Slice 16（Polygon 下载）、Slice 18（RegionCatalog / RegionService）、
-> Slice 19（国家→省→市级联 UI）、Slice 25（分级离线地图 E2E 收尾）。
+> Slice 19（国家→省→市级联 UI）、Slice 25（分级离线地图 E2E 收尾）、
+> Slice 27（新增「县」级 + 天地图省/市/县三份数据的专用导入脚本）。
 
 ---
 
 ## 1. 一句话：把"手工维护 index.json + 逐个手写边界文件"换成"导一份数据"
 
-Slice 18 的 RegionCatalog 已经支持 `COUNTRY → PROVINCE → CITY` 三级，但那套
+Slice 18 的 RegionCatalog 支持 `COUNTRY → PROVINCE → CITY`，Slice 27 起加
+`COUNTY`（县 / 区 / 旗 / 县级市）一级，那套
 `resources/regions/index.json` + `province/*.geojson` + `city/*.geojson` 是**手工
-维护**的。真实工程不能靠人肉手写全国几百个省市边界。
+维护**的。真实工程不能靠人肉手写全国几百个省市县边界。
 
 本 Slice 提供一条完整管线，把授权数据变成目录：
 
@@ -26,7 +28,7 @@ SourceReader          读 FeatureCollection，按字段映射取 id/name/level/p
 GeometryNormalizer    校验 is_valid / WGS84 范围 / 几何类型，make_valid 修轻伤
         │
         ▼
-HierarchyBuilder      建 COUNTRY→PROVINCE→CITY，查 parent/duplicate/cycle/level
+HierarchyBuilder      建 COUNTRY→PROVINCE→CITY→COUNTY，查 parent/duplicate/cycle/level
         │
         ▼
 CatalogGenerator      逐 Region 写 GeoJSON + 生成 index.json + dataset manifest
@@ -41,7 +43,7 @@ Atomic Publish        临时目录建好 → 原子替换 resources/regions/gene
 RegionCatalog         与手工数据用同一套格式，Catalog 无需知道来源
         │
         ▼
-Country / Province / City UI（下载面板级联下拉）
+Country / Province / City / County UI（下载面板四级联下拉）
 ```
 
 **本工具只提供导入能力，不自动下载、抓取或分发来源不明的行政边界数据。**
@@ -136,9 +138,33 @@ python scripts/import_regions.py \
 ### 5.2 GUI（主窗口 → 文件 → 行政区数据管理）
 
 选源文件 → 字段映射自动按源数据键名填好 → 填边界版本 / 来源 / 授权说明 →
-点「验证」看统计（总区域 / COUNTRY / PROVINCE / CITY / Geometry Invalid /
+点「验证」看统计（总区域 / COUNTRY / PROVINCE / CITY / COUNTY / Geometry Invalid /
 Missing Parent / Duplicate ID + PASS/WARNING/FAIL）→ FAIL 时导入按钮禁用 →
 点「导入」原子发布。
+
+### 5.3 天地图中国行政区划（`scripts/import_china_admin_regions.py`，Slice 27）
+
+天地图官网的行政区划数据是**省 / 市 / 县三份独立文件**，字段只有 ``{name, gb}``
+（没有 level / parent）。这个脚本把三份文件整理成一份四级 FeatureCollection 再导入：
+
+```bash
+python scripts/import_china_admin_regions.py \
+  --province "Downloads/中国_省 (1).geojson" \
+  --city "Downloads/中国_市.geojson" \
+  --county "Downloads/中国_县.geojson" \
+  --boundary-version 2026-10 \
+  --source-license "天地图官网下载" \
+  --check          # 先验证；去掉 --check 真正发布到 resources/regions/generated/
+```
+
+脚本做的整理（见脚本 docstring 与 `tests/test_import_china_admin_regions.py`）：
+
+- 过滤 ``gb`` 为空的"境界线"Feature（国界 / 省界线）；
+- 合成全国条目（``id=china``，几何 = 34 个省几何的 ``unary_union``，不造矩形）；
+- 父级从 ``gb`` 前缀推导：市 → 省、县 → 市；
+- **行政级别有歧义的单位去重**：直辖市 / 港澳台（省文件里已是省级）跳过市文件
+  那份；不设区的市（东莞 / 中山 / 嘉峪关 / 儋州，gb 后两位 ``00``）归市级；
+  省直辖县级市 / 县（济源 / 仙桃 / 海南直辖县 / 新疆兵团市）归县级、挂省。
 
 ---
 

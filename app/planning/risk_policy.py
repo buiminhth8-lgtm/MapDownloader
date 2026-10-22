@@ -75,6 +75,9 @@ LEVEL_ADVICE: dict[RegionLevel, str] = {
     RegionLevel.CITY: (
         "建议按 {range_text} 下载城市范围，高精度作业区请改用任务区域（航线走廊）。"
     ),
+    RegionLevel.COUNTY: (
+        "建议按 {range_text} 下载县区范围；县级下到高 Zoom，注意单县也会产生大量瓦片。"
+    ),
     RegionLevel.MISSION: (
         "任务区建议按 {range_text}；总量仍然偏大时请缩小航线范围或减小 Buffer 半径。"
     ),

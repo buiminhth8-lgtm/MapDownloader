@@ -253,6 +253,7 @@ class RegionImportResult:
             f"COUNTRY：{self.count_of(RegionLevel.COUNTRY)}",
             f"PROVINCE：{self.count_of(RegionLevel.PROVINCE)}",
             f"CITY：{self.count_of(RegionLevel.CITY)}",
+            f"COUNTY：{self.count_of(RegionLevel.COUNTY)}",
             f"Geometry Invalid：{self.geometry_invalid}",
             f"Missing Parent：{self.missing_parent}",
             f"Duplicate ID：{self.duplicate_id}",
@@ -292,14 +293,21 @@ DEFAULT_LEVEL_ALIASES: dict[str, RegionLevel] = {
     "州": RegionLevel.PROVINCE,
     "盟": RegionLevel.PROVINCE,
     "地区": RegionLevel.PROVINCE,
-    # 市级（市 / 区县 / 县 / 旗）
+    # 市级（市 / 自治州 / 盟）
     "city": RegionLevel.CITY,
     "3": RegionLevel.CITY,
     "市": RegionLevel.CITY,
     "市级": RegionLevel.CITY,
-    "区县": RegionLevel.CITY,
-    "县": RegionLevel.CITY,
-    "旗": RegionLevel.CITY,
+    # 县级（县 / 区 / 旗 / 县级市 —— Slice 27）
+    "county": RegionLevel.COUNTY,
+    "4": RegionLevel.COUNTY,
+    "县": RegionLevel.COUNTY,
+    "区": RegionLevel.COUNTY,
+    "区县": RegionLevel.COUNTY,
+    "县级": RegionLevel.COUNTY,
+    "县级市": RegionLevel.COUNTY,
+    "自治县": RegionLevel.COUNTY,
+    "旗": RegionLevel.COUNTY,
 }
 
 
@@ -577,7 +585,7 @@ class RegionDatasetManifest:
             ``properties.boundaryVersion`` 一致）。
         source_name: 数据来源名称。
         created_at: 发布时间（ISO 8601，本地时区）。
-        region_count / country_count / province_count / city_count: 条数。
+        region_count / country_count / province_count / city_count / county_count: 条数。
         source_license: 授权说明。
         source_description: 可选补充说明。
 
@@ -593,6 +601,7 @@ class RegionDatasetManifest:
     country_count: int = 0
     province_count: int = 0
     city_count: int = 0
+    county_count: int = 0
     source_license: str = ""
     source_description: str = ""
 
@@ -607,6 +616,7 @@ class RegionDatasetManifest:
             "countryCount": self.country_count,
             "provinceCount": self.province_count,
             "cityCount": self.city_count,
+            "countyCount": self.county_count,
             "sourceLicense": self.source_license,
             "sourceDescription": self.source_description,
         }
@@ -630,6 +640,7 @@ class RegionDatasetManifest:
             country_count=_int(payload.get("countryCount")),
             province_count=_int(payload.get("provinceCount")),
             city_count=_int(payload.get("cityCount")),
+            county_count=_int(payload.get("countyCount")),
             source_license=str(payload.get("sourceLicense") or ""),
             source_description=str(payload.get("sourceDescription") or ""),
         )
@@ -639,7 +650,8 @@ class RegionDatasetManifest:
         return (
             f"{self.boundary_version}：{self.region_count} 个区域"
             f"（全国 {self.country_count} / 省 {self.province_count} / "
-            f"市 {self.city_count}），来源 {self.source_name or '未注明'}"
+            f"市 {self.city_count} / 县 {self.county_count}），"
+            f"来源 {self.source_name or '未注明'}"
         )
 
 

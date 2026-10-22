@@ -75,6 +75,13 @@ DEFAULT_ZOOM_POLICIES: dict[RegionLevel, ZoomPolicy] = {
         warning_max_zoom=16,
         description="城市级地图适合城市范围任务规划。",
     ),
+    RegionLevel.COUNTY: ZoomPolicy(
+        level=RegionLevel.COUNTY,
+        recommended_min_zoom=14,
+        recommended_max_zoom=18,
+        warning_max_zoom=18,
+        description="县级地图适合街道级高精度浏览，单县范围较小、适合下到高 Zoom。",
+    ),
     RegionLevel.MISSION: ZoomPolicy(
         level=RegionLevel.MISSION,
         recommended_min_zoom=15,

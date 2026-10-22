@@ -244,15 +244,16 @@ def test_the_mission_level_is_a_real_hierarchy_level() -> None:
 
 
 def test_the_hierarchy_order_puts_mission_after_city_and_before_custom() -> None:
-    """顺序是**契约**（Spec §20）：全国 → 省 → 市 → 任务区 → 自定义。
+    """顺序是**契约**（Spec §20）：全国 → 省 → 市 → 县 → 任务区 → 自定义。
 
-    任务区排在市级之后，因为它是"在已经选好的底图上补高精度走廊"；
+    任务区排在县级之后，因为它是"在已经选好的底图上补高精度走廊"；
     自定义排在最后，因为它最不可预期。
     """
     assert PLAN_LEVEL_ORDER == (
         RegionLevel.COUNTRY,
         RegionLevel.PROVINCE,
         RegionLevel.CITY,
+        RegionLevel.COUNTY,
         RegionLevel.MISSION,
         RegionLevel.CUSTOM,
     )

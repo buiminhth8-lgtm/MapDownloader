@@ -168,6 +168,7 @@ PLAN_LEVEL_ORDER: tuple[RegionLevel, ...] = (
     RegionLevel.COUNTRY,
     RegionLevel.PROVINCE,
     RegionLevel.CITY,
+    RegionLevel.COUNTY,
     RegionLevel.MISSION,
     RegionLevel.CUSTOM,
 )

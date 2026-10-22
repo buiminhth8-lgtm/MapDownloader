@@ -57,11 +57,12 @@ _LEVEL_LITERAL_ALLOWED = {
     APP_DIR / "regions" / "importer" / "models.py",
 }
 
-#: Spec §3 点名的四个层级（顺序即文档顺序）。
+#: 有"等级规则"的五个层级（顺序即文档顺序）。``CUSTOM`` 不算：它没有规则。
 _HIERARCHY_LEVELS = (
     RegionLevel.COUNTRY,
     RegionLevel.PROVINCE,
     RegionLevel.CITY,
+    RegionLevel.COUNTY,
     RegionLevel.MISSION,
 )
 
@@ -87,6 +88,7 @@ def test_region_level_values_are_the_persisted_contract() -> None:
         "COUNTRY": "country",
         "PROVINCE": "province",
         "CITY": "city",
+        "COUNTY": "county",
         "MISSION": "mission",
         "CUSTOM": "custom",
     }
@@ -109,7 +111,8 @@ def test_region_level_display_names_are_present_and_unique() -> None:
         (RegionLevel.CITY, RegionLevel.CITY),
         # 认不出来 → CUSTOM（读历史数据的宽容路径）
         ("全国", RegionLevel.CUSTOM),
-        ("county", RegionLevel.CUSTOM),
+        ("county", RegionLevel.COUNTY),
+        ("countyy", RegionLevel.CUSTOM),
         (7, RegionLevel.CUSTOM),
     ],
 )

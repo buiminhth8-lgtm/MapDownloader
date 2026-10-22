@@ -345,8 +345,13 @@ class RegionPreset:
         return self.level.is_city
 
     @property
+    def is_county(self) -> bool:
+        """是不是县级（县 / 区 / 旗 / 县级市）。"""
+        return self.level.is_county
+
+    @property
     def is_administrative(self) -> bool:
-        """是否纳入行政层级规则（全国 / 省 / 市）。"""
+        """是否纳入行政层级规则（全国 / 省 / 市 / 县）。"""
         return self.level.is_administrative
 
     @property

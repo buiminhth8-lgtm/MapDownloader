@@ -107,8 +107,9 @@ def _check_hierarchy(catalog: RegionCatalog, issues: list[CatalogIssue]) -> None
             # MISSION / CUSTOM 允许挂在任何区域下，等级规则对它们不适用（Spec §6）
             continue
 
-        expected = PARENT_LEVEL_RULES.get(entry.level)
-        if expected is None:
+        allowed_parents = PARENT_LEVEL_RULES.get(entry.level)
+        if not allowed_parents:
+            # 空集合 = 必须是层级的根（全国级）。
             issues.append(
                 CatalogIssue(
                     CatalogIssueCode.COUNTRY_HAS_PARENT,
@@ -118,12 +119,16 @@ def _check_hierarchy(catalog: RegionCatalog, issues: list[CatalogIssue]) -> None
                 )
             )
             continue
-        if parent.level is not expected:
+        if parent.level not in allowed_parents:
+            allowed_text = " / ".join(
+                item.display_name
+                for item in sorted(allowed_parents, key=lambda level: level.value)
+            )
             issues.append(
                 CatalogIssue(
                     CatalogIssueCode.PARENT_LEVEL_INVALID,
                     f"{entry.level.display_name}区域的上级必须是"
-                    f"{expected.display_name}，但 {parent_id!r} 是"
+                    f"{allowed_text}之一，但 {parent_id!r} 是"
                     f"{parent.level.display_name}",
                     entry.id,
                 )

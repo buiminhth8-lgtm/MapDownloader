@@ -245,6 +245,21 @@ class RegionService:
             item for item in self.catalog.list_children(province_id) if item.is_city
         )
 
+    def list_counties(self, parent_id: str) -> tuple[RegionPreset, ...]:
+        """某个市（或省）下的县级区域（Slice 27）。
+
+        县的父级可能是市（绝大多数），也可能是省（直辖市 / 省直辖县级市），
+        所以这里**不限定父级等级**，只按 ``parent_id`` 查下级里的县级条目 ——
+        调用方传"当前选中的市"或"当前选中的省"都能查到。
+
+        Raises:
+            RegionCatalogError: ``parent_id`` 不在目录里。
+        """
+        self.require_region(parent_id)
+        return tuple(
+            item for item in self.catalog.list_children(parent_id) if item.is_county
+        )
+
     def children(self, parent_id: str | None) -> tuple[RegionPreset, ...]:
         """直接下级（``None`` 表示"全部根节点"）。"""
         return self.catalog.list_children(parent_id)

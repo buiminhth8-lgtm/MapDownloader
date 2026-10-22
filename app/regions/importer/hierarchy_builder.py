@@ -165,15 +165,16 @@ def _check_parent(
         return None
 
     if not parent_ref:
+        if level.is_city:
+            hint = "市级条目必须挂在一个省下面"
+        elif level.is_county:
+            hint = "县级条目必须挂在一个市或省下面"
+        else:
+            hint = "省级条目必须挂在全国下面"
         issues.append(
             RegionImportIssue(
                 RegionImportIssueCode.PARENT_MISSING,
-                f"{level.display_name}条目没有父级引用"
-                + (
-                    "（市级条目必须挂在一个省下面）"
-                    if level.is_city
-                    else "（省级条目必须挂在全国下面）"
-                ),
+                f"{level.display_name}条目没有父级引用（{hint}）",
                 label,
             )
         )
@@ -234,6 +235,29 @@ def _check_parent(
             )
         )
         return None
+    if level.is_county:
+        # 县级条目的父级是市或省（省直辖县 / 直辖市的下辖区）。
+        # 直接挂全国 / 挂别的等级都是层级错误。
+        if parent_level.is_country:
+            issues.append(
+                RegionImportIssue(
+                    RegionImportIssueCode.PARENT_LEVEL_INVALID,
+                    "县级条目直接挂在了全国下面：中间必须有市级或省级"
+                    "（直辖市的下辖区挂在那个直辖市上）",
+                    label,
+                )
+            )
+            return None
+        if not (parent_level.is_city or parent_level.is_province):
+            issues.append(
+                RegionImportIssue(
+                    RegionImportIssueCode.PARENT_LEVEL_INVALID,
+                    f"县级条目的父级必须是市级或省级，实际是{parent_level.display_name}"
+                    f"（{parent.name}）",
+                    label,
+                )
+            )
+            return None
     return parent_key
 
 

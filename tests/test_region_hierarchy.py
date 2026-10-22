@@ -81,6 +81,7 @@ def test_administrative_levels_are_derived_from_the_parent_table() -> None:
         RegionLevel.COUNTRY,
         RegionLevel.PROVINCE,
         RegionLevel.CITY,
+        RegionLevel.COUNTY,
     }
 
 
@@ -125,6 +126,61 @@ def test_city_must_hang_under_a_province_once_removed_from_a_country() -> None:
     )
 
     assert validate_catalog(catalog).ok is True
+
+
+def test_county_may_hang_under_a_city() -> None:
+    """县挂在市下是正常形态（Slice 27）。"""
+    catalog = _catalog(
+        _entry("c", RegionLevel.COUNTRY),
+        _entry("p", RegionLevel.PROVINCE, "c"),
+        _entry("t", RegionLevel.CITY, "p"),
+        _entry("x", RegionLevel.COUNTY, "t"),
+    )
+
+    assert validate_catalog(catalog).ok is True
+
+
+def test_county_may_hang_under_a_province_directly() -> None:
+    """县直接挂省是**合法**的（直辖市的下辖区 / 省直辖县级市，Slice 27）。
+
+    中国行政区划里，北京 / 上海 / 天津 / 重庆的下辖区、海南 / 湖北 / 新疆兵团
+    的直辖县都没有"市级"这一级 —— 把它们判成层级错误会让整个直辖市用不了。
+    """
+    catalog = _catalog(
+        _entry("c", RegionLevel.COUNTRY),
+        _entry("p", RegionLevel.PROVINCE, "c"),
+        _entry("x", RegionLevel.COUNTY, "p"),
+    )
+
+    assert validate_catalog(catalog).ok is True
+
+
+def test_county_may_not_hang_directly_under_a_country() -> None:
+    """``COUNTY`` 直接挂 ``COUNTRY`` 是**非法**的（跳了至少一级）。"""
+    catalog = _catalog(
+        _entry("c", RegionLevel.COUNTRY),
+        _entry("x", RegionLevel.COUNTY, "c"),
+    )
+
+    result = validate_catalog(catalog)
+
+    assert result.has(CatalogIssueCode.PARENT_LEVEL_INVALID)
+    (issue,) = result.errors
+    assert issue.region_id == "x"
+    assert "市" in issue.message and "省" in issue.message
+
+
+def test_county_may_not_hang_under_a_mission_or_custom() -> None:
+    """县挂任务区 / 自定义区域都是非法（父级只许市或省）。"""
+    catalog = _catalog(
+        _entry("c", RegionLevel.COUNTRY),
+        _entry("p", RegionLevel.PROVINCE, "c"),
+        _entry("m", RegionLevel.MISSION, "p"),
+        _entry("x", RegionLevel.COUNTY, "m"),
+    )
+
+    result = validate_catalog(catalog)
+    assert result.has(CatalogIssueCode.PARENT_LEVEL_INVALID)
 
 
 def test_dangling_parent_is_an_error() -> None:

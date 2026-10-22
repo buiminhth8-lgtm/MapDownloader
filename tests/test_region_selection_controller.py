@@ -189,10 +189,65 @@ def test_province_without_cities_is_not_an_error(work_dir: Path) -> None:
     assert controller.level is RegionLevel.PROVINCE
 
 
+def test_county_is_the_deepest_selection(work_dir: Path) -> None:
+    """国 → 省 → 市 → 县四级：选到县时等级才是县级（Slice 27）。"""
+    root = _catalog_root(
+        work_dir,
+        [
+            {"id": "demoland", "name": "示例国", "level": "country", "parentId": None,
+             "geojson": "country/demoland.geojson"},
+            {"id": "northland", "name": "示例北省", "level": "province",
+             "parentId": "demoland", "geojson": "province/northland.geojson"},
+            {"id": "rivertown", "name": "示例河市", "level": "city",
+             "parentId": "northland", "geojson": "city/rivertown.geojson"},
+            {"id": "hilltown", "name": "示例山县", "level": "county",
+             "parentId": "rivertown", "geojson": "county/hilltown.geojson"},
+        ],
+    )
+    controller = RegionSelectionController(RegionService(root=root))
+    controller.select_country("demoland")
+    controller.select_province("northland")
+    controller.select_city("rivertown")
+    controller.select_county("hilltown")
+
+    assert controller.selected_region_id == "hilltown"
+    assert controller.level is RegionLevel.COUNTY
+    assert controller.county is not None and controller.county.id == "hilltown"
+    # 县下面没有更细的行政级（目录里没有挂到 hilltown 下的条目）
+    assert controller.service.children("hilltown") == ()
+
+
+def test_county_may_hang_directly_under_a_province(work_dir: Path) -> None:
+    """县挂省（直辖市 / 省直辖县）时，跳过市这一级也能选中（Slice 27）。"""
+    root = _catalog_root(
+        work_dir,
+        [
+            {"id": "demoland", "name": "示例国", "level": "country", "parentId": None,
+             "geojson": "country/demoland.geojson"},
+            {"id": "northland", "name": "示例直辖市", "level": "province",
+             "parentId": "demoland", "geojson": "province/northland.geojson"},
+            {"id": "hilltown", "name": "示例区", "level": "county",
+             "parentId": "northland", "geojson": "county/hilltown.geojson"},
+        ],
+    )
+    controller = RegionSelectionController(RegionService(root=root))
+    controller.select_country("demoland")
+    controller.select_province("northland")
+
+    # 没有市级：list_cities 空，但 list_counties 直接按省查得到
+    assert controller.list_cities() == ()
+    counties = controller.list_counties("northland")
+    assert [item.id for item in counties] == ["hilltown"]
+
+    assert controller.select_county("hilltown") is True
+    assert controller.level is RegionLevel.COUNTY
+    assert controller.selected_region_id == "hilltown"
+
+
 def test_non_administrative_entry_cannot_be_selected(
     work_dir: Path,
 ) -> None:
-    """任务区 / 自定义条目不进三段级联：界面上没有这一段下拉（Spec §18 不实现 Mission）。"""
+    """任务区 / 自定义条目不进四段级联：界面上没有这一段下拉（Spec §18 不实现 Mission）。"""
     root = _catalog_root(
         work_dir,
         [
@@ -205,7 +260,7 @@ def test_non_administrative_entry_cannot_be_selected(
     controller = RegionSelectionController(RegionService(root=root))
 
     assert controller.select_region("site-a") is False
-    assert "只支持国家 / 省 / 市" in controller.error
+    assert "只支持国家 / 省 / 市 / 县" in controller.error
 
 
 # --------------------------------------------------------------------------- #

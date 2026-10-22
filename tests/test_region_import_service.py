@@ -75,9 +75,10 @@ def test_validate_reports_the_spec19_statistics(
     assert lines[1] == "COUNTRY：1"
     assert lines[2] == "PROVINCE：2"
     assert lines[3] == "CITY：2"
-    assert lines[4] == "Geometry Invalid：0"
-    assert lines[5] == "Missing Parent：0"
-    assert lines[6] == "Duplicate ID：0"
+    assert lines[4] == "COUNTY：0"
+    assert lines[5] == "Geometry Invalid：0"
+    assert lines[6] == "Missing Parent：0"
+    assert lines[7] == "Duplicate ID：0"
     assert lines[-1] == "结果：PASS"
 
 

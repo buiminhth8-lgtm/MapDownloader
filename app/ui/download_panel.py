@@ -157,10 +157,14 @@ _RESULT_PLACEHOLDER = "尚未计算"
 #: 于是等级自动落回上一级（只选中国 → COUNTRY，选了省 → PROVINCE）。
 _ANY_PROVINCE_TEXT = "全部（不限定省份）"
 _ANY_CITY_TEXT = "全部（不限定城市）"
+_ANY_COUNTY_TEXT = "全部（不限定县区）"
 
 #: 省下面确实没有城市级数据时，城市下拉里那一项改成的文案。
 #: 这与"还没选省"是两回事：后者是用户的操作顺序问题，前者是数据问题。
 _NO_CITY_TEXT = "（该省暂无城市级数据）"
+
+#: 市/省下面确实没有县级数据时，县区下拉里那一项改成的文案。
+_NO_COUNTY_TEXT = "（该市/省暂无县级数据）"
 
 #: 未做连通性测试时展示的占位文案
 _CONNECTION_PLACEHOLDER = "尚未测试"
@@ -401,17 +405,19 @@ class DownloadPanel(QGroupBox):
             "行政区域：按行政区边界精确裁剪，只下载与区域相交的瓦片"
         )
 
-        # --- Slice 19：国家 → 省 → 市 三段级联（Spec §1 / §2）---
-        # 三段下拉的条目一律来自 RegionService（控制器负责问），面板不解析
+        # --- Slice 19：国家 → 省 → 市 三段级联（Spec §1 / §2）；Slice 27 加"县"---
+        # 四段下拉的条目一律来自 RegionService（控制器负责问），面板不解析
         # index.json、不扫 GeoJSON、不推导 parent。
         self._country_combo = QComboBox(self)
         self._province_combo = QComboBox(self)
         self._city_combo = QComboBox(self)
-        for combo in (self._country_combo, self._province_combo, self._city_combo):
+        self._county_combo = QComboBox(self)
+        for combo in (self._country_combo, self._province_combo, self._city_combo, self._county_combo):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(12)
         self._province_combo.setToolTip("留空表示不限定省份 —— 这时下载的是整个国家")
         self._city_combo.setToolTip("留空表示不限定城市 —— 这时下载的是整个省")
+        self._county_combo.setToolTip("留空表示不限定县区 —— 这时下载的是整个市（或省直辖的县）")
 
         #: 「下载级别」是**推导**出来的（市 → 省 → 国），不是让用户选的第四项。
         #: 让它可点会与三段下拉互相打架（"选了城市却把级别设成国家级"该怎么算？），
@@ -452,6 +458,7 @@ class DownloadPanel(QGroupBox):
         self._country_title = QLabel("国家", self)
         self._province_title = QLabel("省份", self)
         self._city_title = QLabel("城市", self)
+        self._county_title = QLabel("县区", self)
 
         grid = QGridLayout()
         grid.addWidget(QLabel("区域类型", self), 0, 0)
@@ -463,21 +470,23 @@ class DownloadPanel(QGroupBox):
         grid.addWidget(self._province_combo, 2, 1, 1, 3)
         grid.addWidget(self._city_title, 3, 0)
         grid.addWidget(self._city_combo, 3, 1, 1, 3)
-        grid.addWidget(self._level_title, 4, 0)
-        grid.addWidget(self._level_label, 4, 1, 1, 3)
+        grid.addWidget(self._county_title, 4, 0)
+        grid.addWidget(self._county_combo, 4, 1, 1, 3)
+        grid.addWidget(self._level_title, 5, 0)
+        grid.addWidget(self._level_label, 5, 1, 1, 3)
 
         self._bounds_hint_title = QLabel("边界范围", self)
-        grid.addWidget(self._bounds_hint_title, 5, 0)
-        grid.addWidget(self._bounds_hint_label, 5, 1, 1, 3)
+        grid.addWidget(self._bounds_hint_title, 6, 0)
+        grid.addWidget(self._bounds_hint_label, 6, 1, 1, 3)
 
-        grid.addWidget(QLabel("West", self), 6, 0)
-        grid.addWidget(self._west_spin, 6, 1)
-        grid.addWidget(QLabel("East", self), 6, 2)
-        grid.addWidget(self._east_spin, 6, 3)
-        grid.addWidget(QLabel("South", self), 7, 0)
-        grid.addWidget(self._south_spin, 7, 1)
-        grid.addWidget(QLabel("North", self), 7, 2)
-        grid.addWidget(self._north_spin, 7, 3)
+        grid.addWidget(QLabel("West", self), 7, 0)
+        grid.addWidget(self._west_spin, 7, 1)
+        grid.addWidget(QLabel("East", self), 7, 2)
+        grid.addWidget(self._east_spin, 7, 3)
+        grid.addWidget(QLabel("South", self), 8, 0)
+        grid.addWidget(self._south_spin, 8, 1)
+        grid.addWidget(QLabel("North", self), 8, 2)
+        grid.addWidget(self._north_spin, 8, 3)
 
         self._zoom_mode_row = QWidget(self)
         mode_row = QHBoxLayout(self._zoom_mode_row)
@@ -485,18 +494,18 @@ class DownloadPanel(QGroupBox):
         mode_row.addWidget(self._zoom_recommended_radio)
         mode_row.addWidget(self._zoom_custom_radio)
         mode_row.addStretch(1)
-        grid.addWidget(self._zoom_mode_title, 8, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self._zoom_mode_row, 8, 1, 1, 3)
+        grid.addWidget(self._zoom_mode_title, 9, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_mode_row, 9, 1, 1, 3)
 
         # 顺序照 Spec §1：策略 → 推荐 → Min/Max → 说明
-        grid.addWidget(self._zoom_hint_title, 9, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self._zoom_hint_label, 9, 1, 1, 3)
-        grid.addWidget(QLabel("Min Zoom", self), 10, 0)
-        grid.addWidget(self._min_zoom_spin, 10, 1)
-        grid.addWidget(QLabel("Max Zoom", self), 10, 2)
-        grid.addWidget(self._max_zoom_spin, 10, 3)
-        grid.addWidget(self._zoom_explain_title, 11, 0, Qt.AlignmentFlag.AlignTop)
-        grid.addWidget(self._zoom_explain_label, 11, 1, 1, 3)
+        grid.addWidget(self._zoom_hint_title, 10, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_hint_label, 10, 1, 1, 3)
+        grid.addWidget(QLabel("Min Zoom", self), 11, 0)
+        grid.addWidget(self._min_zoom_spin, 11, 1)
+        grid.addWidget(QLabel("Max Zoom", self), 11, 2)
+        grid.addWidget(self._max_zoom_spin, 11, 3)
+        grid.addWidget(self._zoom_explain_title, 12, 0, Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self._zoom_explain_label, 12, 1, 1, 3)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
@@ -511,6 +520,7 @@ class DownloadPanel(QGroupBox):
         self._country_combo.currentIndexChanged.connect(self._on_cascade_changed)
         self._province_combo.currentIndexChanged.connect(self._on_cascade_changed)
         self._city_combo.currentIndexChanged.connect(self._on_cascade_changed)
+        self._county_combo.currentIndexChanged.connect(self._on_cascade_changed)
         self._zoom_recommended_radio.toggled.connect(self._on_zoom_mode_toggled)
         # Zoom 一改就重算建议：用户把 Max Zoom 从 10 拉到 18 的**当下**就该看到
         # 那句提醒，而不是等他点了「计算」才发现。
@@ -540,6 +550,7 @@ class DownloadPanel(QGroupBox):
             self._fill_country_combo()
             self._fill_province_combo()
             self._fill_city_combo()
+            self._fill_county_combo()
         finally:
             self._syncing = False
 
@@ -604,6 +615,31 @@ class DownloadPanel(QGroupBox):
             return
         self._city_combo.setCurrentIndex(0)
         self._controller.select_city(None)
+
+    def _fill_county_combo(self) -> None:
+        """填「县区」下拉（首个条目是"全部"；市/省下没有县时只剩它）。
+
+        县的父级可能是市（绝大多数），也可能是省（直辖市 / 省直辖县级市），
+        所以父级取"当前选中的市"，没有市就取"当前选中的省"。
+        """
+        self._county_combo.clear()
+        parent = self._controller.city or self._controller.province
+        if parent is None:
+            # 还没选市/省 → 县无可选项。留着空下拉而不是禁用（与城市同理）。
+            self._county_combo.addItem(_ANY_COUNTY_TEXT, None)
+            self._controller.select_county(None)
+            return
+        self._county_combo.addItem(_ANY_COUNTY_TEXT, None)
+        for entry in self._controller.list_counties(parent.id):
+            self._add_entry(self._county_combo, entry)
+        if self._county_combo.count() == 1:
+            # 市/省下面确实没有县级数据：说清楚，别让用户空等
+            self._county_combo.setItemText(0, _NO_COUNTY_TEXT)
+        wanted = self._controller.county
+        if wanted is not None and self._select_entry(self._county_combo, wanted.id):
+            return
+        self._county_combo.setCurrentIndex(0)
+        self._controller.select_county(None)
 
     def _add_entry(self, combo: QComboBox, entry) -> None:
         """往下拉里加一条目录条目。
@@ -747,11 +783,11 @@ class DownloadPanel(QGroupBox):
 
     @Slot()
     def _on_cascade_changed(self, *_args) -> None:
-        """国家 / 省份 / 城市下拉变化：级联刷新（Spec §2）。
+        """国家 / 省份 / 城市 / 县区下拉变化：级联刷新（Spec §2）。
 
-        "选择国家 → 刷新省、清空市；选择省 → 刷新市"这三条规则写在这里而不是
-        三个各自的槽里：它们本来就是一个动作的三个分支，拆开后**换国家却忘了
-        清城市**这种漏改迟早会发生。
+        "选择国家 → 刷新省、清空市；选择省 → 刷新市；选择市 → 刷新县"这几条
+        规则写在这里而不是各自的槽里：它们本来就是一个动作的几条分支，拆开后
+        **换国家却忘了清城市**这种漏改迟早会发生。
 
         ``_syncing`` 是必须的：下面会 ``clear()`` 再 ``addItem()``，
         每一次都会触发 ``currentIndexChanged`` 再回到本方法。
@@ -764,17 +800,20 @@ class DownloadPanel(QGroupBox):
             if country is None:
                 self._controller.select_country(None)
             elif self._controller.country is None or self._controller.country.id != country.id:
-                # 只有"真的换了国家"才重选：否则每次刷新都把省、市清掉一次。
+                # 只有"真的换了国家"才重选：否则每次刷新都把省、市、县清掉一次。
                 self._controller.select_country(country.id)
             else:
-                # 同一国家内选省：先同步省，再按需同步市
+                # 同一国家内选省：先同步省，再按需同步市、县
                 self._controller.select_province(
                     self._entry_id_of(self._province_combo)
                 )
                 if self._controller.province is not None:
                     self._controller.select_city(self._entry_id_of(self._city_combo))
+                    if self._controller.city is not None:
+                        self._controller.select_county(self._entry_id_of(self._county_combo))
             self._fill_province_combo()
             self._fill_city_combo()
+            self._fill_county_combo()
         finally:
             self._syncing = False
         self._apply_region_mode()
@@ -831,6 +870,8 @@ class DownloadPanel(QGroupBox):
             self._province_combo,
             self._city_title,
             self._city_combo,
+            self._county_title,
+            self._county_combo,
             self._level_title,
             self._level_label,
             self._bounds_hint_title,
@@ -1574,7 +1615,7 @@ class DownloadPanel(QGroupBox):
         if not wanted:
             return False
         # 先切到「行政区域」再选：反过来的话，切换区域类型那一下会把刚选好的
-        # 级联刷掉一次（`set_region_type` 触发的重绘会重建三段下拉）。
+        # 级联刷掉一次（`set_region_type` 触发的重绘会重建四段下拉）。
         if not self.set_region_type(RegionType.POLYGON):
             return False
         if not self._controller.select_region(wanted):
@@ -1588,6 +1629,7 @@ class DownloadPanel(QGroupBox):
             self._fill_country_combo()
             self._fill_province_combo()
             self._fill_city_combo()
+            self._fill_county_combo()
         finally:
             self._syncing = False
         self._apply_region_mode()

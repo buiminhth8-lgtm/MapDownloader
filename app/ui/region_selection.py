@@ -123,6 +123,7 @@ class RegionSelectionController:
         self._country_id: str | None = None
         self._province_id: str | None = None
         self._city_id: str | None = None
+        self._county_id: str | None = None
         self._zoom_mode: ZoomMode = ZoomMode.RECOMMENDED
         self._error: str = ""
 
@@ -191,6 +192,20 @@ class RegionSelectionController:
         except RegionCatalogError as exc:
             return self._fail(f"读不到 {target} 的下级城市：{exc}")
 
+    def list_counties(self, city_id: str | None = None) -> tuple[RegionPreset, ...]:
+        """某个市下的县级区域；没有市（或市不在目录里）时返回空元组。
+
+        县直接挂在省下面（直辖市 / 省直辖县级市）时，调用方应以 ``省`` 作为
+        父级来查 —— 见 :meth:`~app.regions.RegionService.list_counties` 的说明。
+        """
+        target = city_id if city_id is not None else self._city_id
+        if not target:
+            return ()
+        try:
+            return self._service.list_counties(target)
+        except RegionCatalogError as exc:
+            return self._fail(f"读不到 {target} 的下级县区：{exc}")
+
     def children_text(self, parent_id: str | None) -> str:
         """面包屑文本（``中国 / 浙江省 / 杭州市``），给界面显示用。"""
         if parent_id is None:
@@ -204,7 +219,7 @@ class RegionSelectionController:
     # 级联选择（Spec §2）
     # ------------------------------------------------------------------ #
     def select_country(self, region_id: str | None) -> bool:
-        """选中一个国家；**同时清空省与市**（Spec §2）。
+        """选中一个国家；**同时清空省、市与县**（Spec §2）。
 
         Returns:
             ``True`` 表示这个 id 确实是目录里的国家级条目。
@@ -215,10 +230,11 @@ class RegionSelectionController:
         if not entry.is_country:
             return bool(self._fail(f"{entry.name} 不是国家级区域（等级：{entry.level.display_name}）"))
         self._country_id = entry.id
-        # 换国家 → 旧国家下面的省、市一律作废。留着它们会造出"国家是 A、
+        # 换国家 → 旧国家下面的省、市、县一律作废。留着它们会造出"国家是 A、
         # 省是 A 的下级"这种跨国家的组合，而界面上看不出来。
         self._province_id = None
         self._city_id = None
+        self._county_id = None
         self._error = ""
         return True
 
@@ -230,6 +246,7 @@ class RegionSelectionController:
         if not (region_id or "").strip():
             self._province_id = None
             self._city_id = None
+            self._county_id = None
             self._error = ""
             return True
         entry = self._lookup(region_id, what="省份")
@@ -245,6 +262,7 @@ class RegionSelectionController:
             )
         self._province_id = entry.id
         self._city_id = None
+        self._county_id = None
         self._error = ""
         return True
 
@@ -255,6 +273,7 @@ class RegionSelectionController:
         """
         if not (region_id or "").strip():
             self._city_id = None
+            self._county_id = None
             self._error = ""
             return True
         entry = self._lookup(region_id, what="城市")
@@ -269,6 +288,38 @@ class RegionSelectionController:
                 )
             )
         self._city_id = entry.id
+        self._county_id = None
+        self._error = ""
+        return True
+
+    def select_county(self, region_id: str | None) -> bool:
+        """选中一个县；传 ``None`` / 空串表示"全部（不限定县）"。
+
+        选到县时等级才是县级（Slice 27）。
+        """
+        if not (region_id or "").strip():
+            self._county_id = None
+            self._error = ""
+            return True
+        entry = self._lookup(region_id, what="县区")
+        if entry is None:
+            return False
+        if not entry.is_county:
+            return bool(self._fail(f"{entry.name} 不是县级区域（等级：{entry.level.display_name}）"))
+        # 县的父级是市或省（省直辖县 / 直辖市的下辖区），两者都算合法。
+        if self._city_id and entry.parent_id != self._city_id:
+            return bool(
+                self._fail(
+                    f"{entry.name} 不属于当前选择的城市（它挂在 {entry.parent_id} 下）"
+                )
+            )
+        if not self._city_id and self._province_id and entry.parent_id != self._province_id:
+            return bool(
+                self._fail(
+                    f"{entry.name} 不属于当前选择的省份（它挂在 {entry.parent_id} 下）"
+                )
+            )
+        self._county_id = entry.id
         self._error = ""
         return True
 
@@ -292,7 +343,7 @@ class RegionSelectionController:
             return bool(
                 self._fail(
                     f"{entry.name} 的等级是{entry.level.display_name}，"
-                    "当前界面只支持国家 / 省 / 市三级"
+                    "当前界面只支持国家 / 省 / 市 / 县四级"
                 )
             )
         try:
@@ -300,12 +351,13 @@ class RegionSelectionController:
         except RegionCatalogError as exc:  # pragma: no cover - 条目刚从目录里取出
             return bool(self._fail(str(exc)))
 
-        # 先清空：从"选了市"切到"只选省"时，那条链里根本没有城市级条目，
-        # 留着旧的市就会造出"省=示例北省、市=示例河市"—— 表面上看着没错，
-        # 但用户点的是"杭州市"（省）而实际下载的还是"杭州市（市）"。
+        # 先清空：从"选了县"切到"只选省"时，那条链里根本没有县级条目，
+        # 留着旧的县就会造出"省=示例北省、县=示例河县"—— 表面上看着没错，
+        # 但用户点的是"杭州市（省）"而实际下载的还是"杭州市（县）"。
         self._country_id = None
         self._province_id = None
         self._city_id = None
+        self._county_id = None
         for item in chain:
             if item.is_country:
                 self._country_id = item.id
@@ -313,14 +365,17 @@ class RegionSelectionController:
                 self._province_id = item.id
             elif item.is_city:
                 self._city_id = item.id
+            elif item.is_county:
+                self._county_id = item.id
         self._error = ""
         return True
 
     def reset(self) -> None:
-        """回到"什么都没选"（清空三级，保留 Zoom 模式）。"""
+        """回到"什么都没选"（清空四级，保留 Zoom 模式）。"""
         self._country_id = None
         self._province_id = None
         self._city_id = None
+        self._county_id = None
         self._error = ""
 
     # ------------------------------------------------------------------ #
@@ -342,13 +397,18 @@ class RegionSelectionController:
         return None if self._city_id is None else self._service.get_region(self._city_id)
 
     @property
-    def selected_region_id(self) -> str | None:
-        """**当前生效**的区域 id：市 → 省 → 国（Spec §2 的推导规则）。
+    def county(self) -> RegionPreset | None:
+        """当前选中的县（"全部"时是 ``None``）。"""
+        return None if self._county_id is None else self._service.get_region(self._county_id)
 
-        单一字段（而不是三个各自为政的字段）是 Spec §3 的要求：下游只认这一个
-        id，不存在"等级说是市、id 却是省"这种组合。
+    @property
+    def selected_region_id(self) -> str | None:
+        """**当前生效**的区域 id：县 → 市 → 省 → 国（Spec §2 的推导规则）。
+
+        单一字段（而不是四个各自为政的字段）是 Spec §3 的要求：下游只认这一个
+        id，不存在"等级说是县、id 却是市"这种组合。
         """
-        return self._city_id or self._province_id or self._country_id
+        return self._county_id or self._city_id or self._province_id or self._country_id
 
     @property
     def selected(self) -> RegionPreset | None:

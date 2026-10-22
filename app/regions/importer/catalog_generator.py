@@ -140,19 +140,20 @@ def _write_manifest(
     config: RegionImportConfig,
 ) -> RegionDatasetManifest:
     """写 dataset manifest（Spec §14）。"""
-    # 只数三个行政等级（ADMINISTRATIVE_LEVELS 就是 COUNTRY/PROVINCE/CITY，
+    # 只数四个行政等级（ADMINISTRATIVE_LEVELS 就是 COUNTRY/PROVINCE/CITY/COUNTY，
     # 从 PARENT_LEVEL_RULES 推导 —— 不在这里手写等级成员名）。
     counts = {level: 0 for level in ADMINISTRATIVE_LEVELS}
     for entry in entries:
         if entry.level in counts:
             counts[entry.level] += 1
-    # manifest 的三个计数字段是持久化契约（countryCount/provinceCount/
-    # cityCount），按 ADMINISTRATIVE_LEVELS 的固定顺序取值 —— 顺序来自
-    # PARENT_LEVEL_RULES 的插入序（COUNTRY → PROVINCE → CITY），加断言钉死。
+    # manifest 的四个计数字段是持久化契约（countryCount/provinceCount/
+    # cityCount/countyCount），按 ADMINISTRATIVE_LEVELS 的固定顺序取值 ——
+    # 顺序来自 PARENT_LEVEL_RULES 的插入序（COUNTRY → PROVINCE → CITY →
+    # COUNTY），加断言钉死。
     assert [level.value for level in ADMINISTRATIVE_LEVELS] == [
-        "country", "province", "city"
+        "country", "province", "city", "county"
     ], "行政等级顺序变了，manifest 计数字段会错位"
-    country_count, province_count, city_count = (
+    country_count, province_count, city_count, county_count = (
         counts.get(level, 0) for level in ADMINISTRATIVE_LEVELS
     )
     manifest = RegionDatasetManifest(
@@ -163,6 +164,7 @@ def _write_manifest(
         country_count=country_count,
         province_count=province_count,
         city_count=city_count,
+        county_count=county_count,
         source_license=config.source_license,
         source_description=config.source_description,
     )

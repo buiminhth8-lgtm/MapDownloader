@@ -48,8 +48,13 @@ class RegionLevel(Enum):
     #: 省 / 自治区 / 直辖市 —— 省域浏览与城市定位（Spec §3）。
     PROVINCE = "province"
 
-    #: 市 / 区县 —— 城市范围任务规划（Spec §3）。
+    #: 市 / 自治州 / 盟 —— 城市范围任务规划（Spec §3）。
     CITY = "city"
+
+    #: 县 / 区 / 旗 / 县级市 —— 最小行政区，高精度街道级（Slice 27）。
+    #: 直辖市的下辖区、省直辖县级市**没有市级上级**，它们的父级直接是省
+    #: （见 :data:`PARENT_LEVEL_RULES`）。
+    COUNTY = "county"
 
     #: 作业区 / 航线缓冲 —— 高精度，但只建议用于有限区域（Spec §3）。
     MISSION = "mission"
@@ -111,6 +116,11 @@ class RegionLevel(Enum):
         return self is RegionLevel.CITY
 
     @property
+    def is_county(self) -> bool:
+        """是不是县级（县 / 区 / 旗 / 县级市）。"""
+        return self is RegionLevel.COUNTY
+
+    @property
     def is_mission(self) -> bool:
         """是不是任务区 / 作业区（航线走廊）。
 
@@ -136,18 +146,25 @@ class RegionLevel(Enum):
         return self is RegionLevel.CUSTOM
 
 
-#: 等级 → 允许的父等级。``None`` 表示"必须是层级的根"。
+#: 等级 → **允许的父等级集合**。空集合表示"必须是层级的根"。
 #:
 #: 这张表放在**定义等级的这个模块**里（而不是校验器里）：它和枚举是同一个
-#: 概念的两半 —— "有哪些等级"和"这些等级怎么嵌套"。想加"区县"一级时，
+#: 概念的两半 —— "有哪些等级"和"这些等级怎么嵌套"。想加一级区域时，
 #: 改枚举 + 补一行表就够，校验器、目录查询、界面都不用动。
+#:
+#: 用**集合**而不是单值，是为了表达"县 / 区"这一类的一对多：绝大多数县挂在
+#: 市下面（``COUNTY → CITY``），但直辖市的下辖区、省直辖县级市**没有市级上级**，
+#: 直接挂在省下面（``COUNTY → PROVINCE``，Slice 27 的中国行政区划就是这样）。
+#: 一个值对不上就拒，会让整个直辖市 / 海南、湖北、新疆兵团市的县全被判成
+#: "层级错误"。
 #:
 #: ``MISSION`` / ``CUSTOM`` **刻意不在表内**：它们不参与行政层级（Spec §6），
 #: 查不到就表示"没有等级约束"，与"必须是根"是两回事。
-PARENT_LEVEL_RULES: dict["RegionLevel", "RegionLevel | None"] = {
-    RegionLevel.COUNTRY: None,
-    RegionLevel.PROVINCE: RegionLevel.COUNTRY,
-    RegionLevel.CITY: RegionLevel.PROVINCE,
+PARENT_LEVEL_RULES: dict["RegionLevel", "frozenset[RegionLevel]"] = {
+    RegionLevel.COUNTRY: frozenset(),
+    RegionLevel.PROVINCE: frozenset({RegionLevel.COUNTRY}),
+    RegionLevel.CITY: frozenset({RegionLevel.PROVINCE}),
+    RegionLevel.COUNTY: frozenset({RegionLevel.CITY, RegionLevel.PROVINCE}),
 }
 
 #: 纳入行政层级的等级，**从** :data:`PARENT_LEVEL_RULES` 推导。
@@ -163,6 +180,7 @@ _DISPLAY_NAMES: dict[RegionLevel, str] = {
     RegionLevel.COUNTRY: "全国级",
     RegionLevel.PROVINCE: "省级",
     RegionLevel.CITY: "城市级",
+    RegionLevel.COUNTY: "县级",
     RegionLevel.MISSION: "任务区",
     RegionLevel.CUSTOM: "自定义",
 }
