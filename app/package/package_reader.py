@@ -32,9 +32,9 @@ from pathlib import Path
 
 from app.config.settings import PACKAGE_MANIFEST_FILENAME
 from app.package.models import (
-    MapPackageManifest,
     ManifestError,
     ManifestPathError,
+    MapPackageManifest,
     parse_manifest_dict,
 )
 

@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
 from pathlib import Path
 
 from app.config.settings import (

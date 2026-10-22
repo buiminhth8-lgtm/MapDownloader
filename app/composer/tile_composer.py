@@ -47,7 +47,7 @@ from app.config.settings import (
 # 免得出现"合成说自己是 PNG、下载器说它不像 PNG"的互相矛盾。
 from app.providers import PNG_SIGNATURE
 
-__all__ = ["TileComposer", "TileComposeError"]
+__all__ = ["TileComposeError", "TileComposer"]
 
 
 _logger = logging.getLogger(__name__)

@@ -228,9 +228,8 @@ def test_sample_tiles_rejects_corrupt_row(work_dir: Path) -> None:
     conn.commit()
     conn.close()
 
-    with MBTilesReader(db) as reader:
-        with pytest.raises(ValueError):
-            reader.sample_tiles(5)
+    with MBTilesReader(db) as reader, pytest.raises(ValueError):
+        reader.sample_tiles(5)
 
 
 # --------------------------------------------------------------------------- #

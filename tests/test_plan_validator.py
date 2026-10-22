@@ -479,7 +479,7 @@ def test_existing_output_file_is_only_a_warning(
     plan = _ready_plan(builder, estimator, "demoland", output_dir=work_dir)
     paths = planned_output_paths(plan, output_dir=work_dir)
     paths["demoland"].parent.mkdir(parents=True, exist_ok=True)
-    paths["demoland"].write_bytes("上一次的成果".encode("utf-8"))
+    paths["demoland"].write_bytes("上一次的成果".encode())
 
     result = validator.validate(plan)
 

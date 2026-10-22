@@ -89,13 +89,13 @@ from app.config.settings import (
     UI_TEXT_PACKAGE_EXISTS_BODY,
     UI_TEXT_PACKAGE_EXISTS_TITLE,
     UI_TEXT_PACKAGE_FAILED,
-    UI_TEXT_PACKAGE_FAILED_TITLE,
     UI_TEXT_PACKAGE_FILE_FILTER,
     UI_TEXT_PACKAGE_GROUP_DIAG,
     UI_TEXT_PACKAGE_GROUP_INFO,
     UI_TEXT_PACKAGE_GROUP_PACKAGE,
     UI_TEXT_PACKAGE_GROUP_SOURCE,
     UI_TEXT_PACKAGE_MAP_TYPE_LABEL,
+    UI_TEXT_PACKAGE_MBTILES_LABEL,
     UI_TEXT_PACKAGE_NAME_LABEL,
     UI_TEXT_PACKAGE_NEED_DIR,
     UI_TEXT_PACKAGE_NEED_NAME,
@@ -103,6 +103,7 @@ from app.config.settings import (
     UI_TEXT_PACKAGE_NEED_SOURCE,
     UI_TEXT_PACKAGE_OUTPUT_LABEL,
     UI_TEXT_PACKAGE_PACKAGE_LABEL,
+    UI_TEXT_PACKAGE_RESULT_LABEL,
     UI_TEXT_PACKAGE_RUNNING,
     UI_TEXT_PACKAGE_SHA256_LABEL,
     UI_TEXT_PACKAGE_SOURCE_LABEL,
@@ -117,9 +118,6 @@ from app.config.settings import (
     UI_TEXT_PACKAGE_WARNING_BODY,
     UI_TEXT_PACKAGE_WARNING_TITLE,
     UI_TEXT_PACKAGE_ZOOM_LABEL,
-    UI_TEXT_PACKAGE_MANIFEST_LABEL,
-    UI_TEXT_PACKAGE_MBTILES_LABEL,
-    UI_TEXT_PACKAGE_RESULT_LABEL,
 )
 from app.geo import format_size
 from app.mbtiles import MBTilesDiagnosticsResult
@@ -137,9 +135,9 @@ from app.ui.widgets import WrappingLabel, apply_secondary_text, status_text_colo
 
 __all__ = [
     "PackageBuildWorker",
-    "PackageValidateWorker",
     "PackageDialog",
     "PackageValidateDialog",
+    "PackageValidateWorker",
 ]
 
 _logger = logging.getLogger(__name__)

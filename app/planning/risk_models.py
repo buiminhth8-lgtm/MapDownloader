@@ -46,16 +46,16 @@ if TYPE_CHECKING:  # pragma: no cover - 只为类型标注
     from app.geo.region_estimator import ZoomRegionStats
 
 __all__ = [
+    "RISK_ACTUAL_ZOOM_LABEL",
+    "RISK_LEVEL_LABEL",
+    "RISK_OVER_ZOOM_LABEL",
+    "RISK_PLAN_TOTAL_LABEL",
+    "RISK_RECOMMENDED_ZOOM_LABEL",
+    "RISK_SIZE_LABEL",
+    "RISK_TILES_LABEL",
     "DownloadRiskReport",
     "PlanItemRisk",
     "PlanRiskReport",
-    "RISK_LEVEL_LABEL",
-    "RISK_TILES_LABEL",
-    "RISK_SIZE_LABEL",
-    "RISK_ACTUAL_ZOOM_LABEL",
-    "RISK_RECOMMENDED_ZOOM_LABEL",
-    "RISK_OVER_ZOOM_LABEL",
-    "RISK_PLAN_TOTAL_LABEL",
 ]
 
 #: 报告里的固定行前缀。放模型层而不是 UI 里：界面、日志、验收脚本要逐字一致。
@@ -111,7 +111,7 @@ class DownloadRiskReport:
     recommendations: tuple[str, ...] = ()
     requires_confirmation: bool = False
     requires_strong_confirmation: bool = False
-    per_zoom: tuple["ZoomRegionStats", ...] = field(default_factory=tuple)
+    per_zoom: tuple[ZoomRegionStats, ...] = field(default_factory=tuple)
     average_tile_size: int = DEFAULT_AVERAGE_TILE_SIZE
 
     def __post_init__(self) -> None:

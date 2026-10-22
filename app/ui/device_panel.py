@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from PySide6.QtCore import Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QGridLayout,
@@ -65,7 +66,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Signal, Slot
 
 from app.android.device_manager import DeviceRefreshOutcome
 from app.android.transfer_models import TransferPlan, TransferProgress
@@ -113,12 +113,12 @@ from app.models.device import AndroidDevice, DeviceState
 from app.ui.widgets import WrappingLabel, apply_secondary_text, status_text_color
 
 __all__ = [
-    "DevicePanel",
     "TRANSFER_STATE_CANCELLED",
     "TRANSFER_STATE_DONE",
     "TRANSFER_STATE_FAILED",
     "TRANSFER_STATE_READY",
     "TRANSFER_STATE_RUNNING",
+    "DevicePanel",
 ]
 
 #: 传输状态机的取值（Spec §30）。用常量而不是裸字符串：

@@ -48,41 +48,43 @@ from __future__ import annotations
 import math
 import numbers
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from app.config.settings import (
     MAX_LONGITUDE,
+    MIN_LONGITUDE,
     MISSION_GEOMETRY_VERSION,
     MISSION_ID_PREFIX,
     MISSION_METADATA_VERSION,
     MISSION_MIN_WAYPOINTS,
-    MIN_LONGITUDE,
     WEB_MERCATOR_MAX_LAT,
 )
 from app.geo.bounds import GeoBounds
 from app.geo.region import is_safe_region_relative_path
+
 # 唯一一处「任务区层 → 规划层」的依赖，与 app.geo.region 对 RegionLevel 的依赖
 # 同形（那边也是只 import 这个零依赖模块）。等级枚举本身不含任何规则，
 # 因此这条边不构成循环。
 from app.planning.region_level import RegionLevel
 
 __all__ = [
-    "MissionWaypoint",
-    "MissionRegion",
-    "MissionRegionMetadata",
+    "MISSION_METADATA_FIELD_ORDER",
+    "MISSION_REGION_LEVEL",
     "MissionError",
-    "MissionRouteError",
+    "MissionRegion",
     "MissionRegionError",
+    "MissionRegionMetadata",
     "MissionRegionNotFound",
     "MissionRegionReferenced",
+    "MissionRouteError",
+    "MissionWaypoint",
+    "is_mission_id",
     "km_to_meters",
     "meters_to_km",
-    "is_mission_id",
     "now_iso",
-    "MISSION_REGION_LEVEL",
-    "MISSION_METADATA_FIELD_ORDER",
 ]
 
 #: 任务区在规划等级里的位置（Slice 22，Spec §5）。
@@ -373,7 +375,7 @@ class MissionRegion:
             f"{self.buffer_km:.2f} km）"
         )
 
-    def with_geojson_path(self, path: str) -> "MissionRegion":
+    def with_geojson_path(self, path: str) -> MissionRegion:
         """回填几何文件路径（返回新实例；本类型不可变）。"""
         return replace(self, geojson_path=str(path))
 
@@ -440,7 +442,7 @@ class MissionRegionMetadata:
             )
 
     @classmethod
-    def from_region(cls, region: MissionRegion) -> "MissionRegionMetadata":
+    def from_region(cls, region: MissionRegion) -> MissionRegionMetadata:
         """从一个任务区生成它的元数据。"""
         return cls(
             id=region.id,
@@ -472,7 +474,7 @@ class MissionRegionMetadata:
         return {key: data[key] for key in MISSION_METADATA_FIELD_ORDER}
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "MissionRegionMetadata":
+    def from_dict(cls, data: Mapping[str, Any]) -> MissionRegionMetadata:
         """从 JSON 结构还原。
 
         Raises:

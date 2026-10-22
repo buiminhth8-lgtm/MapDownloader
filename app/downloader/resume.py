@@ -52,11 +52,11 @@ from app.downloader.models import SkipPredicate, TileCoordinate
 from app.providers import is_valid_tile_response
 
 __all__ = [
+    "ExistingTileIndex",
+    "ExistingTileStats",
     "ResumePolicy",
     "SkipMode",
     "TileProbe",
-    "ExistingTileStats",
-    "ExistingTileIndex",
     "describe_existing_tiles",
     "make_skip_predicate",
 ]
@@ -84,7 +84,7 @@ class ResumePolicy:
     redownload_invalid_tile: bool = DEFAULT_RESUME_REDOWNLOAD_INVALID_TILE
 
     @classmethod
-    def disabled(cls) -> "ResumePolicy":
+    def disabled(cls) -> ResumePolicy:
         """返回"不做任何跳过"的策略（全量重下）。"""
         return cls(enabled=False)
 

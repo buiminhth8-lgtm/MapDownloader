@@ -60,9 +60,9 @@ from app.regions.models import RegionCatalogError
 from app.regions.service import RegionService
 
 __all__ = [
+    "DownloadPlanEstimator",
     "PlanEstimateCancelled",
     "PlanEstimateProgress",
-    "DownloadPlanEstimator",
 ]
 
 

@@ -16,8 +16,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -28,7 +26,6 @@ from app.planning.region_level import RegionLevel
 from app.regions import RegionCatalog, RegionService
 from app.regions.importer import RegionImportService
 from app.regions.importer.models import RegionImportIssueCode
-
 from tests.conftest import REGION_FIXTURE_ROOT, REGION_IMPORT_FIXTURE_ROOT
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

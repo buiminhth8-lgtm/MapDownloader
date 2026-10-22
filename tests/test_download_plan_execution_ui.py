@@ -155,7 +155,7 @@ def test_run_buttons_are_disabled_without_a_scheduler(
 def test_only_start_is_available_before_the_plan_runs(
     plan_service: PlanService, task_service, store, qapp
 ) -> None:
-    plan = ready_plan(plan_service, task_service.store.path.parent, "demoland")
+    ready_plan(plan_service, task_service.store.path.parent, "demoland")
     dialog = _dialog(plan_service, task_service, store)
     dialog.refresh()
 
@@ -178,7 +178,7 @@ def test_clicking_start_runs_the_whole_plan(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """**核心用例**：点「开始计划」→ 两个区域依次跑完 → 界面显示已完成。"""
-    plan = ready_plan(plan_service, work_dir, "demoland", "northland")
+    ready_plan(plan_service, work_dir, "demoland", "northland")
     runner = FakeRunner()
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()
@@ -226,7 +226,7 @@ def test_clicking_start_twice_does_not_open_two_executions(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """连点两次「开始计划」不该变成两份执行（按钮在跑起来后就是灰的）。"""
-    plan = ready_plan(plan_service, work_dir, "demoland")
+    ready_plan(plan_service, work_dir, "demoland")
     runner = FakeRunner(hang=True)
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()
@@ -254,7 +254,7 @@ def test_pause_then_resume_from_the_buttons(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """暂停 → 表格被锁、继续可用；继续 → 接着跑完（复用 Resume 补差集）。"""
-    plan = ready_plan(plan_service, work_dir, "demoland", "northland")
+    ready_plan(plan_service, work_dir, "demoland", "northland")
     runner = FakeRunner(hang_once=True)
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()
@@ -296,7 +296,7 @@ def test_cancel_asks_first_and_keeps_the_partial_file(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """取消：先问一句 → 当前停下 → 后续标已取消 → **半截的文件还在**。"""
-    plan = ready_plan(plan_service, work_dir, "demoland", "northland")
+    ready_plan(plan_service, work_dir, "demoland", "northland")
     runner = FakeRunner(hang=True)
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()
@@ -328,7 +328,7 @@ def test_saying_no_to_the_cancel_question_keeps_the_plan_running(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """问一句时点「否」→ 计划照旧在跑（不能"点了否却停了"）。"""
-    plan = ready_plan(plan_service, work_dir, "demoland")
+    ready_plan(plan_service, work_dir, "demoland")
     runner = FakeRunner(hang=True)
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.show()
@@ -357,7 +357,7 @@ def test_a_failed_item_offers_retry_and_skip(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """失败 → 停在「部分失败」→ 只给重试 / 跳过 / 取消。"""
-    plan = ready_plan(plan_service, work_dir, "demoland", "northland")
+    ready_plan(plan_service, work_dir, "demoland", "northland")
     runner = FakeRunner(fail_on=("demoland",), fail_times=1)
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()
@@ -391,7 +391,7 @@ def test_skipping_a_failed_item_continues_with_the_next_one(
     plan_service: PlanService, task_service, store, work_dir: Path, qapp
 ) -> None:
     """跳过 → 那一项标「已跳过」→ 接着跑下一项。"""
-    plan = ready_plan(plan_service, work_dir, "demoland", "northland")
+    ready_plan(plan_service, work_dir, "demoland", "northland")
     runner = FakeRunner(fail_on=("demoland",))
     dialog = _dialog(plan_service, task_service, store, runner)
     dialog.refresh()

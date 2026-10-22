@@ -59,7 +59,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -129,7 +129,7 @@ from app.config.settings import (
     UI_TEXT_OPEN_DIRECTORY_FAILED,
 )
 from app.geo import format_size
-from app.mbtiles import MBTilesDiagnosticsResult, InspectionProgress
+from app.mbtiles import InspectionProgress, MBTilesDiagnosticsResult
 from app.providers import describe_exception
 from app.services import MBTilesInspectionService
 from app.ui.desktop import open_directory

@@ -34,7 +34,6 @@ from app.planning.risk_policy import (
     DANGEROUS_TILE_THRESHOLD,
     LARGE_TILE_THRESHOLD,
     VERY_LARGE_TILE_THRESHOLD,
-    RiskPolicy,
 )
 from app.planning.zoom_strategy import ZoomStrategyService
 from app.regions.service import RegionService

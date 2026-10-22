@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import io
 import json
@@ -577,9 +578,9 @@ def _expected_remote_dir(package_dir: Path) -> str:
 def _scene_discovery(checker: Checker, adb_path: str, root: Path) -> None:
     """``adb version`` / ``devices -l`` / ``getprop`` 都是**真的子进程**。"""
     from app.config.settings import (
-        DEFAULT_ANDROID_IMPORT_DIR,
         ANDROID_PROP_MANUFACTURER,
         ANDROID_PROP_MODEL,
+        DEFAULT_ANDROID_IMPORT_DIR,
     )
 
     checker.section("场景 A：ADB 探测与设备发现（真实子进程）")
@@ -1428,10 +1429,8 @@ def _close_dialogs(window) -> None:
     ):
         dialog = getattr(window, attribute, None)
         if dialog is not None:
-            try:
+            with contextlib.suppress(RuntimeError):
                 dialog.close()
-            except RuntimeError:
-                pass
     _pump(_APP, 4)
 
 

@@ -1,21 +1,29 @@
 # 天地图离线地图工具 —— 运行依赖
 # 安装：python -m pip install -r requirements.txt
+#
+# **每条都写了上限**：这不是洁癖。PySide6 / Pillow / shapely 的大版本升级都真的
+# 改过行为（Qt 枚举、Pillow 的重采样常量、shapely 的几何接口），而本项目的测试
+# 是跟着**当前**大版本写的。没有上限时，某天 `pip install -r` 会在别人的机器上
+# 装出一个本项目从没验证过的组合，然后失败原因藏在依赖差异里。
+#
+# 需要**逐字节复现**（排查怪问题时）用 requirements-lock.txt，那是 pip freeze 的
+# 快照，含传递依赖。
 
 # GUI 框架
-PySide6>=6.6
+PySide6>=6.6,<7
 
 # HTTP 客户端（天地图 WMTS 瓦片请求，Slice 2 起）
-httpx>=0.27
+httpx>=0.27,<1
 
 # 图像合成（底图 + 中文注记 alpha 混合，Slice 6 起）
-Pillow>=10.0
+Pillow>=10.0,<13
 
 # 几何运算（多边形瓦片过滤 / 覆盖度判定，Slice 16 起）
-shapely>=2.0
+shapely>=2.0,<3
 
 # 坐标投影（Slice 22 起：航线 Buffer 必须按**米**算，不能按 WGS84 度数算）
-pyproj>=3.6
+pyproj>=3.6,<4
 
 # 测试
-pytest>=8.0
-pytest-asyncio>=1.0   # 异步用例（Slice 3 起），asyncio_mode=auto 见 pytest.ini
+pytest>=8.0,<10
+pytest-asyncio>=1.0,<2   # 异步用例（Slice 3 起），asyncio_mode=auto 见 pytest.ini

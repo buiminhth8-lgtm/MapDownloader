@@ -1,0 +1,81 @@
+# 工具配置（不是打包配置：本项目的安装入口是 requirements.txt，不是 pip install .）
+#
+# 这里只放 lint / 类型检查的配置。**规则写死在项目里**，不依赖 ruff 的默认集合 ——
+# 默认集合会随版本变（ruff 0.17 的默认就比早期大得多），一旦变了，"本地绿、CI 红"
+# 或者反过来都会发生，而原因还藏在版本差异里。
+
+[tool.ruff]
+# 中文注释按字符数算，行宽放到 100；E501 另行关闭，见下面 ignore 的第一条理由。
+line-length = 100
+# 与 README「环境」章节一致：声明支持的最低版本。
+target-version = "py311"
+src = ["app", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle error
+    "F",   # pyflakes（**这条抓到过一个真实的 NameError**，见下）
+    "W",   # pycodestyle warning
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear：可变默认参数、循环变量捕获、assert 副作用等
+    "SIM", # 可简化但没简化（**只报建议，不自动改语义**）
+    "C4",  # 推导式写法
+    "PIE", # 杂项反模式
+    "RUF", # ruff 自己的规则（含 RUF100 / RUF022 等）
+]
+
+ignore = [
+    # 中文注释与长字符串天然超宽。真正要限制的是**代码**宽度，而 format 已经管了；
+    # 逐行加 noqa 只会把注释搞得比代码还长。
+    "E501",
+    # zip(strict=) 是**运行时语义**变更（长度不等时从"静默截断"变成抛错）。
+    # 这不是风格问题，必须逐处评审，不能批量开。
+    "B905",
+    # 全角标点（，。：；）在中文注释/文案里是有意为之，不是"看起来像但其实是别的字符"。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 代码里有 100+ 处 `# noqa: BLE001` 之类，抑制的是**本项目没启用的**规则
+    # （安全规则、docstring 规则、命名规则）。它们在这里的作用不是压制告警，
+    # 而是告诉下一个读者"这个 except Exception 是有意的"——属于注释，不是配置。
+    # 启用 RUF100 会把它们全部删掉，等于删掉一批解释。
+    "RUF100",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# F401：包的 __init__.py 就是再导出清单（`from .x import y` + `__all__`），
+#      在 re-export 模块里"导入未使用"是**正确形态**。
+# RUF022：`__init__.py` 的 `__all__` 刻意按"类型 → 函数 → 常量"分组排，
+#      不是纯字母序（分组让读者一眼看出这个包的对外形状）。
+#      普通模块的 `__all__` 大多是扁平清单，按字母序即可 —— 所以这条只对
+#      `__init__.py` 关闭，是有意的不对称，不是漏配。
+"**/__init__.py" = ["F401", "RUF022"]
+
+# 测试里两类写法是惯例，不是缺陷：
+# - B017：`pytest.raises(Exception)` 断言"总之会抛"，在测防御性路径时是对的；
+# - F811：fixture / 工厂函数的参数名与模块级导入同名（参数遮蔽），不影响运行。
+"tests/**" = ["B017", "F811"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+# 与本项目现有风格一致：`from __future__` 单独一组在最前。
+force-sort-within-sections = false
+
+# --------------------------------------------------------------------------- #
+# mypy：配置就绪，但**当前不是绿基线**，因此不进门禁。
+#
+# 现状（2026-10-23，mypy 2.4.0）：`mypy app` → 113 errors / 31 files。
+# 主要类别：arg-type / union-attr / attr-defined / import-untyped / assignment /
+# return-value。这些是真实的类型不精确，不是配置问题 ——
+# 强行设成 CI 门禁只会让所有人学会忽略它。先把 ruff 做绿，mypy 按模块逐块收紧。
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.11"
+# 第三方库缺 stub（PySide6 有 stub，shapely/pyproj 部分有）——先不因它阻塞。
+ignore_missing_imports = true
+# 只检查有注解的函数体，未注解的先跳过：这是 pyproject 化之后的第一阶段。
+check_untyped_defs = false
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true

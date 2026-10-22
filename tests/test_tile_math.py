@@ -6,6 +6,8 @@ z12 是 ``(3372, 1552)``，与 Slippy Map 通用实现一致，作为公式回�
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from app.config.settings import (
@@ -148,7 +150,7 @@ def test_non_finite_input_raises(bad: float) -> None:
 # BoundingBox -> TileRange
 # --------------------------------------------------------------------------- #
 def test_tile_range_shape_and_ordering() -> None:
-    for zoom in range(0, 19):
+    for zoom in range(19):
         rng = calculate_tile_range(BEIJING, zoom)
         assert rng.zoom == zoom
         assert rng.min_x <= rng.max_x
@@ -234,7 +236,7 @@ def test_xyz_to_tms_reference_value() -> None:
 
 
 def test_xyz_tms_round_trip() -> None:
-    for zoom in range(0, 13):
+    for zoom in range(13):
         for y in range(1 << zoom):
             assert tms_y_to_xyz_y(zoom, xyz_y_to_tms_y(zoom, y)) == y
             assert xyz_y_to_tms_y(zoom, tms_y_to_xyz_y(zoom, y)) == y
@@ -344,7 +346,7 @@ def test_lon_to_x_round_trip_has_zero_inconsistencies() -> None:
     恰恰在**一共有多少处**：只有 1 处可能是个巧合，有 14 处说明公式没对齐。
     """
     mismatches: list[tuple[str, int, int, int]] = []
-    for zoom in range(0, 23):
+    for zoom in range(23):
         tiles = 2**zoom
         for x in range(tiles + 1):
             got = lon_to_tile_x(tile_x_to_lon(x, zoom), zoom)
@@ -379,7 +381,7 @@ def test_tile_y_to_lat_anchors() -> None:
 def test_tile_y_to_lat_is_monotonic_decreasing() -> None:
     """行号越大越靠南：纬度必须严格递减（这个方向反了整张地图会上下颠倒）。"""
     lats = [tile_y_to_lat(y, 6) for y in range(2**6 + 1)]
-    assert all(a > b for a, b in zip(lats, lats[1:]))
+    assert all(a > b for a, b in itertools.pairwise(lats))
 
 
 @pytest.mark.parametrize(("zoom", "x", "y"), [(0, 0, 0), (1, 1, 0), (10, 843, 388), (12, 3372, 1552)])
@@ -410,7 +412,7 @@ def test_tile_range_tiles_all_overlap_the_requested_rectangle() -> None:
     瓦片连判定的机会都没有 —— 那才是真正的"漏块"。
     """
     lonely: list[tuple[int, int, int]] = []
-    for zoom in range(0, 13):
+    for zoom in range(13):
         tile_range = calculate_tile_range(BEIJING, zoom)
         for y in range(tile_range.min_y, tile_range.max_y + 1):
             for x in range(tile_range.min_x, tile_range.max_x + 1):
@@ -438,7 +440,7 @@ def test_tile_range_union_covers_the_requested_rectangle() -> None:
     与上一条一起构成"保守但不浪费"的完整表述：既没漏，也没多到离谱。
     """
     holes: list[tuple[int, str]] = []
-    for zoom in range(0, 13):
+    for zoom in range(13):
         tile_range = calculate_tile_range(BEIJING, zoom)
         west = tile_bounds(zoom, tile_range.min_x, tile_range.min_y).west
         east = tile_bounds(zoom, tile_range.max_x, tile_range.max_y).east

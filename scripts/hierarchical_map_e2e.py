@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """分级离线地图链路端到端验收（Slice 25 Spec §2）。
 
 **它验证的是"整条分级链路还活着"，不是"某个函数算得对"。**
@@ -74,7 +73,7 @@ if str(BACKEND_ROOT) not in sys.path:
 # --------------------------------------------------------------------------- #
 # 资源目录重定向必须在**任何** RegionService 实例化之前（区域目录是全局单例语义）。
 # --------------------------------------------------------------------------- #
-import app.geo.region as _region_module                      # noqa: E402
+import app.geo.region as _region_module  # noqa: E402
 
 #: 分级夹具目录（自建几何，**不是**真实行政边界，见该目录的 README）。
 HIERARCHY_DIR = BACKEND_ROOT / "tests" / "fixtures" / "regions" / "hierarchy"
@@ -184,7 +183,7 @@ class MockTileServer:
         self.delay = delay
         self._png_cache: dict[tuple[int, int], bytes] = {}
 
-    async def __call__(self, request) -> "object":  # httpx.Request → httpx.Response
+    async def __call__(self, request) -> object:  # httpx.Request → httpx.Response
         import httpx
 
         params = request.url.params
@@ -849,10 +848,10 @@ class Runner:
         )
         per_item = [
             f"{id_to_region.get(item.plan_item_id, item.plan_item_id)}="
-            f"{str(getattr(item.status, 'value', item.status))}"
+            f"{getattr(item.status, 'value', item.status)!s}"
             for item in self.execution.items
         ]
-        self.note(f"四条状态：" + "，".join(per_item))
+        self.note("四条状态：" + "，".join(per_item))
         self.note(
             f"耗时 {elapsed:.1f}s，服务端收到 {server.count:,} 个瓦片请求"
             f"（计划总量 {self.plan.total_tiles:,} 张）"
@@ -888,12 +887,11 @@ class Runner:
         ok &= self.check(len(self.outputs) == 4, "四个 MBTiles 都产出了",
                          f"实际 {sorted(self.outputs)}")
         by_region = {}
-        for region_id, item in (
-            (item.region_id, item) for item in self.plan.ordered_enabled_items()
-        ):
-            by_region[region_id] = item
+        for item in self.plan.ordered_enabled_items():
+            by_region[item.region_id] = item
 
-        for region_id, path in sorted(self.outputs.items()):
+        # 按 region_id 排序（输出稳定），但这一段只用 path。
+        for _region_id, path in sorted(self.outputs.items()):
             if not path.exists():
                 ok &= self.check(False, f"{path.name} 存在")
                 continue
@@ -940,7 +938,7 @@ class Runner:
         service = MBTilesInspectionService()
         ok = True
         missing_claim = re.compile(r"缺失\s*[0-9,]+\s*张")
-        for region_id, path in sorted(self.outputs.items()):
+        for _region_id, path in sorted(self.outputs.items()):
             result = service.inspect(path, check_coverage=True)
             ok &= self.check(
                 result.status == "PASS",
@@ -970,7 +968,6 @@ class Runner:
         拿**真实的行政区产物**验一遍，而不是只在单测里断言字典。
         """
         from app.package.models import parse_manifest_dict
-
         from app.services import MapPackageService
 
         service = MapPackageService()

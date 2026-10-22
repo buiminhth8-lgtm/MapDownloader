@@ -38,31 +38,31 @@ from app.config.settings import (
     DEFAULT_TILE_TIMEOUT_SECONDS,
     HTTP_USER_AGENT,
     MAX_TILE_RESPONSE_BYTES,
-    TILE_MATH_MAX_ZOOM,
-    TILE_MATH_MIN_ZOOM,
     TIANDITU_ACCEPT_HEADER,
     TIANDITU_HOST_TEMPLATE,
     TIANDITU_SERVER_COUNT,
     TIANDITU_URL_SCHEME,
     TIANDITU_WMTS_PATH_TEMPLATE,
+    TILE_MATH_MAX_ZOOM,
+    TILE_MATH_MIN_ZOOM,
 )
 from app.models.map_layer import MapLayerType
 from app.providers.base import TileProvider, TileTestResult
 
 __all__ = [
+    "JPEG_SIGNATURE",
+    "PNG_SIGNATURE",
     "TiandituProvider",
     "TileProvider",
     "TileTestResult",
-    "PNG_SIGNATURE",
-    "JPEG_SIGNATURE",
-    "server_index",
+    "describe_exception",
+    "describe_response",
+    "detect_image_format",
+    "http_error_message",
+    "is_valid_tile_response",
     "mask_token",
     "mask_url",
-    "detect_image_format",
-    "is_valid_tile_response",
-    "describe_response",
-    "describe_exception",
-    "http_error_message",
+    "server_index",
     "test_tile",
 ]
 
@@ -262,11 +262,11 @@ def _sniff_text_format(content: bytes) -> str | None:
     if head.startswith((b"{", b"[")):
         return "JSON"
     lowered = head.lower()
-    if lowered.startswith(b"<!doctype html") or lowered.startswith(b"<html"):
+    if lowered.startswith((b"<!doctype html", b"<html")):
         return "HTML"
     if b"serviceexception" in lowered:
         return "XML（ServiceException）"
-    if lowered.startswith(b"<?xml") or lowered.startswith(b"<ows"):
+    if lowered.startswith((b"<?xml", b"<ows")):
         return "XML"
     if b"<html" in lowered[:256]:
         return "HTML"
@@ -318,9 +318,7 @@ def is_valid_tile_response(content: bytes, content_type: str | None = None) -> b
         return False
     if detect_image_format(content) is None:
         return False
-    if is_error_content_type(content_type):
-        return False
-    return True
+    return not is_error_content_type(content_type)
 
 
 # --------------------------------------------------------------------------- #

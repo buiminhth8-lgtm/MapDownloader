@@ -43,6 +43,7 @@ from app.regions.catalog import RegionCatalog
 from app.regions.importer.catalog_generator import generate_dataset
 from app.regions.importer.hierarchy_builder import build_hierarchy
 from app.regions.importer.models import (
+    ImportReport,
     RegionDatasetManifest,
     RegionImportConfig,
     RegionImportError,
@@ -50,7 +51,6 @@ from app.regions.importer.models import (
     RegionImportIssueCode,
     RegionImportResult,
     RegionSourceFeature,
-    ImportReport,
 )
 from app.regions.importer.normalizer import count_levels, normalize_features
 from app.regions.importer.region_exporter import (

@@ -28,7 +28,6 @@ from app.planning.plan_execution import (
     PlanExecutionStatus,
     PlanItemRunStatus,
 )
-from app.planning.plan_execution_store import PlanExecutionStore
 from app.planning.plan_scheduler import PlanScheduler
 from app.workers.plan_download_worker import PlanDownloadWorker
 from tests.plan_fakes import ExplodingRunner, FakeRunner, ready_plan
@@ -321,7 +320,7 @@ def test_closing_the_page_pauses_instead_of_killing_the_thread(
     worker = PlanDownloadWorker(
         _scheduler(plan_service, task_service, store, runner), plan
     )
-    seen = _Recorder(worker)
+    _Recorder(worker)
 
     worker.start()
     assert _wait_until(qapp, lambda: runner.calls)

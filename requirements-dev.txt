@@ -1,0 +1,13 @@
+# 天地图离线地图工具 —— 开发依赖（lint / 类型检查）
+# 安装：python -m pip install -r requirements-dev.txt
+#
+# 这些**不是运行依赖**：程序本身不 import ruff / mypy。只装 requirements.txt
+# 的机器照样能跑工具、跑测试。
+
+# lint（配置见 pyproject.toml 的 [tool.ruff]）
+ruff>=0.17,<1
+
+# 类型检查（配置见 pyproject.toml 的 [tool.mypy]）
+# 现状：`mypy app` 还有约 110 条错误，**不是绿基线**，因此不进 CI 门禁 ——
+# 详见 pyproject.toml 里那段说明。装上它只是为了本地能随时看基线有没有变差。
+mypy>=2.4,<3

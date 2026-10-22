@@ -61,13 +61,12 @@ import inspect
 import logging
 import time
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Awaitable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from app.config.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
-    DEFAULT_REQUEST_TIMEOUT,
     MAX_DOWNLOAD_CONCURRENCY,
     MAX_LOGGED_TILE_FAILURES,
     MIN_DOWNLOAD_CONCURRENCY,
@@ -86,10 +85,10 @@ from app.downloader.models import (
     TileFailureKind,
 )
 from app.downloader.tile_downloader import TileDownloader
-from app.geo import GeoBounds, TileRange, calculate_tile_ranges
+from app.geo import GeoBounds, calculate_tile_ranges
 from app.models.map_layer import MapLayerType, MapType
 
-__all__ = ["DownloadManager", "iter_tile_coordinates", "RegionFilterLike"]
+__all__ = ["DownloadManager", "RegionFilterLike", "iter_tile_coordinates"]
 
 #: ``layer`` 参数允许的取值。
 #:

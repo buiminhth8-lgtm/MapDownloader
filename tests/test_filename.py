@@ -25,6 +25,7 @@ import pytest
 from app.config import settings
 from app.services import build_output_path, sanitize_map_name
 
+
 # --------------------------------------------------------------------------- #
 # Windows 非法字符
 # --------------------------------------------------------------------------- #

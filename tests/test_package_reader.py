@@ -18,9 +18,9 @@ import pytest
 
 from app.package import (
     MANIFEST_FIELD_ORDER,
-    MapPackageManifest,
     ManifestError,
     ManifestPathError,
+    MapPackageManifest,
     UnsupportedFormatVersion,
     ensure_inside,
     parse_manifest_dict,
@@ -152,7 +152,7 @@ def test_read_manifest_rejects_missing_directory(work_dir: Path) -> None:
 def test_read_manifest_rejects_missing_file(work_dir: Path) -> None:
     empty = work_dir / "empty"
     empty.mkdir()
-    with pytest.raises(ManifestError, match="manifest.json"):
+    with pytest.raises(ManifestError, match=r"manifest\.json"):
         MapPackageReader().read_manifest(empty)
 
 

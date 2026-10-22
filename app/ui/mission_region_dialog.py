@@ -54,6 +54,7 @@ from app.config.settings import (
     UI_TEXT_MISSION_ROUTE_REQUIRED,
 )
 from app.geo.geojson_loader import GeoJSONError
+from app.mission.mission_region_service import MissionRegionService
 from app.mission.models import (
     MISSION_REGION_LEVEL,
     MissionError,
@@ -62,7 +63,6 @@ from app.mission.models import (
     km_to_meters,
     meters_to_km,
 )
-from app.mission.mission_region_service import MissionRegionService
 from app.planning.zoom_strategy import ZoomPlanEstimate
 from app.ui.widgets import WrappingLabel, apply_secondary_text
 

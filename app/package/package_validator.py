@@ -45,8 +45,8 @@ PASS / WARNING / FAIL（Spec §13）
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from app.config.settings import (
     PACKAGE_BOUNDS_TOLERANCE,
@@ -70,8 +70,8 @@ from app.geo import format_size
 from app.mbtiles import MBTilesDiagnosticsResult
 from app.package import checksum as package_checksum
 from app.package.models import (
-    MapPackageManifest,
     ManifestError,
+    MapPackageManifest,
     PackageProgress,
     PackageValidationResult,
 )
@@ -325,7 +325,9 @@ class MapPackageValidator:
         metadata = dict(diagnostics.metadata)
 
         # --- 关键项 ---
-        if diagnostics.min_zoom is not None and diagnostics.max_zoom is not None:
+        # SIM102：不合并成一条 `and`。合并后那行会变成 4 层缩进、跨行的巨型条件，
+        # 而这里表达的是"先确认两个值都在，再比较这一对"——两步有先后语义。
+        if diagnostics.min_zoom is not None and diagnostics.max_zoom is not None:  # noqa: SIM102
             if (manifest.min_zoom, manifest.max_zoom) != (
                 diagnostics.min_zoom,
                 diagnostics.max_zoom,
@@ -521,7 +523,7 @@ class MapPackageValidator:
         start, end = PACKAGE_VALIDATE_STAGE_RANGES.get(stage, (0, 100))
         if total > 0:
             ratio = max(0.0, min(1.0, current / total))
-            percent = start + int(round((end - start) * ratio))
+            percent = start + round((end - start) * ratio)
         else:
             percent = start
         callback(

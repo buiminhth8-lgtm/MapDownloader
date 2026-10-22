@@ -199,9 +199,9 @@ def _seed_existing(window, tiles: int = 3) -> Path:
 
 def _build_window(qapp, work_dir: Path):
     """装配一个走临时目录 / 临时偏好、且网络被打桩的主窗口。"""
-    import app.ui.main_window as main_window_module
     from PySide6.QtCore import QSettings
 
+    import app.ui.main_window as main_window_module
     from app.providers import TiandituProvider
     from app.tasks import TaskService, TaskStore
     from app.ui.main_window import MainWindow

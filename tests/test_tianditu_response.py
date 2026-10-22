@@ -26,8 +26,11 @@ from app.providers import (
     detect_image_format,
     is_error_content_type,
     is_valid_tile_response,
+)
+from app.providers import (
     test_tile as request_single_tile,
 )
+
 # 注意：``test_tile`` 以 test_ 开头，若直接按原名导入，pytest 会把它误当成测试函数
 # 收集（并因缺少 fixture 报错），因此统一用别名 ``request_single_tile``。
 
@@ -46,7 +49,7 @@ XML_BYTES = (
     b"Token is not valid</ServiceException>"
 )
 JSON_BYTES = b'{"code":401,"message":"invalid token"}'
-TEXT_BYTES = "Token错误，请检查服务密钥".encode("utf-8")
+TEXT_BYTES = "Token错误，请检查服务密钥".encode()
 
 Handler = Callable[[httpx.Request], httpx.Response]
 

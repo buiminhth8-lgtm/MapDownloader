@@ -92,7 +92,7 @@ class UiTaskState(Enum):
         )
 
     @classmethod
-    def from_status(cls, status: DownloadTaskStatus) -> "UiTaskState":
+    def from_status(cls, status: DownloadTaskStatus) -> UiTaskState:
         """把持久化状态映射成界面状态。
 
         Args:

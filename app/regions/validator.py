@@ -32,7 +32,7 @@ from app.regions.models import (
     RegionPreset,
 )
 
-__all__ = ["validate_catalog", "find_parent_cycles"]
+__all__ = ["find_parent_cycles", "validate_catalog"]
 
 #: 声明 bounds 与几何实际范围比对的容差。两者本来是同一次计算的产物，
 #: 任何可测量的差异都说明 ``index.json`` 里的值是手抄的（Spec §11 禁止的事）。
@@ -231,8 +231,8 @@ def _bounds_text(entry: RegionPreset) -> str:
 
 def _bounds_text_geo(bounds: object) -> str:
     return (
-        f"({getattr(bounds, 'west')}, {getattr(bounds, 'south')}, "
-        f"{getattr(bounds, 'east')}, {getattr(bounds, 'north')})"
+        f"({bounds.west}, {bounds.south}, "
+        f"{bounds.east}, {bounds.north})"
     )
 
 

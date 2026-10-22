@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-__all__ = ["RegionLevel", "PARENT_LEVEL_RULES", "ADMINISTRATIVE_LEVELS"]
+__all__ = ["ADMINISTRATIVE_LEVELS", "PARENT_LEVEL_RULES", "RegionLevel"]
 
 
 class RegionLevel(Enum):
@@ -67,7 +67,7 @@ class RegionLevel(Enum):
     # 解析与展示
     # ------------------------------------------------------------------ #
     @classmethod
-    def parse(cls, value: object) -> "RegionLevel":
+    def parse(cls, value: object) -> RegionLevel:
         """宽容解析：认不出来的一律按 :attr:`CUSTOM` 处理。
 
         "认不出 → CUSTOM" 而不是抛异常，是因为这个方法的调用方是**读历史数据**
@@ -160,7 +160,7 @@ class RegionLevel(Enum):
 #:
 #: ``MISSION`` / ``CUSTOM`` **刻意不在表内**：它们不参与行政层级（Spec §6），
 #: 查不到就表示"没有等级约束"，与"必须是根"是两回事。
-PARENT_LEVEL_RULES: dict["RegionLevel", "frozenset[RegionLevel]"] = {
+PARENT_LEVEL_RULES: dict[RegionLevel, frozenset[RegionLevel]] = {
     RegionLevel.COUNTRY: frozenset(),
     RegionLevel.PROVINCE: frozenset({RegionLevel.COUNTRY}),
     RegionLevel.CITY: frozenset({RegionLevel.PROVINCE}),
@@ -169,7 +169,7 @@ PARENT_LEVEL_RULES: dict["RegionLevel", "frozenset[RegionLevel]"] = {
 
 #: 纳入行政层级的等级，**从** :data:`PARENT_LEVEL_RULES` 推导。
 #: 不手写第二份列表：多写一份就一定会有人在加等级时漏掉。
-ADMINISTRATIVE_LEVELS: tuple["RegionLevel", ...] = tuple(PARENT_LEVEL_RULES)
+ADMINISTRATIVE_LEVELS: tuple[RegionLevel, ...] = tuple(PARENT_LEVEL_RULES)
 
 
 #: 等级 → 中文展示名。集中在这里，避免 UI 里出现 ``if level is COUNTRY: "全国"``

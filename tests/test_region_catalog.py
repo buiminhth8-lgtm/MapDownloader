@@ -23,11 +23,12 @@ from app.regions import (
     INDEX_FILENAME,
     RegionCatalog,
     RegionCatalogError,
-    RegionService,
     RegionLoader,
+    RegionService,
 )
 from app.regions.catalog import parse_index_payload
 from app.regions.models import CatalogIssueCode
+
 
 # --------------------------------------------------------------------------- #
 # 辅助

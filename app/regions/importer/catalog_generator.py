@@ -142,7 +142,7 @@ def _write_manifest(
     """写 dataset manifest（Spec §14）。"""
     # 只数四个行政等级（ADMINISTRATIVE_LEVELS 就是 COUNTRY/PROVINCE/CITY/COUNTY，
     # 从 PARENT_LEVEL_RULES 推导 —— 不在这里手写等级成员名）。
-    counts = {level: 0 for level in ADMINISTRATIVE_LEVELS}
+    counts = dict.fromkeys(ADMINISTRATIVE_LEVELS, 0)
     for entry in entries:
         if entry.level in counts:
             counts[entry.level] += 1

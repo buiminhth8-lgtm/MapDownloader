@@ -30,8 +30,7 @@ from app.planning.plan_service import PlanService
 from app.planning.plan_store import PlanStore
 from app.planning.plan_validator import PlanIssueCode
 from app.regions.service import RegionService
-from app.tasks.task_service import TaskStore
-from app.tasks.task_service import TaskService
+from app.tasks.task_service import TaskService, TaskStore
 from app.ui.download_plan_dialog import (
     PLAN_ACTION_CLEAR,
     PLAN_ACTION_ESTIMATE,

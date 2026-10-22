@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.planning.region_level import RegionLevel
 from app.regions.catalog import INDEX_FILENAME, RegionCatalog
 from app.regions.importer import (
     RegionImportConfig,
@@ -27,7 +26,6 @@ from app.regions.importer import (
     read_source,
 )
 from app.regions.importer.models import DATASET_MANIFEST_FILENAME
-
 from tests.conftest import REGION_IMPORT_FIXTURE_ROOT
 
 
@@ -71,7 +69,7 @@ def test_layout_matches_the_documented_tree(tmp_path: Path) -> None:
 # 单 Region GeoJSON（Spec §11）
 # --------------------------------------------------------------------------- #
 def test_single_region_geojson_is_a_feature_with_full_properties(tmp_path: Path) -> None:
-    generated, config, _entries = _generate(tmp_path)
+    generated, _config, _entries = _generate(tmp_path)
 
     payload = json.loads(
         (generated.root / "province" / "test_province_a.geojson").read_text(
@@ -100,10 +98,7 @@ def test_original_code_is_kept_when_id_was_sanitized(tmp_path: Path) -> None:
     generated, _config, _entries = _generate(tmp_path, "sanitize_ids.geojson")
 
     # 纯中文 code → 哈希 id，原值进 originalCode。
-    hashed = [
-        path
-        for path in (generated.root / "province").glob("*.geojson")
-    ]
+    hashed = list((generated.root / "province").glob("*.geojson"))
     originals = set()
     for path in hashed:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -188,7 +183,7 @@ def test_deep_validation_of_generated_catalog_passes(tmp_path: Path) -> None:
 # dataset manifest（Spec §14）
 # --------------------------------------------------------------------------- #
 def test_dataset_manifest_records_version_source_and_counts(tmp_path: Path) -> None:
-    generated, config, _entries = _generate(
+    generated, _config, _entries = _generate(
         tmp_path,
         source_name="测试来源",
         source_license="测试授权",

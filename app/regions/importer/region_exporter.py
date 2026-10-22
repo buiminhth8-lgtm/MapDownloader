@@ -31,6 +31,7 @@ GeoJSON。导入期校验（import_service）与目录期校验（catalog/valida
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import time
@@ -45,10 +46,10 @@ from app.regions.models import CatalogValidationResult, RegionCatalogError
 from app.regions.validator import validate_catalog
 
 __all__ = [
-    "publish_dataset",
-    "discard_build",
-    "validate_built_catalog",
     "PublishError",
+    "discard_build",
+    "publish_dataset",
+    "validate_built_catalog",
 ]
 
 
@@ -140,10 +141,8 @@ def publish_dataset(build_dir: Path, output_root: Path) -> Path:
     try:
         os.replace(build_dir, output_root)
     except OSError as exc:
-        try:
+        with contextlib.suppress(OSError):  # pragma: no cover - 恢复也失败只能如实报
             os.replace(backup, output_root)  # 恢复旧数据
-        except OSError:  # pragma: no cover - 恢复也失败只能如实报
-            pass
         raise PublishError(
             f"发布失败（{build_dir} → {output_root}）：{exc}；旧数据已尝试恢复"
         ) from exc

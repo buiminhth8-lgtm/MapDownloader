@@ -41,17 +41,17 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from app.config.settings import (
     DEFAULT_AVERAGE_TILE_SIZE,
     DEFAULT_MISSION_BUFFER_METERS,
     DEFAULT_TASKS_DIR,
     MISSION_ID_PREFIX,
-    PLANS_FILE_NAME,
     PLAN_EXECUTIONS_FILE_NAME,
+    PLANS_FILE_NAME,
     TASKS_FILE_NAME,
     UI_TEXT_MISSION_DELETE_REFERENCED,
     UI_TEXT_MISSION_NOT_FOUND,
@@ -63,9 +63,7 @@ from app.geo.region import (
     register_region_resolver,
     unregister_region_resolver,
 )
-from app.planning.zoom_strategy import ZoomPlanEstimate, ZoomStrategyService
-from app.regions.models import RegionCatalogError, RegionPreset
-from app.regions.service import RegionService, install_region_catalog_resolver
+from app.mission.mission_region_store import MissionRegionStore
 from app.mission.models import (
     MISSION_REGION_LEVEL,
     MissionRegion,
@@ -78,23 +76,24 @@ from app.mission.models import (
     now_iso,
     require_mission_id,
 )
-from app.mission.mission_region_store import MissionRegionStore
 from app.mission.region_builder import (
-    MissionGeometry,
     MissionRegionBuilder,
     region_geojson_document,
     route_geojson_document,
 )
 from app.mission.route_loader import load_route_waypoints
+from app.planning.zoom_strategy import ZoomPlanEstimate, ZoomStrategyService
+from app.regions.models import RegionCatalogError, RegionPreset
+from app.regions.service import RegionService, install_region_catalog_resolver
 
 __all__ = [
-    "MissionRegionService",
-    "CompositeRegionService",
-    "install_mission_region_resolver",
-    "uninstall_mission_region_resolver",
-    "reset_mission_region_resolver",
     "MISSION_REFERENCE_FILES",
+    "CompositeRegionService",
+    "MissionRegionService",
+    "install_mission_region_resolver",
     "mission_reference_files",
+    "reset_mission_region_resolver",
+    "uninstall_mission_region_resolver",
 ]
 
 _logger = logging.getLogger(__name__)

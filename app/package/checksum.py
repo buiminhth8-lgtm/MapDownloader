@@ -26,8 +26,8 @@ import hashlib
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from app.config.settings import (
     PACKAGE_COPY_CHUNK_SIZE,
@@ -39,8 +39,8 @@ __all__ = [
     "ByteProgressCallback",
     "calculate_sha256",
     "copy_file",
-    "verify_sha256",
     "file_size",
+    "verify_sha256",
 ]
 
 _logger = logging.getLogger(__name__)

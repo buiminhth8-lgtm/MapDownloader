@@ -239,7 +239,6 @@ def make_dialog(plan_service, task_service, store, runner, auto_estimate: bool):
 
 def build_plan(plan_service, task_service, work_dir: Path, *region_ids: str):
     """加区域 + 估算 + 生成任务，返回一份就绪的计划。"""
-    from app.planning.plan_service import PlanService
 
     for region_id in region_ids:
         plan_service.add_region(region_id)
@@ -255,7 +254,7 @@ def scene_start_and_finish(app, plan_service, task_service, store, work_dir, che
     checker.section("场景 A：点「开始计划」→ 两个区域依次跑完 → 已完成")
     from tests.plan_fakes import FakeRunner
 
-    plan = build_plan(plan_service, task_service, work_dir, "demoland", "northland")
+    build_plan(plan_service, task_service, work_dir, "demoland", "northland")
     runner = FakeRunner()
     dialog = make_dialog(plan_service, task_service, store, runner, auto_estimate=False)
     dialog.show()
@@ -328,7 +327,7 @@ def scene_pause_resume(app, plan_service, task_service, store, work_dir, checker
     checker.section("场景 B：暂停 → 编辑锁定 → 继续 → 接着跑完")
     from tests.plan_fakes import FakeRunner
 
-    plan = build_plan(plan_service, task_service, work_dir, "demoland", "northland")
+    build_plan(plan_service, task_service, work_dir, "demoland", "northland")
     runner = FakeRunner(hang_once=True)
     dialog = make_dialog(plan_service, task_service, store, runner, auto_estimate=False)
     dialog.show()
@@ -344,7 +343,7 @@ def scene_pause_resume(app, plan_service, task_service, store, work_dir, checker
     checker.check(paused, "点「暂停」后计划进入「已暂停」", "超过 30s")
     _pump(app, 10)
 
-    execution = dialog.execution()
+    dialog.execution()
     checker.check("已暂停" in dialog.run_status_lines()[0], "状态行说「已暂停」", dialog.run_status_lines()[0])
     checker.check(
         dialog.run_buttons()["resume"].isEnabled() is True
@@ -409,7 +408,7 @@ def scene_failure_retry_skip(app, work_dir, checker, shots):
 
     # --- 重试（独立 services） ---------------------------------------- #
     ps_r, ts_r, store_r = make_services(work_dir / "c1")
-    plan = build_plan(ps_r, ts_r, work_dir / "c1", "demoland", "northland")
+    build_plan(ps_r, ts_r, work_dir / "c1", "demoland", "northland")
     runner = FakeRunner(fail_on=("demoland",), fail_times=1)
     dialog = make_dialog(ps_r, ts_r, store_r, runner, auto_estimate=False)
     dialog.show()
@@ -441,7 +440,7 @@ def scene_failure_retry_skip(app, work_dir, checker, shots):
 
     # --- 跳过（独立 services） ---------------------------------------- #
     ps_s, ts_s, store_s = make_services(work_dir / "c2")
-    plan = build_plan(ps_s, ts_s, work_dir / "c2", "demoland", "northland")
+    build_plan(ps_s, ts_s, work_dir / "c2", "demoland", "northland")
     runner = FakeRunner(fail_on=("demoland",))
     dialog = make_dialog(ps_s, ts_s, store_s, runner, auto_estimate=False)
     dialog.show()
@@ -480,7 +479,7 @@ def scene_cancel(app, plan_service, task_service, store, work_dir, checker, shot
     checker.section("场景 D：取消 → 先问一句 → 半截的成果保留")
     from tests.plan_fakes import FakeRunner
 
-    plan = build_plan(plan_service, task_service, work_dir, "demoland", "northland")
+    build_plan(plan_service, task_service, work_dir, "demoland", "northland")
     runner = FakeRunner(hang=True)
     dialog = make_dialog(plan_service, task_service, store, runner, auto_estimate=False)
     dialog.show()

@@ -21,8 +21,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import time
 from pathlib import Path
 
@@ -38,7 +38,6 @@ from app.planning.plan_execution_store import PlanExecutionStore
 from app.planning.plan_scheduler import (
     PlanScheduler,
     PlanSchedulerError,
-    PlanTaskOutcome,
 )
 from app.planning.plan_service import PlanService
 from app.planning.plan_store import PlanStore
@@ -47,8 +46,11 @@ from app.tasks.task_service import TaskService
 from app.tasks.task_store import TaskStore
 from tests.plan_fakes import (
     ExplodingRunner as _ExplodingRunner,
+)
+from tests.plan_fakes import (
     FakeRunner as _FakeRunner,
-    ProgressLike as _ProgressLike,
+)
+from tests.plan_fakes import (
     ready_plan as _ready,
 )
 
@@ -482,7 +484,7 @@ async def test_cancel_keeps_every_file_and_task_record_on_disk(
     execution = await running
 
     first = task_service.get_task(execution.items[0].task_id)
-    second = task_service.get_task(execution.items[1].task_id)
+    task_service.get_task(execution.items[1].task_id)
     assert Path(first.output_path).exists(), "半截的 MBTiles 必须留着"
     assert len(task_service.list_tasks()) == 2, "任务记录一条都不许删"
 
@@ -865,9 +867,12 @@ def test_the_scheduler_does_not_import_the_engine_at_module_level() -> None:
             offenders.extend(
                 alias.name for alias in node.names if _matches(alias.name, forbidden)
             )
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            if _matches(node.module, forbidden):
-                offenders.append(node.module)
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and _matches(node.module, forbidden)
+        ):
+            offenders.append(node.module)
     assert not offenders, f"模块顶层不该 import：{offenders}"
 
 
@@ -926,7 +931,7 @@ def test_the_scheduler_does_not_kill_threads() -> None:
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
-def _paused_execution_for(plan: DownloadPlan, tasks) -> "object":
+def _paused_execution_for(plan: DownloadPlan, tasks) -> object:
     """造一份"跑到一半被暂停"的执行记录（用于恢复类用例）。
 
     直接用 ``new_execution_for`` + 手工把状态改成 PAUSED：这正是"上周三点了

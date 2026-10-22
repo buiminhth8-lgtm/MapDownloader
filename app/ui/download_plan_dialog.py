@@ -57,7 +57,7 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -185,7 +185,7 @@ class DownloadPlanDialog(QDialog):
         parent: QWidget | None = None,
         *,
         auto_estimate: bool = True,
-        scheduler_factory: "Callable[[], PlanScheduler] | None" = None,
+        scheduler_factory: Callable[[], PlanScheduler] | None = None,
     ) -> None:
         """
         Args:
@@ -1169,8 +1169,8 @@ class DownloadPlanDialog(QDialog):
         "状态行"就有两个真值了。
         """
         self._progress = progress
-        self._task_progress_bar.setValue(int(round(progress.current_task_percent)))
-        self._plan_progress_bar.setValue(int(round(progress.plan_percent)))
+        self._task_progress_bar.setValue(round(progress.current_task_percent))
+        self._plan_progress_bar.setValue(round(progress.plan_percent))
         lines = progress.as_lines()
         self._run_state_label.setText("　".join(lines[0:3]))
         self._run_detail_label.setText("　".join(lines[3:5]))

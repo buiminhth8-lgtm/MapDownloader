@@ -26,11 +26,11 @@ from app.geo.tile_math import validate_zoom
 from app.planning.region_level import RegionLevel
 
 __all__ = [
+    "ZOOM_CURRENT_LABEL",
+    "ZOOM_RECOMMEND_LABEL",
+    "ZOOM_WARNING_PREFIX",
     "ZoomPolicy",
     "ZoomRecommendation",
-    "ZOOM_RECOMMEND_LABEL",
-    "ZOOM_CURRENT_LABEL",
-    "ZOOM_WARNING_PREFIX",
 ]
 
 #: 界面 / 日志里的固定前缀。放这里而不是 UI 里，是因为

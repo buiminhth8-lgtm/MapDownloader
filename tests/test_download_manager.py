@@ -15,15 +15,14 @@ import asyncio
 import inspect
 import logging
 import time
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 
 from app.config.settings import (
     MAX_DOWNLOAD_CONCURRENCY,
-    PROGRESS_EMIT_INTERVAL_SECONDS,
 )
 from app.downloader import (
     DownloadManager,
@@ -553,8 +552,14 @@ async def test_concurrency_does_not_change_results() -> None:
         manager = DownloadManager(downloader, concurrency=concurrency)
         seen: list[TileCoordinate] = []
         async with downloader:
+            # B023 在这里是误报：`seen` 每轮循环都重新绑定，而 `download()`
+            # 返回前回调已全部同步调用完，lambda 不会活到下一轮。
             await manager.download(
-                SMALL_BOUNDS, 12, 12, LAYER, on_tile=lambda r: seen.append(r.tile)
+                SMALL_BOUNDS,
+                12,
+                12,
+                LAYER,
+                on_tile=lambda r: seen.append(r.tile),  # noqa: B023
             )
         results.append(set(seen))
 

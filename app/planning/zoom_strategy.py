@@ -34,10 +34,10 @@ if TYPE_CHECKING:  # pragma: no cover - 只给类型检查器看
     from app.geo.region_estimator import RegionTileEstimate
 
 __all__ = [
-    "ZoomStrategyService",
-    "ZoomPlanEstimate",
-    "PLAN_TILES_LABEL",
     "PLAN_SIZE_LABEL",
+    "PLAN_TILES_LABEL",
+    "ZoomPlanEstimate",
+    "ZoomStrategyService",
 ]
 
 #: 「推荐 + 预估」文案的固定前缀（与 :class:`RegionTileEstimate` 的用语保持一致，
@@ -77,7 +77,7 @@ class ZoomPlanEstimate:
     """
 
     recommendation: ZoomRecommendation
-    estimate: "RegionTileEstimate"
+    estimate: RegionTileEstimate
     estimated_min_zoom: int
     estimated_max_zoom: int
     average_tile_size: int
@@ -235,7 +235,7 @@ class ZoomStrategyService:
 
     def recommend_with_estimate(
         self,
-        region: "DownloadRegion",
+        region: DownloadRegion,
         level: object,
         *,
         min_zoom: int | None = None,

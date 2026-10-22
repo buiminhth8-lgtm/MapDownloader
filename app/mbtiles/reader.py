@@ -65,14 +65,14 @@ from app.geo import (
 )
 
 __all__ = [
-    "MBTilesReader",
+    "EXISTING_TILES_BY_ZOOM_SQL",
+    "EXISTING_TILES_SQL",
+    "TILE_COUNT_BY_ZOOM_SQL",
+    "TILE_DATA_SQL",
     # 只读 SQL 常量：``writer.py`` 复用它做"已存在瓦片"查询，
     # 避免两处各写一份 SQL（一处改错就会出现"写的和查的不是同一张表"）。
     "TILE_EXISTS_SQL",
-    "TILE_DATA_SQL",
-    "EXISTING_TILES_SQL",
-    "EXISTING_TILES_BY_ZOOM_SQL",
-    "TILE_COUNT_BY_ZOOM_SQL",
+    "MBTilesReader",
 ]
 
 
@@ -159,7 +159,7 @@ _DUPLICATE_TILES_SQL = (
 _COUNT_DUPLICATE_TILES_SQL = f"SELECT COUNT(*) FROM ({_DUPLICATE_TILES_SQL})"
 
 #: 某一列（固定 x）上落在给定 TMS 行区间里的行号。缺失瓦片定位用：
-#: 逐列判断"这一列缺不缺"，缺了才逐行展开（见 diagnostics.collect_missing_details）。
+#: 逐列判断"这一列缺不缺"，缺了才逐行展开（见 diagnostics._missing_in_range）。
 _TILE_ROWS_IN_COLUMN_SQL = (
     "SELECT tile_row FROM tiles "
     "WHERE zoom_level = ? AND tile_column = ? AND tile_row BETWEEN ? AND ?"
@@ -300,7 +300,7 @@ class MBTilesReader:
         if conn is not None:
             conn.close()
 
-    def __enter__(self) -> "MBTilesReader":
+    def __enter__(self) -> MBTilesReader:
         self.open()
         return self
 
@@ -322,7 +322,7 @@ class MBTilesReader:
             sqlite3.DatabaseError: ``metadata`` 表不存在。
         """
         conn = self._require_open()
-        return {name: value for name, value in conn.execute(_SELECT_METADATA_SQL)}
+        return dict(conn.execute(_SELECT_METADATA_SQL))
 
     def get_tile_count(self) -> int:
         """瓦片总数。
@@ -535,7 +535,7 @@ class MBTilesReader:
 
         缺失瓦片定位用：先按列判断"这一列缺不缺"（一次计数），
         确认缺了才逐行展开 —— 否则在世界范围的大库上会退化成
-        逐格扫描几亿次（见 :func:`app.mbtiles.diagnostics.collect_missing_details`）。
+        逐格扫描几亿次（见 :func:`app.mbtiles.diagnostics._missing_in_range`）。
 
         Yields:
             TMS 行号（升序）。

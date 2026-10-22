@@ -24,7 +24,7 @@ import re
 
 from app.config.settings import DEFAULT_MAP_NAME
 
-__all__ = ["sanitize_map_name", "sanitize_filename"]
+__all__ = ["sanitize_filename", "sanitize_map_name"]
 
 
 #: Windows 文件名非法字符（``\\ / : * ? " < > |``）与其余控制字符

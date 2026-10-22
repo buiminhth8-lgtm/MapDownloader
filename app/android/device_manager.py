@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from app.android.adb_client import AdbClient, AdbCommandResult, ERROR_ADB_MISSING
+from app.android.adb_client import ERROR_ADB_MISSING, AdbClient
 from app.config.settings import (
     ADB_DEVICES_HEADER,
     ANDROID_PROP_ANDROID_VERSION,

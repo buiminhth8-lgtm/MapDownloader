@@ -42,7 +42,7 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
-from app.android.adb_client import AdbClient, ERROR_CANCELLED, ERROR_DEVICE_DISCONNECTED
+from app.android.adb_client import ERROR_CANCELLED, ERROR_DEVICE_DISCONNECTED, AdbClient
 from app.android.device_manager import DeviceManager
 from app.android.transfer_models import (
     TransferPlan,
@@ -72,7 +72,6 @@ from app.config.settings import (
     TRANSFER_ERROR_DISCONNECTED,
     TRANSFER_ERROR_LOCAL_FILE_MISSING,
     TRANSFER_ERROR_LOCAL_SIZE_MISMATCH,
-    TRANSFER_ERROR_REMOTE_ROOT,
     TRANSFER_ERROR_MKDIR,
     TRANSFER_ERROR_NO_SPACE,
     TRANSFER_ERROR_NOT_DIR,
@@ -80,6 +79,7 @@ from app.config.settings import (
     TRANSFER_ERROR_PUSH_MANIFEST,
     TRANSFER_ERROR_PUSH_MBTILES,
     TRANSFER_ERROR_REMOTE_DELETE,
+    TRANSFER_ERROR_REMOTE_ROOT,
     TRANSFER_ERROR_RENAME,
     TRANSFER_ERROR_SHA256_MISMATCH,
     TRANSFER_ERROR_SIZE_MISMATCH,

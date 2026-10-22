@@ -53,12 +53,12 @@ from app.regions.models import (
 
 __all__ = [
     "INDEX_FILENAME",
-    "SUPPORTED_INDEX_VERSIONS",
     "REGION_ROOT_KEY",
+    "SUPPORTED_INDEX_VERSIONS",
     "RegionCatalog",
-    "region_resource_root",
     "effective_region_root",
     "parse_index_payload",
+    "region_resource_root",
 ]
 
 #: 目录元数据的固定文件名（Spec §1 / §18）。
@@ -383,14 +383,14 @@ class RegionCatalog:
     # 构造
     # ------------------------------------------------------------------ #
     @classmethod
-    def empty(cls, *, root: Path | None = None) -> "RegionCatalog":
+    def empty(cls, *, root: Path | None = None) -> RegionCatalog:
         """空目录（目录文件还没就位时用它顶上，见 RegionService 的兜底）。"""
         return cls((), root=root)
 
     @classmethod
     def from_payload(
         cls, payload: object, *, root: Path | None = None
-    ) -> "RegionCatalog":
+    ) -> RegionCatalog:
         """从已经读进内存的 JSON 结构构造（测试与诊断用）。"""
         issues: list[CatalogIssue] = []
         presets = parse_index_payload(payload, issues=issues)
@@ -398,7 +398,7 @@ class RegionCatalog:
         return catalog
 
     @classmethod
-    def from_index(cls, path: Path, *, root: Path | None = None) -> "RegionCatalog":
+    def from_index(cls, path: Path, *, root: Path | None = None) -> RegionCatalog:
         """读一个显式路径的 index.json。目录不存在时抛 :class:`RegionCatalogError`。"""
         index_path = Path(path)
         if not index_path.is_file():
@@ -427,7 +427,7 @@ class RegionCatalog:
         return catalog
 
     @classmethod
-    def load(cls, *, root: Path | None = None) -> "RegionCatalog":
+    def load(cls, *, root: Path | None = None) -> RegionCatalog:
         """读 ``<root>/index.json``（``root`` 缺省为资源根目录）。
 
         Raises:

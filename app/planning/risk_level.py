@@ -25,9 +25,9 @@ from __future__ import annotations
 from enum import Enum
 
 __all__ = [
-    "RiskLevel",
-    "RISK_LEVEL_ORDER",
     "RISK_LABEL",
+    "RISK_LEVEL_ORDER",
+    "RiskLevel",
 ]
 
 
@@ -81,7 +81,7 @@ class RiskLevel(Enum):
         """是否无需任何确认。"""
         return self is RiskLevel.NORMAL
 
-    def at_least(self, other: "RiskLevel") -> bool:
+    def at_least(self, other: RiskLevel) -> bool:
         """本等级是否**不低于** ``other``。
 
         Raises:
@@ -89,7 +89,7 @@ class RiskLevel(Enum):
         """
         return self.severity >= _require_level(other, "other").severity
 
-    def worst(self, other: "RiskLevel") -> "RiskLevel":
+    def worst(self, other: RiskLevel) -> RiskLevel:
         """两个等级里更严重的那个。"""
         return self if self.severity >= _require_level(other, "other").severity else other
 
@@ -110,7 +110,7 @@ class RiskLevel(Enum):
     # 构造
     # ------------------------------------------------------------------ #
     @classmethod
-    def parse(cls, value: object) -> "RiskLevel":
+    def parse(cls, value: object) -> RiskLevel:
         """把外部值（字符串 / 枚举）收敛成等级。
 
         认不出来一律退回 :attr:`NORMAL` 而不是抛异常：等级会出现在**旧版本
@@ -126,7 +126,7 @@ class RiskLevel(Enum):
         return cls.NORMAL
 
     @classmethod
-    def worst_of(cls, *levels: "RiskLevel") -> "RiskLevel":
+    def worst_of(cls, *levels: RiskLevel) -> RiskLevel:
         """一组等级里最严重的那个；空集合 → :attr:`NORMAL`。"""
         result = cls.NORMAL
         for item in levels:

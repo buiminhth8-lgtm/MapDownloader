@@ -46,7 +46,7 @@ from app.planning.risk_models import (
 from app.planning.risk_policy import DEFAULT_RISK_POLICY, RiskPolicy
 from app.planning.zoom_strategy import ZoomStrategyService
 
-__all__ = ["DownloadRiskAnalyzer", "RISK_ESTIMATE_ATTRS"]
+__all__ = ["RISK_ESTIMATE_ATTRS", "DownloadRiskAnalyzer"]
 
 _logger = logging.getLogger(__name__)
 
@@ -514,9 +514,9 @@ def _read_estimate(estimate: object) -> tuple[int, int, tuple[object, ...]]:
             + f"，实际缺少：{'、'.join(missing)} —— "
             "风险分析只吃现成的估算结果，不接受'先给我几何我算给你看'"
         )
-    per_zoom = getattr(estimate, "per_zoom") or ()
+    per_zoom = estimate.per_zoom or ()
     return (
-        int(getattr(estimate, "selected_tiles")),
-        int(getattr(estimate, "estimated_size_bytes")),
+        int(estimate.selected_tiles),
+        int(estimate.estimated_size_bytes),
         tuple(per_zoom),
     )

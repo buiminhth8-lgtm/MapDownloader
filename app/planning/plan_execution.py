@@ -56,9 +56,10 @@ Spec 把执行态枚举命名为 ``PlanItemStatus``，但这个名字在 Slice 2
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any
 
 from app.geo.tile_math import format_size
 from app.planning.download_plan import DownloadPlan, DownloadPlanItem

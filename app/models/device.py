@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-__all__ = ["Device", "AndroidDevice", "DeviceState"]
+__all__ = ["AndroidDevice", "Device", "DeviceState"]
 
 
 class DeviceState(Enum):
@@ -57,7 +57,7 @@ class DeviceState(Enum):
         return self is DeviceState.DEVICE
 
     @classmethod
-    def parse(cls, raw: str) -> "DeviceState":
+    def parse(cls, raw: str) -> DeviceState:
         """把 adb 给的原始状态串转成枚举；认不出来的一律归 ``UNKNOWN``。
 
         不抛异常：``adb`` 的输出来自设备与驱动，多一种怪状态不该让整个设备

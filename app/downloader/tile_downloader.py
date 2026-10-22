@@ -47,8 +47,8 @@ from app.downloader.retry_policy import RetryPolicy, should_retry
 from app.models.map_layer import MapLayerType
 from app.providers import (
     TiandituProvider,
-    describe_response,
     describe_exception,
+    describe_response,
     http_error_message,
     is_valid_tile_response,
     mask_url,

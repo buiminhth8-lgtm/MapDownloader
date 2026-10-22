@@ -31,9 +31,10 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from app.config.settings import (
     PACKAGE_DEFAULT_PROVIDER,
@@ -48,23 +49,23 @@ from app.geo import GeoBounds, format_size
 from app.mbtiles import SUPPORTED_TILE_FORMATS
 
 __all__ = [
-    "MapPackageManifest",
-    "PackageRegion",
-    "PackageBuildResult",
-    "PackageValidationResult",
-    "PackageProgress",
-    "PackageError",
-    "PackageAborted",
-    "ManifestError",
-    "ManifestPathError",
-    "UnsupportedFormatVersion",
-    "MANIFEST_FIELD_ORDER",
     "MANIFEST_BOUNDS_FIELDS",
+    "MANIFEST_FIELD_ORDER",
     "MANIFEST_MBTILES_FIELDS",
     "MANIFEST_REGION_FIELDS",
+    "ManifestError",
+    "ManifestPathError",
+    "MapPackageManifest",
+    "PackageAborted",
+    "PackageBuildResult",
+    "PackageError",
+    "PackageProgress",
+    "PackageRegion",
+    "PackageValidationResult",
+    "UnsupportedFormatVersion",
+    "now_iso",
     "parse_manifest_dict",
     "render_manifest_json",
-    "now_iso",
 ]
 
 
@@ -269,7 +270,7 @@ class PackageRegion:
         return {key: data[key] for key in MANIFEST_REGION_FIELDS if key in data}
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "PackageRegion":
+    def from_dict(cls, data: Mapping[str, Any]) -> PackageRegion:
         """从 JSON 结构还原。
 
         Raises:
@@ -289,7 +290,7 @@ class PackageRegion:
         )
 
     @classmethod
-    def for_rectangle(cls) -> "PackageRegion":
+    def for_rectangle(cls) -> PackageRegion:
         """矩形包的区域记录（Spec §21：矩形也要显式写出来）。"""
         return cls(region_type="rectangle")
 
@@ -518,7 +519,7 @@ class MapPackageManifest:
         return {key: data[key] for key in MANIFEST_FIELD_ORDER if key in data}
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "MapPackageManifest":
+    def from_dict(cls, data: Mapping[str, Any]) -> MapPackageManifest:
         """从 manifest 的 JSON 结构还原（Spec §11 的字段校验入口）。
 
         未知字段**忽略**（不报错）：未来版本加字段时，老解析器要能装作没看见，

@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.android.device_manager import DeviceManager, parse_devices_output
 from app.config.settings import (
     ANDROID_PROP_ANDROID_VERSION,

@@ -35,9 +35,9 @@ from app.config.settings import (
 )
 from app.mbtiles import MBTilesDiagnosticsResult
 from app.package import (
-    MapPackageBuilder,
     ManifestError,
     ManifestPathError,
+    MapPackageBuilder,
     UnsupportedFormatVersion,
 )
 from app.package.package_reader import MapPackageReader
@@ -45,7 +45,7 @@ from app.package.package_validator import MapPackageValidator
 from app.services import MBTilesInspectionService
 
 #: 复用 builder 测试里的造库夹具（同一个仓库、同一套约定，不重复实现）
-from tests.test_package_builder import _make_mbtiles, _png
+from tests.test_package_builder import _make_mbtiles
 
 
 # --------------------------------------------------------------------------- #

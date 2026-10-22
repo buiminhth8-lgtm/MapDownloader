@@ -18,7 +18,7 @@ import asyncio
 import inspect
 import io
 import sqlite3
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
@@ -142,10 +142,8 @@ async def _running(coro):
     finally:
         if not task.done():
             task.cancel()
-            try:
+            with suppress(asyncio.CancelledError, Exception):  # noqa: BLE001
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
 
 
 # --------------------------------------------------------------------------- #

@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
-import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -35,8 +35,8 @@ __all__ = [
     "CheckStatus",
     "EnvironmentCheck",
     "EnvironmentReport",
-    "run_environment_checks",
     "log_report",
+    "run_environment_checks",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -191,10 +191,8 @@ def _writable_directory_problem(path: Path) -> str | None:
         return f"目录不可写（{type(exc).__name__}: {exc}）"
     finally:
         # 就算写失败也要试着清理，别在自己的输出目录里留垃圾
-        try:
+        with contextlib.suppress(OSError):
             probe.unlink(missing_ok=True)
-        except OSError:
-            pass
     return None
 
 

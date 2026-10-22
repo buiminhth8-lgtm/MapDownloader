@@ -49,6 +49,8 @@ from app.models import (
 from app.planning import RegionLevel
 from app.planning.risk_policy import (
     LARGE_SIZE_THRESHOLD as RISK_LARGE_SIZE_THRESHOLD,
+)
+from app.planning.risk_policy import (
     LARGE_TILE_THRESHOLD as RISK_LARGE_TILE_THRESHOLD,
 )
 from app.providers import PNG_SIGNATURE, TiandituProvider
@@ -65,7 +67,6 @@ from app.ui.download_panel import (
     ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
-from app.ui.region_selection import ZoomMode
 from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
 from app.ui.main_window import MainWindow
@@ -73,9 +74,9 @@ from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
 from app.ui.package_dialog import (
     PackageBuildWorker,
     PackageDialog,
-    PackageValidateDialog,
     PackageValidateWorker,
 )
+from app.ui.region_selection import ZoomMode
 from app.ui.validation import auto_map_name
 from tests.android_fakes import FakeAdbClient
 
@@ -2962,7 +2963,7 @@ def test_inspector_dialog_has_no_qt_main_thread_sql() -> None:
 # --------------------------------------------------------------------------- #
 # Slice 9：离线地图包（Spec §16 ~ §21）
 # --------------------------------------------------------------------------- #
-def _open_package_dialog(window: MainWindow, path: "Path | str" = "") -> PackageDialog:
+def _open_package_dialog(window: MainWindow, path: Path | str = "") -> PackageDialog:
     """打开「生成地图包」窗口（主窗口的入口，不是直接 new 一个）。"""
     window.open_package_dialog(str(path) if path else "")
     dialog = window._package_dialog
@@ -3276,7 +3277,6 @@ def test_package_validate_dialog_reports_pass_then_fail(
     "改了文件却仍然显示 PASS"是这条 Slice 最坏的结果 —— 用户会带着一个坏包
     去导入。所以这条端到端（界面 → 后台线程 → 结论 → 文本区）必须有守卫。
     """
-    from app.config.settings import UI_TEXT_PACKAGE_VALIDATE_DONE_TITLE
     from app.package import MapPackageBuilder
 
     source = _make_complete_map(work_dir / "good.mbtiles")

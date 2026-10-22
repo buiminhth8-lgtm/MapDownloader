@@ -124,7 +124,7 @@ class PolygonTileRegionFilter:
     # ------------------------------------------------------------------ #
     # 判定
     # ------------------------------------------------------------------ #
-    def intersects_tile(self, tile: "TileCoordinate") -> bool:
+    def intersects_tile(self, tile: TileCoordinate) -> bool:
         """这张瓦片是否与区域相交。
 
         走鸭子类型（只读 ``tile.z / tile.x / tile.y``）而不是强制

@@ -209,7 +209,7 @@ class TransferPlan:
 
     serial: str = ""
     device_name: str = ""
-    device: "object | None" = None
+    device: object | None = None
     package_dir: str = ""
     package_id: str = ""
     package_name: str = ""

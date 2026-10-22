@@ -477,7 +477,7 @@ def test_tasks_file_stores_only_region_identifiers(
     """``tasks.json`` 里只能有类型 / id / 版本，**不能有边界坐标**。"""
     region = region_for(preset)
     path = work_dir / "task.mbtiles"
-    task = make_task(tasks_file, path, region, total_tiles=60)
+    make_task(tasks_file, path, region, total_tiles=60)
 
     raw = tasks_file.read_text(encoding="utf-8")
     payload = json.loads(raw)["tasks"][0]

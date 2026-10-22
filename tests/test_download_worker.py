@@ -21,9 +21,8 @@ import io
 from pathlib import Path
 
 import httpx
-import pytest
-from PySide6.QtCore import QThread
 from PIL import Image
+from PySide6.QtCore import QThread
 
 from app.geo import GeoBounds
 from app.mbtiles import MBTilesReader, MBTilesWriteError

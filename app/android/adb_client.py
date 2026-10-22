@@ -34,6 +34,7 @@ shell：``["adb", "-s", "SER", "shell", "mkdir", "-p", "/sdcard/x"]`` 里的每�
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -42,7 +43,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.config.settings import (
@@ -662,14 +663,10 @@ def _decode(raw: bytes | str) -> str:
 
 def _kill(popen: subprocess.Popen) -> None:
     """尽力终止子进程；失败也不抛（正在退出的进程 kill 会报错，那是正常的）。"""
-    try:
+    with contextlib.suppress(OSError):  # pragma: no cover - 进程刚好自己退了
         popen.kill()
-    except OSError:  # pragma: no cover - 进程刚好自己退了
-        pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):  # pragma: no cover
         popen.wait(timeout=5)
-    except (subprocess.TimeoutExpired, OSError):  # pragma: no cover
-        pass
 
 
 class _PercentTracker:

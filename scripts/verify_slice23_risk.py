@@ -822,6 +822,8 @@ def scene_plan(
     app, checker: Checker, work_dir: Path, shots: bool
 ) -> None:
     checker.section("场景 E：计划页（风险列 / 合计 / 四选一 / 危险档确认词）")
+    from tests.plan_fakes import FakeRunner
+
     from app.config.settings import (
         UI_TEXT_BUTTON_APPLY_RECOMMENDED_ALL,
         UI_TEXT_BUTTON_BACK_TO_EDIT,
@@ -836,7 +838,6 @@ def scene_plan(
     from app.regions.service import RegionService
     from app.tasks.task_service import TaskService, TaskStore
     from app.ui.download_plan_dialog import PLAN_ACTION_START
-    from tests.plan_fakes import FakeRunner
 
     data_dir = work_dir / "plan-data"
     data_dir.mkdir(parents=True, exist_ok=True)

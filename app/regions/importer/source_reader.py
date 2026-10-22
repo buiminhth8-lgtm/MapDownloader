@@ -51,7 +51,7 @@ from app.regions.importer.models import (
     map_level,
 )
 
-__all__ = ["read_source", "peek_property_keys"]
+__all__ = ["peek_property_keys", "read_source"]
 
 #: 本层认得的顶层文档类型。
 _SUPPORTED_TOP_TYPES = frozenset({"FeatureCollection", "Feature"})

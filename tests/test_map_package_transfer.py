@@ -275,7 +275,7 @@ def test_progress_is_monotonic_and_ends_at_100(work_dir: Path) -> None:
     """进度条只能向前、必须收在 100，且每个阶段都被走到（Spec §30）。"""
     package = _make_package(work_dir)
     events: list = []
-    result, _client_ = _transfer(work_dir, package, progress_callback=events.append)
+    result, _ = _transfer(work_dir, package, progress_callback=events.append)
 
     assert result.success is True
     percents = [event.percent for event in events]
@@ -309,7 +309,7 @@ def test_progress_without_percent_still_advances_stages(work_dir: Path) -> None:
     """``adb`` 不给百分比时退回阶段级进度，而不是编一个数字（Spec §22）。"""
     package = _make_package(work_dir)
     events: list = []
-    result, _client_ = _transfer(
+    result, _ = _transfer(
         work_dir, package, client=_client(push_percent=False), progress_callback=events.append
     )
     assert result.success is True
@@ -397,7 +397,7 @@ def test_unparsable_df_warns_but_continues(work_dir: Path) -> None:
     client = _client()
     client.device(SERIAL).available_bytes = None
 
-    result, _client_ = _transfer(work_dir, package, client=client)
+    result, _ = _transfer(work_dir, package, client=client)
     assert result.success is True
     assert any("无法确认设备剩余空间" in warning for warning in result.warnings)
 
@@ -424,7 +424,7 @@ def test_mbtiles_push_failure(work_dir: Path) -> None:
 
 def test_manifest_push_failure(work_dir: Path) -> None:
     package = _make_package(work_dir)
-    result, _client_ = _transfer(work_dir, package, client=_client(fail_push_manifest=True))
+    result, _ = _transfer(work_dir, package, client=_client(fail_push_manifest=True))
 
     assert result.success is False
     assert "manifest.json" in " ".join(result.errors)
@@ -447,7 +447,7 @@ def test_remote_size_mismatch(work_dir: Path) -> None:
     size = (package / PACKAGE_MBTILES_FILENAME).stat().st_size
     client = _client(size_override=size + 1)
 
-    result, _client_ = _transfer(work_dir, package, client=client)
+    result, _ = _transfer(work_dir, package, client=client)
     assert result.success is False
     assert result.size_verified is False
     assert "大小不一致" in " ".join(result.errors)
@@ -456,7 +456,7 @@ def test_remote_size_mismatch(work_dir: Path) -> None:
 def test_remote_size_unreadable(work_dir: Path) -> None:
     """远端大小读不到 → FAIL（"不知道"不等于"对的"）。"""
     package = _make_package(work_dir)
-    result, _client_ = _transfer(work_dir, package, client=_client(size_mode="unavailable"))
+    result, _ = _transfer(work_dir, package, client=_client(size_mode="unavailable"))
     assert result.success is False
     assert "无法读取远端文件大小" in " ".join(result.errors)
 
@@ -464,7 +464,7 @@ def test_remote_size_unreadable(work_dir: Path) -> None:
 def test_remote_sha256_mismatch(work_dir: Path) -> None:
     """摘要对不上必须 FAIL —— 文件在设备上是坏的，装上去只会出问题（Spec §41）。"""
     package = _make_package(work_dir)
-    result, _client_ = _transfer(work_dir, package, client=_client(sha256_mode="broken"))
+    result, _ = _transfer(work_dir, package, client=_client(sha256_mode="broken"))
 
     assert result.success is False
     assert result.checksum_verified is False
@@ -475,7 +475,7 @@ def test_remote_sha256_mismatch(work_dir: Path) -> None:
 def test_device_disconnects_during_push(work_dir: Path) -> None:
     """传输中掉线 → 明确报"传输中设备断开"，并**保留** ``.part``（Spec §35）。"""
     package = _make_package(work_dir)
-    result, client = _transfer(
+    result, _ = _transfer(
         work_dir, package, client=_client(disconnect_on_push=True)
     )
 
@@ -517,7 +517,7 @@ def test_partial_progress_is_reported_on_failure(work_dir: Path) -> None:
     """失败/取消也要如实报"传了多少"（用户据此判断要不要重来）。"""
     package = _make_package(work_dir)
     events: list = []
-    result, _client_ = _transfer(
+    result, _ = _transfer(
         work_dir, package, client=_client(cancel_push=True), progress_callback=events.append
     )
     assert result.cancelled is True
@@ -649,7 +649,7 @@ def test_sha256_unavailable_is_a_warning_not_a_failure(work_dir: Path) -> None:
 def test_sha256_comparison_uses_lowercase_hex(work_dir: Path) -> None:
     """大小写不该造成假失败：比较前统一小写。"""
     package = _make_package(work_dir)
-    result, _client_ = _transfer(work_dir, package)
+    result, _ = _transfer(work_dir, package)
     assert result.checksum_verified is True
 
     expected = hashlib.sha256(
@@ -713,6 +713,6 @@ def test_transfer_never_raises(work_dir: Path) -> None:
         def push(self, *args, **kwargs):  # noqa: ARG002
             raise RuntimeError("boom")
 
-    result, _client_ = _transfer(work_dir, package, client=Exploding())
+    result, _ = _transfer(work_dir, package, client=Exploding())
     assert result.success is False
     assert any("boom" in error for error in result.errors)

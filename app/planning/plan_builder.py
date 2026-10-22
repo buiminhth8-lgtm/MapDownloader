@@ -52,10 +52,10 @@ from app.config.settings import DEFAULT_PLAN_NAME
 from app.geo.tile_math import validate_zoom
 from app.planning.download_plan import DownloadPlan, DownloadPlanItem
 from app.planning.zoom_strategy import ZoomStrategyService
-from app.regions.models import RegionCatalogError, RegionPreset
+from app.regions.models import RegionPreset
 from app.regions.service import RegionService
 
-__all__ = ["PlanAddResult", "DownloadPlanBuilder"]
+__all__ = ["DownloadPlanBuilder", "PlanAddResult"]
 
 
 _logger = logging.getLogger(__name__)

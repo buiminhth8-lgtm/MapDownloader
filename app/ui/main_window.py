@@ -26,6 +26,7 @@ MBTiles 检查（§8）   SQLite 自检 / 聚合 / Pillow 解码             ``M
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -36,7 +37,6 @@ from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
-    QGroupBox,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -54,8 +54,8 @@ from app.config.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
     DEFAULT_OUTPUT_DIR,
-    DEFAULT_REQUESTS_PER_SECOND,
     DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_REQUESTS_PER_SECOND,
     DEFAULT_TILE_TIMEOUT_SECONDS,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
@@ -65,23 +65,21 @@ from app.config.settings import (
     LOG_PACKAGE_VALIDATED,
     LOG_TRANSFER_STARTED,
     MISSION_REGIONS_DIR_NAME,
-    PACKAGE_MANIFEST_FILENAME,
+    PACKAGE_FORMAT_VERSION,
     PLAN_EXECUTIONS_FILE_NAME,
     PLANS_FILE_NAME,
-    TRANSFER_ERROR_PACKAGE_DIR_MISSING,
     UI_TEXT_BUTTON_CANCEL,
     UI_TEXT_BUTTON_CLOSE,
     UI_TEXT_BUTTON_CONFIRM,
     UI_TEXT_BUTTON_OK,
-    UI_TEXT_CANCELLED_KEEP_TILES,
     UI_TEXT_CANCEL_CONFIRM,
     UI_TEXT_CANCEL_TITLE,
+    UI_TEXT_CANCELLED_KEEP_TILES,
     UI_TEXT_COMPLETE_BODY,
     UI_TEXT_COMPLETE_TITLE,
     UI_TEXT_COMPOSITION_MERGED,
     UI_TEXT_COMPOSITION_SINGLE,
     UI_TEXT_DEVICE_ADB_MISSING,
-    UI_TEXT_DEVICE_HINT,
     UI_TEXT_EXIT_CANCEL,
     UI_TEXT_EXIT_CONFIRM,
     UI_TEXT_EXIT_WITH_TASK,
@@ -129,8 +127,8 @@ from app.config.settings import (
     UI_TEXT_TRANSFER_EXISTS_TITLE,
     UI_TEXT_TRANSFER_FAILED_BODY,
     UI_TEXT_TRANSFER_FAILED_TITLE,
-    UI_TEXT_TRANSFER_NEED_PACKAGE,
     UI_TEXT_TRANSFER_NEED_DEVICE,
+    UI_TEXT_TRANSFER_NEED_PACKAGE,
     UI_TEXT_TRANSFER_RUNNING,
     UI_TEXT_TRANSFER_SHA256_UNAVAILABLE,
     UI_TEXT_TRANSFER_STATUS_WAITING_IMPORT,
@@ -152,14 +150,14 @@ from app.geo import (
     lon_to_tile_x,
     region_from_task,
 )
-from app.models.download_task import DownloadTask, DownloadTaskStatus
-from app.models.map_layer import MapLayerType, MapType, describe_map_type
 from app.mission import (
     CompositeRegionService,
     MissionRegionService,
     MissionRegionStore,
     mission_reference_files,
 )
+from app.models.download_task import DownloadTask, DownloadTaskStatus
+from app.models.map_layer import MapLayerType, MapType, describe_map_type
 from app.planning.download_risk_analyzer import DownloadRiskAnalyzer
 from app.planning.plan_execution_store import (
     PlanExecutionStore,
@@ -177,10 +175,10 @@ from app.regions.importer import RegionImportService
 from app.regions.models import RegionCatalogError
 from app.regions.service import RegionService
 from app.services import (
-    AdbStatus,
     AndroidTransferService,
     MapDownloadOutcome,
     build_output_path,
+    region_target_tiles,
 )
 from app.tasks import TaskService, TaskStoreError
 from app.ui.connection_check import ConnectionTestWorker
@@ -202,14 +200,14 @@ from app.ui.download_panel import (
     ACTION_TEST_CONNECTION,
     DownloadPanel,
 )
-from app.ui.download_worker import DownloadWorker
 from app.ui.download_plan_dialog import DownloadPlanDialog
+from app.ui.download_worker import DownloadWorker
 from app.ui.log_panel import LogPanel
-from app.ui.mission_region_dialog import MissionRegionDialog
-from app.ui.region_data_import_dialog import RegionDataImportDialog
 from app.ui.mbtiles_inspector_dialog import MBTilesInspectorDialog
+from app.ui.mission_region_dialog import MissionRegionDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import RegionSelection, UiPreferences
+from app.ui.region_data_import_dialog import RegionDataImportDialog
 from app.ui.region_selection import ZoomMode
 from app.ui.risk_details_dialog import DangerousTaskConfirmDialog, RiskDetailsDialog
 from app.ui.task_actions import UiTaskState
@@ -285,6 +283,31 @@ def _describe_plan(
     """
     layers = " + ".join(item.value for item in map_type.layers(with_labels))
     return f"天地图 {layers} z{min_zoom}~{max_zoom} {bounds.as_tuple()}"
+
+
+def _about_html() -> str:
+    """「关于」对话框的正文。
+
+    **刻意不写 Slice 编号**：那是个只增不减的序号，每加一版都得回来改一次，
+    而漏改的代价是用户在"关于"里读到一年前的进度 —— 这里曾经写着"当前进度
+    Slice 10""Slice 11 尚未实现"，而实际早已做到更后面的版本。改成只描述
+    **现在能做什么**：只要能力没变就不用动，也不会再走样。
+
+    ``tests/test_about_text.py`` 钉住这两条：正文里不许出现 Slice 编号、
+    不许出现"尚未实现"这类否定式进度句。
+    """
+    return (
+        f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
+        "Windows 端生成天地图离线地图包，导入 Android 供 osmdroid 使用。<br><br>"
+        "<b>下载</b>：矩形 / GeoJSON 多边形 / 国·省·市·县四级行政区域；"
+        "底图与中文注记合成，并发下载、限速、重试、断点续传。<br>"
+        "<b>规划</b>：分级 Zoom 推荐、瓦片估算、下载风险分析、"
+        "多级下载计划与串行调度。<br>"
+        "<b>产出</b>：标准离线包（formatVersion "
+        f"{PACKAGE_FORMAT_VERSION}"
+        "，含 manifest 与 SHA256 校验），经 ADB 传输或手动复制到设备。<br>"
+        "<b>数据</b>：授权的行政区 GeoJSON 可导入为区域目录。"
+    )
 
 #: 各动作对应的说明（下载相关动作在 Slice 3 已实现，Slice 4 起落盘为 MBTiles，
 #: Slice 5 起支持断点续传与任务恢复，Slice 7 起补上取消与完整的按钮状态机）
@@ -380,7 +403,7 @@ class _DownloadPlan:
         return self.is_resume or self.resume_existing
 
     @property
-    def download_target(self) -> "MapLayerType | MapType":
+    def download_target(self) -> MapLayerType | MapType:
         """交给下载引擎的目标（``MapType`` 或单个 ``MapLayerType``）。
 
         合成模式下必须把 ``MapType`` 本身传下去——服务层要靠它才知道
@@ -3252,10 +3275,8 @@ class MainWindow(QMainWindow):
         if box is None:
             return
         setattr(self, attribute, None)
-        try:
+        with contextlib.suppress(RuntimeError):  # pragma: no cover - C++ 对象已被销毁
             box.close()
-        except RuntimeError:  # pragma: no cover - C++ 对象已被销毁
-            pass
 
     # ------------------------------------------------------------------ #
     # 槽：多级下载计划（Slice 20，Spec §10 / §11 / §14 / §18）
@@ -3553,14 +3574,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     @Slot()
     def _on_about(self) -> None:
-        QMessageBox.about(
-            self,
-            f"关于 {APP_NAME}",
-            f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
-            "Windows 端生成天地图离线地图包，导入 Android 供 osmdroid 使用。<br>"
-            "当前进度：Slice 10（ADB 设备管理与离线地图包传输）。<br>"
-            "Android 端的地图包安装（Slice 11）尚未实现。",
-        )
+        QMessageBox.about(self, f"关于 {APP_NAME}", _about_html())
 
     # ------------------------------------------------------------------ #
     # 界面偏好（Slice 7，Spec §22）
@@ -3836,16 +3850,12 @@ class MainWindow(QMainWindow):
                 continue
             setattr(self, attr, None)
             if slot is not None:
-                try:
+                with contextlib.suppress(RuntimeError, TypeError):  # pragma: no cover - 本来没连上
                     dialog.finished.disconnect(slot)
-                except (RuntimeError, TypeError):  # pragma: no cover - 本来就没连上
-                    pass
             # 兜底：万一还有哪条路径漏了销毁回调，也绝不能让异常从 closeEvent
             # 里抛出去——那会让主窗口关不掉（比丢一个弹窗严重得多）。
-            try:
+            with contextlib.suppress(RuntimeError):  # pragma: no cover - 见 _forget_dialog_on_destroy
                 dialog.close()
-            except RuntimeError:  # pragma: no cover - 见 _forget_dialog_on_destroy
-                pass
 
     def _ask_exit_with_running_task(self, event: QCloseEvent) -> None:
         """Spec §17：还有任务在下载 → 先问一次（非模态，理由同大任务确认）。"""

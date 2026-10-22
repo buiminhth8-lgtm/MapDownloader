@@ -35,15 +35,15 @@ from app.planning.region_level import RegionLevel
 from app.planning.risk_level import RiskLevel
 
 __all__ = [
-    "RiskPolicy",
-    "DEFAULT_RISK_POLICY",
-    "LEVEL_ADVICE",
-    "LARGE_TILE_THRESHOLD",
-    "VERY_LARGE_TILE_THRESHOLD",
-    "DANGEROUS_TILE_THRESHOLD",
-    "LARGE_SIZE_THRESHOLD",
-    "VERY_LARGE_SIZE_THRESHOLD",
     "DANGEROUS_SIZE_THRESHOLD",
+    "DANGEROUS_TILE_THRESHOLD",
+    "DEFAULT_RISK_POLICY",
+    "LARGE_SIZE_THRESHOLD",
+    "LARGE_TILE_THRESHOLD",
+    "LEVEL_ADVICE",
+    "VERY_LARGE_SIZE_THRESHOLD",
+    "VERY_LARGE_TILE_THRESHOLD",
+    "RiskPolicy",
 ]
 
 _GIB: int = 1024 ** 3

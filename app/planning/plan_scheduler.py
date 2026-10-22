@@ -72,8 +72,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from app.config.settings import (
     DEFAULT_PLAN_SAVE_INTERVAL_SECONDS,
@@ -156,7 +157,7 @@ class PlanTaskRunner(Protocol):
         *,
         token: str = "",
         on_progress: Callable[[Any], None] | None = None,
-        task_service: "TaskService | None" = None,
+        task_service: TaskService | None = None,
     ) -> PlanTaskOutcome:
         """把一条 :class:`~app.models.DownloadTask` 跑到结束。"""
         ...
@@ -181,7 +182,7 @@ class MapDownloadTaskRunner:
         self,
         provider: Any,
         *,
-        task_service: "TaskService | None" = None,
+        task_service: TaskService | None = None,
         transport: Any = None,
         resume_policy: Any = None,
         concurrency: int | None = None,
@@ -283,7 +284,7 @@ class MapDownloadTaskRunner:
         *,
         token: str = "",
         on_progress: Callable[[Any], None] | None = None,
-        task_service: "TaskService | None" = None,
+        task_service: TaskService | None = None,
     ) -> PlanTaskOutcome:
         """跑一条任务（走既有的 :meth:`MapDownloadService.resume_task`）。"""
         from app.mbtiles import MBTilesWriteError
@@ -371,10 +372,10 @@ class PlanScheduler:
 
     def __init__(
         self,
-        plan_service: "PlanService",
+        plan_service: PlanService,
         runner: PlanTaskRunner,
         *,
-        task_service: "TaskService | None" = None,
+        task_service: TaskService | None = None,
         store: PlanExecutionStore | None = None,
         save_interval_seconds: float = DEFAULT_PLAN_SAVE_INTERVAL_SECONDS,
         save_tile_interval: int = DEFAULT_PLAN_SAVE_TILE_INTERVAL,
@@ -456,7 +457,7 @@ class PlanScheduler:
         return self._plan
 
     @property
-    def task_service(self) -> "TaskService":
+    def task_service(self) -> TaskService:
         """任务服务。"""
         return self._task_service
 
@@ -937,9 +938,7 @@ class PlanScheduler:
         if execution is None:  # pragma: no cover - 防御性分支
             return
         for index, item in enumerate(execution.items):
-            if item.status is PlanItemRunStatus.WAITING:
-                execution.mark(index, status)
-            elif redo_paused and item.status is PlanItemRunStatus.PAUSED:
+            if item.status is PlanItemRunStatus.WAITING or (redo_paused and item.status is PlanItemRunStatus.PAUSED):
                 execution.mark(index, status)
 
     @staticmethod

@@ -32,11 +32,11 @@ from app.config.settings import (
 )
 from app.geo.geojson_loader import load_geojson_geometry
 from app.mission import (
+    MissionRegionBuilder,
     MissionRegionError,
     MissionRegionMetadata,
     MissionRegionNotFound,
     MissionRegionStore,
-    MissionRegionBuilder,
     region_geojson_document,
     route_geojson_document,
 )
@@ -134,7 +134,7 @@ def test_route_file_keeps_the_original_line(store) -> None:
 
 def test_metadata_records_what_the_directory_contains(store) -> None:
     """元数据是"这个目录里装着什么"的唯一说明，几个关键字段都要在。"""
-    saved, geometry = make_region(store)
+    _saved, geometry = make_region(store)
     payload = json.loads(store.metadata_path("mission-001").read_text(encoding="utf-8"))
     assert payload["id"] == "mission-001"
     assert payload["name"] == "西湖巡检航线"

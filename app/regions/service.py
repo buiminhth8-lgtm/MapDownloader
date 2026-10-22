@@ -144,7 +144,9 @@ class RegionService:
         读这个属性会**确保目录已经读过一次**：否则"先看错误、再查询"的调用方
         永远只能看到空串 —— 一个只会说"没事"的体检报告没有意义。
         """
-        self.catalog
+        # 故意取一次：要的是**副作用**（触发 _load_catalog 并在失败时写下原因），
+        # 不是这个值。写成 `_ =` 是为了让"这不是漏写"一眼可见。
+        _ = self.catalog
         return self._catalog_error
 
     @property
@@ -296,7 +298,7 @@ class RegionService:
 
     def resolve_region_geometry(
         self, region_id: str, bounds: GeoBounds
-    ) -> "tuple[geo_region.DownloadRegion | None, str] | None":
+    ) -> tuple[geo_region.DownloadRegion | None, str] | None:
         """把 ``region_id`` 还原成几何，供 :mod:`app.geo.region` 的动态解析表使用。
 
         **为什么需要它**（Slice 25 修）：续传与 Inspector 都是从**任务记录 /
@@ -366,7 +368,7 @@ class RegionService:
         *,
         min_zoom: int | None = None,
         max_zoom: int | None = None,
-    ) -> "ZoomRecommendation":
+    ) -> ZoomRecommendation:
         """某个区域的 Zoom 建议。
 
         不传 ``min_zoom`` / ``max_zoom`` 时是**纯推荐**（``warning`` 恒为 False）；
@@ -469,7 +471,7 @@ class RegionService:
 #: 留下的实例"会赢，于是续传拿到的是**另一个目录**里的几何 —— 一个看起来很像
 #: 真的错误结论。任务区那一路（:func:`~app.mission.install_mission_region_resolver`）
 #: 用的是同一条规矩。
-_ACTIVE_CATALOG_RESOLVER: "geo_region.RegionResolver | None" = None
+_ACTIVE_CATALOG_RESOLVER: geo_region.RegionResolver | None = None
 
 
 def install_region_catalog_resolver(service: RegionService) -> None:

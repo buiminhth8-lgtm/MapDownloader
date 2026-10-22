@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from app.config.settings import DANGEROUS_CONFIRM_WORD
 from app.config.settings import (
+    DANGEROUS_CONFIRM_WORD,
     UI_TEXT_BUTTON_APPLY_RECOMMENDED_ALL,
     UI_TEXT_BUTTON_BACK_TO_EDIT,
     UI_TEXT_BUTTON_CONTINUE_ANYWAY,

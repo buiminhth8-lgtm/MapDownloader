@@ -1,0 +1,39 @@
+# 天地图离线地图工具 —— 依赖快照（可逐字节复现）
+#
+# 来源：`pip freeze`（2026-10-22，Windows / CPython 3.13.14）。
+# 用途：排查"我这儿能跑、换台机器就跑不起来"这类问题时，
+#       `python -m pip install -r requirements-lock.txt` 装回**完全相同的组合**。
+#
+# 与 requirements.txt 的分工：
+#   - requirements.txt      声明**允许的范围**（带大版本上限），日常安装用它；
+#   - requirements-lock.txt 记录**验证过的那一组**（含传递依赖），排查问题用它。
+#
+# 注意：这是 Windows 下的快照。PySide6 / pyproj / shapely 都有平台特定的 wheel，
+# 在 Linux / macOS 上装同一份 pin 未必拿得到同样版本 —— 那份清单要在目标平台上
+# 重新 `pip freeze` 生成，而不是照抄这里。
+#
+# 不含 ruff / mypy（开发工具，见 requirements-dev.txt）：它们不影响程序运行，
+# 也不该让"只想跑一下工具"的人多装一堆东西。
+
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+Pygments==2.21.0
+anyio==4.15.1
+certifi==2026.7.22
+colorama==0.4.6
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.0
+numpy==2.5.3
+packaging==26.3
+pillow==12.3.0
+pluggy==1.6.0
+pyproj==3.8.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+shapely==2.1.2
+shiboken6==6.11.2
+typing_extensions==4.16.0

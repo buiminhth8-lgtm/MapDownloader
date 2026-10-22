@@ -19,7 +19,6 @@ from PySide6.QtTest import QSignalSpy
 
 from app.regions.importer import RegionImportService
 from app.ui.region_data_import_dialog import RegionDataImportDialog
-
 from tests.conftest import REGION_IMPORT_FIXTURE_ROOT
 
 

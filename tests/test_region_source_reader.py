@@ -18,28 +18,27 @@ from pathlib import Path
 
 import pytest
 
+from app.planning.region_level import RegionLevel
 from app.regions.importer import (
     RegionImportConfig,
     RegionImportError,
     RegionImportIssueCode,
     read_source,
 )
-from app.planning.region_level import RegionLevel
-
 from tests.conftest import REGION_IMPORT_FIXTURE_ROOT
 
 
 def _config(source: str = "sample.geojson", **kwargs) -> RegionImportConfig:
-    defaults = dict(
-        id_field="code",
-        name_field="name",
-        level_field="level",
-        parent_field="parent",
-        boundary_version="2026-10-test",
+    defaults = {
+        "id_field": "code",
+        "name_field": "name",
+        "level_field": "level",
+        "parent_field": "parent",
+        "boundary_version": "2026-10-test",
         # 读 / 标准化 / 建层级都不碰发布目录；这里给个显式占位，
         # 免得某个用例顺手把数据写进仓库的 resources/regions/generated。
-        output_root=Path("unused-in-dry-run"),
-    )
+        "output_root": Path("unused-in-dry-run"),
+    }
     defaults.update(kwargs)
     return RegionImportConfig(
         source_file=REGION_IMPORT_FIXTURE_ROOT / source, **defaults

@@ -20,7 +20,6 @@ from app.regions.importer import (
     normalize_features,
     read_source,
 )
-
 from tests.conftest import REGION_IMPORT_FIXTURE_ROOT
 
 
@@ -32,15 +31,15 @@ def _build(
     **field_kwargs,
 ):
     """读 → 标准化 → 建层级，返回 ``(entries, issues)``。"""
-    fields = dict(
-        id_field="code",
-        name_field="name",
-        level_field="level",
-        parent_field="parent",
-        boundary_version="2026-10-test",
+    fields = {
+        "id_field": "code",
+        "name_field": "name",
+        "level_field": "level",
+        "parent_field": "parent",
+        "boundary_version": "2026-10-test",
         # 建层级不碰发布目录（占位路径，见 test_region_source_reader 的说明）。
-        output_root=Path("unused-in-dry-run"),
-    )
+        "output_root": Path("unused-in-dry-run"),
+    }
     fields.update(field_kwargs)
     config = RegionImportConfig(
         source_file=REGION_IMPORT_FIXTURE_ROOT / source,
@@ -164,13 +163,9 @@ def test_province_without_parent_fails() -> None:
     _entries, issues = _build("missing_parent.geojson")
     # 孤儿市（无父级）已经覆盖了空 parent；这里补一条省级的空 parent 场景。
     import json
-
+    import tempfile
     from pathlib import Path
 
-    import tempfile
-
-    from app.regions.importer import RegionSourceFeature
-    from shapely.geometry import shape
 
     directory = Path(tempfile.mkdtemp(prefix="hierarchy-test-"))
     try:

@@ -28,7 +28,7 @@ from app.config.settings import (
     PACKAGE_MBTILES_FILENAME,
 )
 from app.package import MapPackageBuilder, MapPackageValidator
-from app.services import AndroidTransferService, AdbStatus
+from app.services import AdbStatus, AndroidTransferService
 from tests.android_fakes import FakeAdbClient
 from tests.test_package_builder import _make_mbtiles
 
@@ -402,7 +402,7 @@ def test_transfer_package_forwards_progress_and_cancel(work_dir: Path) -> None:
 def test_transfer_package_reports_cancellation(work_dir: Path) -> None:
     """取消 → ``cancelled``，且不抛。"""
     package = _make_package(work_dir)
-    service, client, _validator = _service(work_dir, cancel_push=True)
+    service, _client, _validator = _service(work_dir, cancel_push=True)
     service.refresh_devices()
 
     result = service.transfer_package(SERIAL, package, verify_package=False)

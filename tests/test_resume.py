@@ -356,7 +356,7 @@ def test_xyz_tms_flip_is_only_at_storage_boundary() -> None:
     assert xyz_y_to_tms_y(3, 2) == 5
     assert tms_y_to_xyz_y(3, 5) == 2
     # 往返一致
-    for zoom in range(0, 6):
+    for zoom in range(6):
         for y in range(1 << zoom):
             assert tms_y_to_xyz_y(zoom, xyz_y_to_tms_y(zoom, y)) == y
 

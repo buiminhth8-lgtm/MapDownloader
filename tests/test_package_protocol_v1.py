@@ -47,6 +47,7 @@ from app.package.models import (
     UnsupportedFormatVersion,
     parse_manifest_dict,
 )
+
 # Slice 25：``_region_from_metadata`` 是 metadata → manifest 的**唯一**翻译点。
 # 从私有位置取它是有意的 —— 这条翻译规则（哪几项透传、``geometryVersion``
 # 归谁）就是本文件要钉的协议内容，绕到 ``build()`` 之外再断言一次只会更松。
@@ -417,7 +418,7 @@ def test_both_ends_agree_on_which_level_is_more_specific() -> None:
 
     Windows 的 ``PLAN_LEVEL_ORDER`` 是**下载顺序**（由粗到细）；
     Android 的 ``RegionLevel.getSpecificity()`` 是**选包优先级**（越大越具体）。
-    两者在"全国 < 省 < 市 < 任务区"这一段必须互为逆序 —— 否则 AUTO 选包在
+    两者在"全国 < 省 < 市 < 县 < 任务区"这一段必须互为逆序 —— 否则 AUTO 选包在
     Zoom 区间**重叠**的那几档（9~10 / 12~13 / 15~16）会优先留下更粗的那张图。
     """
     java = _java_region_levels()
@@ -425,16 +426,18 @@ def test_both_ends_agree_on_which_level_is_more_specific() -> None:
         RegionLevel.COUNTRY,
         RegionLevel.PROVINCE,
         RegionLevel.CITY,
+        RegionLevel.COUNTY,
         RegionLevel.MISSION,
     ]
     assert tuple(PLAN_LEVEL_ORDER[: len(ladder)]) == tuple(ladder), (
-        "下载顺序不再是「全国→省→市→任务区」，这条断言的前提变了，"
+        "下载顺序不再是「全国→省→市→县→任务区」，这条断言的前提变了，"
         "要么改这里要么改 PLAN_LEVEL_ORDER"
     )
 
     specificities = [java[level.value] for level in ladder]
     assert specificities == sorted(specificities), (
-        f"Android 的具体度应随层级递增，实际为 {dict(zip([l.value for l in ladder], specificities))}"
+        "Android 的具体度应随层级递增，实际为 "
+        f"{dict(zip([lv.value for lv in ladder], specificities))}"
     )
     assert len(set(specificities)) == len(specificities), (
         "具体度必须两两不同：一旦相等，§5-3 在这一对等级之间就退化成"

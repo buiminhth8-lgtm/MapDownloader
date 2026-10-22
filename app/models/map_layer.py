@@ -34,16 +34,16 @@ from __future__ import annotations
 from enum import Enum
 
 __all__ = [
-    "MapLayerType",
-    "MapType",
-    "MAP_TYPE_LAYERS",
-    "MAP_TYPE_DISPLAY_NAMES",
-    "MAP_TYPE_SHORT_NAMES",
-    "LAYER_DISPLAY_NAMES",
-    "COMPOSITION_SINGLE",
     "COMPOSITION_MERGED",
+    "COMPOSITION_SINGLE",
     "COMPOSITION_VALUES",
     "DEFAULT_LAYER_COMBO",
+    "LAYER_DISPLAY_NAMES",
+    "MAP_TYPE_DISPLAY_NAMES",
+    "MAP_TYPE_LAYERS",
+    "MAP_TYPE_SHORT_NAMES",
+    "MapLayerType",
+    "MapType",
     "composition_for",
     "describe_map_type",
     "layers_for",
@@ -100,7 +100,7 @@ class MapLayerType(Enum):
         return self in (MapLayerType.IMAGE, MapLayerType.IMAGE_LABEL)
 
     @property
-    def base_layer(self) -> "MapLayerType":
+    def base_layer(self) -> MapLayerType:
         """返回与之配对的底图图层；本身是底图时返回自身。
 
         >>> MapLayerType.VECTOR_LABEL.base_layer
@@ -115,7 +115,7 @@ class MapLayerType(Enum):
         return self
 
     @property
-    def label_layer(self) -> "MapLayerType":
+    def label_layer(self) -> MapLayerType:
         """返回与之配对的注记图层；本身是注记时返回自身。"""
         if self is MapLayerType.VECTOR:
             return MapLayerType.VECTOR_LABEL
@@ -128,7 +128,7 @@ class MapLayerType(Enum):
 #:
 #: **全项目唯一的一份映射**（Spec §2）：UI、Service、Downloader 都从这里取，
 #: 不允许在别处再写一遍 ``if 矢量: 用 vec_w``。
-MAP_TYPE_LAYERS: dict["MapType", tuple[MapLayerType, MapLayerType]] = {}
+MAP_TYPE_LAYERS: dict[MapType, tuple[MapLayerType, MapLayerType]] = {}
 
 
 class MapType(Enum):
@@ -203,7 +203,7 @@ class MapType(Enum):
         return len(self.layers(with_labels))
 
     @classmethod
-    def from_layer(cls, layer: "MapLayerType | MapType | str") -> "MapType":
+    def from_layer(cls, layer: MapLayerType | MapType | str) -> MapType:
         """由图层（或字符串标识）反查地图类型。
 
         底图与注记都能反查：``vec_w`` / ``cva_w`` 都得到 ``VECTOR``。
@@ -234,7 +234,7 @@ class MapType(Enum):
         )
 
     @classmethod
-    def parse(cls, value: str | None) -> "MapType | None":
+    def parse(cls, value: str | None) -> MapType | None:
         """宽松解析（给"从磁盘读回来的记录"用）。
 
         与 :meth:`from_layer` 的区别：认不出来时返回 ``None`` 而不是抛异常
@@ -311,7 +311,7 @@ DEFAULT_LAYER_COMBO: tuple[MapLayerType, ...] = (
 
 
 def describe_map_type(
-    map_type: "MapType | None",
+    map_type: MapType | None,
     with_labels: bool,
     *,
     short: bool = False,

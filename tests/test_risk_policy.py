@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from app.planning.region_level import RegionLevel
-from app.planning.risk_level import RISK_LEVEL_ORDER, RISK_LABEL, RiskLevel
+from app.planning.risk_level import RISK_LABEL, RISK_LEVEL_ORDER, RiskLevel
 from app.planning.risk_policy import (
     DANGEROUS_SIZE_THRESHOLD,
     DANGEROUS_TILE_THRESHOLD,
@@ -265,9 +265,12 @@ def _integer_constants(path: Path) -> set[int]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, int):
-            if not isinstance(node.value, bool):
-                found.add(node.value)
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+        ):
+            found.add(node.value)
     return found
 
 

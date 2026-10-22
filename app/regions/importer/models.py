@@ -52,20 +52,20 @@ from typing import Any
 from app.planning.region_level import RegionLevel
 
 __all__ = [
-    "RegionImportError",
-    "RegionImportIssueCode",
-    "IssueLevel",
-    "RegionImportIssue",
-    "RegionImportResult",
-    "ImportVerdict",
-    "RegionImportConfig",
-    "RegionSourceFeature",
-    "RegionDatasetManifest",
-    "ImportReport",
     "DEFAULT_LEVEL_ALIASES",
     "SAFE_ID_PATTERN",
-    "sanitize_region_id",
+    "ImportReport",
+    "ImportVerdict",
+    "IssueLevel",
+    "RegionDatasetManifest",
+    "RegionImportConfig",
+    "RegionImportError",
+    "RegionImportIssue",
+    "RegionImportIssueCode",
+    "RegionImportResult",
+    "RegionSourceFeature",
     "map_level",
+    "sanitize_region_id",
 ]
 
 
@@ -622,7 +622,7 @@ class RegionDatasetManifest:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "RegionDatasetManifest":
+    def from_dict(cls, payload: Mapping[str, Any]) -> RegionDatasetManifest:
         """从 JSON 结构读回来（缺字段给默认值 —— 老版本 manifest 向前兼容）。"""
 
         def _int(value: object) -> int:

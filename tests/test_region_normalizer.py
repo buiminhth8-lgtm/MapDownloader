@@ -12,10 +12,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from app.geo.geojson_loader import geometry_to_bounds
 from app.regions.importer import (
@@ -26,7 +23,6 @@ from app.regions.importer import (
     sanitize_region_id,
 )
 from app.regions.importer.models import IssueLevel
-
 from tests.conftest import REGION_IMPORT_FIXTURE_ROOT
 
 
@@ -94,7 +90,6 @@ def test_dot_names_get_fallback_id() -> None:
 def test_duplicate_ids_keep_the_first_and_flag_the_rest() -> None:
     features = _read("duplicate_id.geojson")
     issues: list = []
-    from app.regions.importer.models import RegionImportIssue
 
     accepted = normalize_features(features, issues=issues)
 

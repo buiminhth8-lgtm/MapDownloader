@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 from collections.abc import Sequence
@@ -75,10 +76,8 @@ def setup_logging() -> None:
     if encoding and "utf" not in encoding:
         # 控制台不是 UTF-8（例如旧版 cmd 的 cp936）时，尽量切到 UTF-8，
         # 避免中文日志乱码；失败则保持原样，不影响程序运行。
-        try:
+        with contextlib.suppress(AttributeError, ValueError, OSError):  # pragma: no cover
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError, OSError):  # pragma: no cover
-            pass
 
     handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))

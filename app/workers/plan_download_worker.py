@@ -86,8 +86,8 @@ class PlanDownloadWorker(QThread):
 
     def __init__(
         self,
-        scheduler: "PlanScheduler",
-        plan: "DownloadPlan",
+        scheduler: PlanScheduler,
+        plan: DownloadPlan,
         *,
         token: str = "",
         parent: Any = None,
@@ -113,7 +113,7 @@ class PlanDownloadWorker(QThread):
         #: 界面要求关页 / 退出程序：安全收尾后线程就结束
         self._closed = False
         #: 最后一次发布出去的执行记录（终态信号要用）
-        self._execution: "PlanExecution | None" = None
+        self._execution: PlanExecution | None = None
         #: 上一次发布的状态（语义信号只在**变化**的那一帧发）
         self._last_status: PlanExecutionStatus | None = None
 
@@ -126,7 +126,7 @@ class PlanDownloadWorker(QThread):
         return str(getattr(self._plan, "id", ""))
 
     @property
-    def execution(self) -> "PlanExecution | None":
+    def execution(self) -> PlanExecution | None:
         """最近一次发布出去的执行记录（``None`` 表示还没开始过）。"""
         return self._execution
 
@@ -201,7 +201,7 @@ class PlanDownloadWorker(QThread):
         self._loop = loop
         self._activity = asyncio.Event()
         try:
-            execution: "PlanExecution | None" = None
+            execution: PlanExecution | None = None
             try:
                 if not self._closed:
                     execution = await self._scheduler.start(
@@ -256,7 +256,7 @@ class PlanDownloadWorker(QThread):
             self._loop = None
             self._activity = None
 
-    async def _replay_pending(self, execution: "PlanExecution") -> "PlanExecution":
+    async def _replay_pending(self, execution: PlanExecution) -> PlanExecution:
         """补发"事件循环还没起来时"收到的指令。
 
         那一段窗口只有几毫秒（``QThread.start()`` 到本线程的事件循环跑起来），
@@ -332,11 +332,11 @@ class PlanDownloadWorker(QThread):
     # ------------------------------------------------------------------ #
     # 回调（在 worker 线程的事件循环里执行）
     # ------------------------------------------------------------------ #
-    def _on_progress(self, progress: "PlanProgress") -> None:
+    def _on_progress(self, progress: PlanProgress) -> None:
         """聚合进度（Spec §12 / §13）。"""
         self.progress.emit(progress)
 
-    def _on_item_changed(self, execution: "PlanExecution") -> None:
+    def _on_item_changed(self, execution: PlanExecution) -> None:
         """条目状态变化（Spec §18）。"""
         self._execution = execution
         self.item_changed.emit(execution)
@@ -348,7 +348,7 @@ class PlanDownloadWorker(QThread):
     # ------------------------------------------------------------------ #
     # 内部：发布
     # ------------------------------------------------------------------ #
-    def _publish(self, execution: "PlanExecution") -> None:
+    def _publish(self, execution: PlanExecution) -> None:
         """把执行记录的一帧推给界面，并按状态**变化**发对应的语义信号。
 
         语义信号只在状态**真的变了**的那一帧发（``_last_status`` 比对）：

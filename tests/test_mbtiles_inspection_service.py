@@ -327,7 +327,7 @@ def test_export_report_is_utf8_with_chinese(good_db: Path) -> None:
     service = MBTilesInspectionService()
     report = service.export_report(service.inspect(good_db))
     raw = report.read_bytes()
-    assert "结论".encode("utf-8") in raw
+    assert "结论".encode() in raw
     raw.decode("utf-8")  # 不抛 → 编码正确
 
 

@@ -130,27 +130,31 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
-Slice 26：行政区数据导入管线（Region Data Pipeline）。真实工程不能靠手工维护
-`resources/regions/index.json` + `province/*.geojson` + `city/*.geojson`，本 Slice 提供
-一条完整管线把**合法授权的 GeoJSON FeatureCollection** 变成 RegionCatalog 直接可用的
-生成数据集：SourceReader（字段名可配置）→ GeometryNormalizer（is_valid / WGS84 / make_valid）
-→ HierarchyBuilder（COUNTRY→PROVINCE→CITY 校验 + 直辖市兼容）→ CatalogGenerator
-（GeoJSON + index.json + manifest）→ 全量校验 → **原子发布**到 `resources/regions/generated/`。
-配套：GUI「行政区数据管理」窗口（字段映射下拉从源数据键动态填、[验证] 显示统计、FAIL 禁导入）、
-CLI `scripts/import_regions.py`。RegionCatalog 加 `effective_region_root()`（生成目录优先但须
-"可解析"），`RegionService.reload()` 失败保留旧 Catalog。**本工具只提供导入能力，不下载、抓取
-或分发来源不明的行政边界数据**。详见 [`docs/region_data_pipeline.md`](docs/region_data_pipeline.md)
+Slice 27：行政区层级扩到**县**（全国 → 省 → 市 → 县四级）。`RegionLevel` 新增
+`COUNTY`，`PARENT_LEVEL_RULES` 从"父等级唯一"改成**父等级集合** —— 县的上级可以是市
+（普通地级市下辖区县）**也可以是省**（直辖市下辖区 / 省直辖县级市没有市级上级，硬凑一个
+中间层就是编数据）。Zoom 策略给 `COUNTY` 定 Z14~18，风险建议与计划顺序同步补齐；
+下载面板多出「县区」下拉，直辖市与省直辖县选完省后市级下拉**自动跳过**。同时新增
+`scripts/import_china_admin_regions.py`：把天地图官网的省/市/县三份 GeoJSON（字段只有
+`{name, gb}`，`gb` 是"156"+6 位 GB/T 2260 编码，没有 level/parent）导成可用数据集 ——
+过滤境界线 → `unary_union` 合成全国条目 → 按 `gb` 前缀推导父级 → 按编码规则消解三份
+文件之间的重叠单位。实测导入 **省 34 / 市 336 / 县 2882 + 合成全国 1 = 3253** 个区域。
 
-上一个 Slice：Slice 25 —— 分级离线地图体系 E2E + 稳定性收尾（把 Slice 16~24 那条线**接成一个整体**：
-一条可自动跑的 10 段全链路验收 `scripts/hierarchical_map_e2e.py` 覆盖
-层级目录 → Zoom 策略 → 多边形估算 → 任务区 → 风险 → 下载计划 → 调度 → MBTiles →
-Inspector → 打包；补齐分级夹具、三份文档与 README 架构图；并修掉两个跨端缺陷 ——
-**行政区包的 `region.level` 从来没写进包里**（Android 侧只能把它当"未知等级"，
-等级优先级整条失效），以及**目录里的多边形区域无法续传 / 无法被 Inspector 认出来**
-（`region_from_task` 只认内置预设）。详见
+上一个 Slice：Slice 26 —— 行政区数据导入管线（授权 GeoJSON → RegionCatalog 生成数据集；
+真实工程不能靠手工维护全国几百个省市边界。SourceReader（字段名可配置）→
+GeometryNormalizer → HierarchyBuilder → CatalogGenerator → 全量校验 → **原子发布**到
+`resources/regions/generated/`；配套 GUI「行政区数据管理」与 CLI `scripts/import_regions.py`。
+**本工具只提供导入能力，不下载、抓取或分发来源不明的行政边界数据**。详见
+[`docs/region_data_pipeline.md`](docs/region_data_pipeline.md)）
+
+上一个 Slice（Android 侧）：Slice 25 —— 分级离线地图体系 E2E + 稳定性收尾（把 Slice 16~24
+那条线**接成一个整体**：一条可自动跑的 10 段全链路验收 `scripts/hierarchical_map_e2e.py`
+覆盖层级目录 → Zoom 策略 → 多边形估算 → 任务区 → 风险 → 下载计划 → 调度 → MBTiles →
+Inspector → 打包；并修掉两个跨端缺陷 —— **行政区包的 `region.level` 从来没写进包里**，
+以及**目录里的多边形区域无法续传 / 无法被 Inspector 认出来**。详见
 [`docs/hierarchical_offline_map.md`](docs/hierarchical_offline_map.md)）
 
-上一个 Slice（Android 侧）：Slice 24 —— AUTO 按「位置 + Zoom + 区域等级」选包）
+再往前（Android 侧）：Slice 24 —— AUTO 按「位置 + Zoom + 区域等级」选包
 
 再往前（Windows 侧）：Slice 23 —— 下载风险分析（把"这一单大不大"从**一个 1 万张的阈值**
 升级成**一层结论**：按张数与容量两个维度分四档 —— 正常 / 较大 / 很大 / 危险，给出原因、
@@ -163,10 +167,11 @@ Inspector → 打包；补齐分级夹具、三份文档与 README 架构图；�
 
 ```text
     ┌──────────────── 分级的三件事实（Slice 16~25）────────────────┐
-    │ RegionCatalog          (Slice 18：行政层级 国 ⊃ 省 ⊃ 市，      │
+    │ RegionCatalog          (Slice 18：行政层级 国 ⊃ 省 ⊃ 市 ⊃ 县， │
     │    ↓                    目录校验；边界数据不进仓库)            │
     │ RegionLevel            (Slice 17：country/province/city/       │
-    │    ↓                    mission/custom —— 它是**跨端契约**)    │
+    │    ↓                    county/mission/custom —— 它是跨端契约， │
+    │                         县的父级允许市**或**省，Slice 27)      │
     │ ZoomStrategyService    (Slice 17：等级 → 推荐 Zoom 区间，      │
     │                         全项目唯一的阈值来源；界面只显示，    │
     │                         绝不改写用户输入)                      │
@@ -274,6 +279,99 @@ Android App 导入        (Slice 11，在 osmdroid 仓库)
 能证明"这个 .mbtiles 就是我当初打进去的那一份"**——传输截断、磁盘静默损坏、有人
 手改过，都过不了这一关。所以它必须是**流式**算的（4 MiB 一块），500 MB / 2 GB /
 5 GB 都不能把文件读进内存；这条有 AST 级静态守卫 + 测试双重盯着。
+
+## Slice 27：行政区层级扩到县（国 → 省 → 市 → 县）
+
+Slice 26 打通了"授权数据能导进来"，但导进来的只有三层：国 ⊃ 省 ⊃ 市。真实下载
+粒度到不了这里 —— 用户要的是"只要郑州惠济区"，而界面只能选到郑州市，于是把一个市
+十几个区县的瓦片全下下来。这一版把层级补到县，并用**天地图官网真实数据**跑通了全链。
+
+### 父级不再唯一：县的上级可以是市，也可以是省
+
+原来 `PARENT_LEVEL_RULES` 是 `等级 → 唯一父等级`。县天然不满足这个模型：
+
+- 普通地级市下辖区县 → 父级是**市**；
+- 直辖市下辖区（北京朝阳区 / 上海浦东新区）→ **没有市级上级**；
+- 省直辖县级市 / 县（济源 / 仙桃 / 海南直辖县 / 新疆兵团市）→ **也没有**。
+
+给它们硬凑一个中间层就是**编数据**——编出来的层级会在估算、风险、计划三处一路
+走样。所以规则改成**父等级集合**（`frozenset`），县允许挂市或省；父级必须真实
+存在且等级在集合内，否则校验直接 FAIL。
+
+### Zoom 策略：COUNTY 定在 Z14 ~ Z18
+
+单县范围小，下到高 Zoom 才看得清街道，而总量不会失控。四个等级的推荐区间仍然
+在 `app/planning/zoom_policy.py` **一处**定义，风险建议（`risk_policy`）与计划
+顺序（`download_plan` 的 `PLAN_LEVEL_ORDER`）同步补上 COUNTY —— 少补一处的后果
+是"计划里能选县、但排不进调度顺序"。
+
+### 天地图三份 GeoJSON 怎么变成目录
+
+```text
+中国_省.geojson (42 个 Feature，含"境界线")
+中国_市.geojson (388)
+中国_县.geojson (2897)
+  → 滤掉 gb 为空的"境界线"（国界 / 省界，不是行政区）
+  → 省界 unary_union 合成全国条目（数据里没有全国边界，但省级必须挂在国家级下面；
+     不凭空造矩形，用省界的并集当国界）
+  → 父级从 gb 前缀推导：市 → gb[:3]+gb[3:5]+"0000"（省）
+                        县 → gb[:3]+gb[3:7]+"00"（市），无市级上级时退到省
+  → 走 Slice 26 的导入管线，原子发布到 resources/regions/generated/
+```
+
+`gb` 是 `"156" + 6 位 GB/T 2260 编码`，省码 `gb[3:5]`、市码 `gb[5:7]`、县码
+`gb[7:9]`。**数据里没有 level、也没有 parent**，层级完全靠编码推。
+
+### 三份文件互相重叠的单位，按编码规则消解
+
+天地图把三类"行政级别有歧义"的单位同时放进了多个文件，直接合会撞 id：
+
+| 重叠形态 | 个数 | 判据 | 归到 |
+| --- | --- | --- | --- |
+| 直辖市 / 港澳台（省 ∩ 市） | 7 | `gb` 已在省文件里 | 省（跳过市文件那份） |
+| 澳门（省 ∩ 市 ∩ 县） | 1 | 同上 | 省 |
+| 不设区的市（市 ∩ 县，东莞 / 中山 / 嘉峪关 / 儋州） | — | `gb[7:9] == "00"` | 市（跳过县那份） |
+| 省直辖县级市 / 县（济源 / 仙桃 / 兵团市） | — | `gb[7:9] != "00"` | 县，挂省（跳过市那份） |
+
+判据是**编码本身**（"后两位是不是 `00`"就是"设不设区"的编码表达），不是按名字
+猜，所以将来数据更新也不会错。
+
+### 界面：四级联动，该跳的级自动跳
+
+下载面板多出「县区」下拉（首个条目是"全部（不限定县区）"）。选到直辖市或省直辖
+县时，市级下拉**自动跳过**并给出说明文案，不会留一个空下拉让用户怀疑是不是坏了。
+
+### 用真实数据验过的几何事实
+
+| 检查 | 结果 |
+| --- | --- |
+| 区域总数 | **3253**（省 34 / 市 336 / 县 2882 / 全国 1） |
+| 北京（直辖市） | 0 个市 → 16 个区，跳级正确 |
+| 济源市 | `level=county`，父级是**河南省**，不是某个市 |
+| 四级路径 | `中国/河南省/郑州市/惠济区` |
+
+### 验收
+
+```bash
+# 全量单测
+.venv/Scripts/python.exe -m pytest                                   # 2501 passed / 4 skipped
+
+# 主链路（离线）
+.venv/Scripts/python.exe scripts/e2e_smoke_test.py                   # 6/6
+
+# 分级全链路（离线）
+.venv/Scripts/python.exe scripts/hierarchical_map_e2e.py             # 10/10
+
+# 真实数据导入（先 dry-run，通过后去掉 --check 再发一次）
+.venv/Scripts/python.exe scripts/import_china_admin_regions.py \
+  --province "$HOME/Downloads/中国_省 (1).geojson" \
+  --city     "$HOME/Downloads/中国_市.geojson" \
+  --county   "$HOME/Downloads/中国_县.geojson" \
+  --boundary-version 2026-10 --check
+```
+
+> 生成目录 `resources/regions/generated/` 整体 gitignore：边界数据的再分发条件
+> 由提供方决定，换台机器要重跑一次导入脚本。
 
 ## Slice 26：行政区数据导入管线（Region Data Pipeline）
 
@@ -1623,7 +1721,8 @@ Slice 0 基础（仍有效）：
 
 - ~~地图包 manifest、离线包级 Sha256 校验~~ —— **Slice 9 已交付**（见上）
 - ~~ADB / Android 导入（设备发现、push）~~ —— **Slice 10 已交付**（见上）；
-  剩下"设备侧怎么导入"（端侧读 manifest、交给 osmdroid 加载）留给 Slice 11
+  设备侧导入（端侧读 manifest、交给 osmdroid 加载）**Slice 11 已交付**，
+  后续 Slice 24 / 25 又补上了 AUTO 按等级选包与 `region.level` 跨端契约
 - 失败瓦片清单与单点重试、速度曲线
 
 > 这几项曾经被写进"Slice 7"的计划里，但 Slice 7 实际排给了 Windows GUI 下载管理，
@@ -1638,8 +1737,51 @@ Python 3.11+（当前使用 `httpx` 做异步 HTTP，`PySide6` 做界面）
 ## 安装
 
 ```bash
+# 日常安装（依赖声明了版本范围，含大版本上限）
 python -m pip install -r requirements.txt
+
+# 要跑 lint / 类型检查（ruff + mypy）
+python -m pip install -r requirements-dev.txt
+
+# 排查"换台机器就跑不起来"时：装回验证过的**同一组**依赖（含传递依赖）
+python -m pip install -r requirements-lock.txt
 ```
+
+三份文件的**分工是刻意的**，别合成一份：
+
+| 文件 | 记什么 | 什么时候用 |
+| --- | --- | --- |
+| `requirements.txt` | 允许的**范围**（`>=x,<下一个大版本`） | 日常安装 |
+| `requirements-dev.txt` | 开发工具（ruff / mypy） | 本地 lint |
+| `requirements-lock.txt` | 验证过的**确切版本**（`pip freeze` 快照） | 复现问题 |
+
+范围上限不是形式主义：PySide6 / Pillow / shapely 的大版本升级都真的改过行为，
+而测试是跟着当前大版本写的。没有上限时，`pip install -r` 会在别人机器上装出一个
+本项目从没验证过的组合，失败原因还藏在依赖差异里。
+
+## 代码检查
+
+```bash
+# lint（配置见 pyproject.toml 的 [tool.ruff]，**当前是绿基线**）
+.venv/Scripts/python.exe -m ruff check app scripts tests
+.venv/Scripts/python.exe -m ruff check app scripts tests --fix        # 自动修可修的
+
+# 类型检查（配置见 [tool.mypy]，**当前不是绿基线**，见下）
+.venv/Scripts/python.exe -m mypy app
+```
+
+规则集**写死在 `pyproject.toml`**，不用 ruff 的默认值 —— 默认集合会随版本变
+（ruff 0.17 的默认就比早期大得多），一旦变了，同一个仓库在不同机器上会得出不同
+结论，而原因藏在版本差异里。
+
+`ruff` 抓到的第一个真问题是运行时崩溃级的：`main_window.py` 调用了
+`region_target_tiles` 却从没导入它（点「继续」恢复老的多边形任务时 `NameError`）。
+这类问题测不出来，只有静态检查能提前发现。
+
+**mypy 目前约 110 条错误，故意不设成门禁。** 主要类别是 `arg-type` / `union-attr` /
+`attr-defined`，都是真实的类型不精确，但修它们要动业务逻辑，属于独立的清理任务。
+把一条**已知不绿**的检查设成门禁，唯一的效果是让所有人学会忽略它 —— 那比不设更糟。
+现状与类别记在 `pyproject.toml` 的注释里，按模块逐块收紧。
 
 ## 启动
 

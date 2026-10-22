@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.geo import CHINA_REGION_PRESET, REGION_PRESETS, RegionTileEstimator, get_region_preset
@@ -76,7 +78,7 @@ def test_the_fixture_tree_is_three_levels_deep(region_catalog: RegionCatalog) ->
 
 def test_administrative_levels_are_derived_from_the_parent_table() -> None:
     """行政层级集合**从**父子规则表推导 —— 加等级时不会有人漏改。"""
-    assert ADMINISTRATIVE_LEVELS == tuple(PARENT_LEVEL_RULES)
+    assert tuple(PARENT_LEVEL_RULES) == ADMINISTRATIVE_LEVELS
     assert set(ADMINISTRATIVE_LEVELS) == {
         RegionLevel.COUNTRY,
         RegionLevel.PROVINCE,

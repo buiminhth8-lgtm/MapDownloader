@@ -178,9 +178,13 @@ _PLAN_SUMMARY_PLACEHOLDER = "下载计划：暂无区域"
 #: 折行标签（Slice 7 起放在 ``app.ui.widgets`` 里，三个面板共用）。
 #: 这里保留 ``_WrappingLabel`` / ``_wrap_anywhere`` 两个名字：
 #: 本模块内的用法与既有测试都按这两个私有名引用，改成新名字没有任何收益。
+#
+#: ``_wrap_anywhere`` 在本模块里**没有读者**，但它是给测试用的再导出
+#: （``tests/test_ui_smoke.py`` 从这里 import 它），所以必须显式抑制 F401 ——
+#: 否则"清理未使用导入"会把这行删掉，测试才在 import 阶段炸。
 from app.ui.widgets import WrappingLabel as _WrappingLabel  # noqa: E402
 from app.ui.widgets import apply_secondary_text as _apply_secondary_text  # noqa: E402
-from app.ui.widgets import wrap_anywhere as _wrap_anywhere  # noqa: E402
+from app.ui.widgets import wrap_anywhere as _wrap_anywhere  # noqa: E402, F401
 
 
 class _CoordSpinBox(QDoubleSpinBox):
@@ -1672,9 +1676,11 @@ class DownloadPanel(QGroupBox):
         # 区域（Slice 16）：老任务没有这三个字段 → 保持矩形，与它们当初的下载
         # 行为一致（Spec §29）。认不出的 region_id 也落回矩形并记下原因 ——
         # 表单显示的范围必须与实际会发生的下载行为一致。
-        if RegionType.parse(getattr(task, "region_type", "")) is RegionType.POLYGON:
-            if not self.set_region_id(str(getattr(task, "region_id", "") or "")):
-                self.set_region_type(RegionType.RECTANGLE)
+        if (
+            RegionType.parse(getattr(task, "region_type", "")) is RegionType.POLYGON
+            and not self.set_region_id(str(getattr(task, "region_id", "") or ""))
+        ):
+            self.set_region_type(RegionType.RECTANGLE)
 
         # Zoom 落**最后**（Slice 19）。任务记录里那一对是当时**真的用来下载**的
         # 值，而恢复一个行政区域会把模式带到「推荐」——推荐模式下控件里是等级

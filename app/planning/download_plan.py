@@ -69,21 +69,22 @@ if TYPE_CHECKING:  # pragma: no cover - 只给类型检查器看
     # ``app.geo.region_estimator`` 在导入期会拉进 ``app.geo.region``，
     # 而 ``app.geo.region`` 又会回头拉 ``app.planning`` ——这条边只能用在
     # 注解里（``from __future__ import annotations`` 让它永不求值）。
-    from app.geo.region_estimator import ZoomRegionStats
     from collections.abc import Iterable
 
+    from app.geo.region_estimator import ZoomRegionStats
+
 __all__ = [
+    "PLAN_LEVEL_ORDER",
     "DownloadPlan",
     "DownloadPlanItem",
     "PlanItemStatus",
-    "PLAN_LEVEL_ORDER",
-    "new_item_id",
-    "new_plan_id",
-    "level_sort_key",
-    "plan_folder_name",
-    "plan_directory",
     "item_file_stem",
     "item_output_path",
+    "level_sort_key",
+    "new_item_id",
+    "new_plan_id",
+    "plan_directory",
+    "plan_folder_name",
     "planned_output_paths",
 ]
 
@@ -123,7 +124,7 @@ class PlanItemStatus(Enum):
     INVALID = "invalid"
 
     @classmethod
-    def parse(cls, value: object) -> "PlanItemStatus":
+    def parse(cls, value: object) -> PlanItemStatus:
         """宽容解析：认不出来一律按 :attr:`VALID` 处理。
 
         与 :meth:`RegionLevel.parse` 同一套路（读历史数据的那一侧要宽容）：
@@ -232,7 +233,7 @@ class DownloadPlanItem:
     # --- 估算摘要（Spec §8）：只有计数，没有任何瓦片坐标 ---
     candidate_tiles: int = 0
     filtered_tiles: int = 0
-    per_zoom: tuple["ZoomRegionStats", ...] = ()
+    per_zoom: tuple[ZoomRegionStats, ...] = ()
 
     # --- 运行时状态：不写盘（见模块文档）---
     status: PlanItemStatus = PlanItemStatus.VALID
@@ -527,7 +528,7 @@ class DownloadPlan:
     # ------------------------------------------------------------------ #
     # 汇总
     # ------------------------------------------------------------------ #
-    def recalculate_totals(self) -> "DownloadPlan":
+    def recalculate_totals(self) -> DownloadPlan:
         """按"启用且可用"的条目重算总量（Spec §7 / §12）。
 
         单独一个方法而不是只让估算器顺手写一遍：**禁用 / 删除 / 勾选**都会
@@ -594,7 +595,7 @@ def plan_directory(plan: DownloadPlan, *, output_dir: object = None) -> Path:
     return Path(str(base or DEFAULT_OUTPUT_DIR)) / plan_folder_name(plan)
 
 
-def item_file_stem(item: DownloadPlanItem, *, taken: "Iterable[str]" = ()) -> str:
+def item_file_stem(item: DownloadPlanItem, *, taken: Iterable[str] = ()) -> str:
     """一个条目的文件名主体（不含扩展名），如 ``china_z4_10``（Spec §15）。
 
     形如 ``<区域 id>_z<下界>_<上界>``：区域 id 而不是展示名，因为 id 是

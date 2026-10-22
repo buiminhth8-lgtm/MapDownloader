@@ -35,9 +35,9 @@ from app.geo.tile_region_filter import (
 )
 
 __all__ = [
-    "ZoomRegionStats",
     "RegionTileEstimate",
     "RegionTileEstimator",
+    "ZoomRegionStats",
     "estimate_region_tiles",
 ]
 

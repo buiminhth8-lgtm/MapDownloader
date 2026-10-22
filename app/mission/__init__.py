@@ -58,6 +58,16 @@ Slice 16 已有的 :class:`~app.geo.DownloadRegion` 交给下载链路 —— �
 这条边有意识做成"注册回调"而不是 import，否则 ``app.geo`` 会反过来依赖业务层。
 """
 
+from app.mission.mission_region_service import (
+    MISSION_REFERENCE_FILES,
+    CompositeRegionService,
+    MissionRegionService,
+    install_mission_region_resolver,
+    mission_reference_files,
+    reset_mission_region_resolver,
+    uninstall_mission_region_resolver,
+)
+from app.mission.mission_region_store import MissionRegionStore
 from app.mission.models import (
     MissionError,
     MissionRegion,
@@ -70,16 +80,6 @@ from app.mission.models import (
     km_to_meters,
     meters_to_km,
 )
-from app.mission.mission_region_service import (
-    MISSION_REFERENCE_FILES,
-    CompositeRegionService,
-    MissionRegionService,
-    install_mission_region_resolver,
-    mission_reference_files,
-    reset_mission_region_resolver,
-    uninstall_mission_region_resolver,
-)
-from app.mission.mission_region_store import MissionRegionStore
 from app.mission.region_builder import (
     MissionGeometry,
     MissionRegionBuilder,

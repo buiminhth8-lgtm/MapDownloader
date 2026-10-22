@@ -597,12 +597,12 @@ def scene_validation(checker: Checker, work_dir: Path) -> None:
 # --------------------------------------------------------------------------- #
 def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 F：界面下拉来自目录（真窗口）")
+    from PySide6.QtCore import Qt
+
     from app.geo import RegionType
     from app.geo.region import CHINA_REGION_PRESET
     from app.planning import RegionLevel, ZoomStrategyService
     from app.ui.download_panel import ACTION_CALCULATE
-
-    from PySide6.QtCore import Qt
 
     panel = window.download_panel
     country_combo = panel.country_combo
@@ -880,9 +880,9 @@ def scene_static_guards(checker: Checker) -> None:
     checker.section("场景 H：单一来源（等级规则 / 策略值 / 路径安全）")
     import ast
 
+    from app.geo import region as geo_region
     from app.planning import ADMINISTRATIVE_LEVELS, PARENT_LEVEL_RULES
     from app.regions import models as regions_models
-    from app.geo import region as geo_region
 
     checker.check(
         regions_models.PARENT_LEVEL_RULES is PARENT_LEVEL_RULES

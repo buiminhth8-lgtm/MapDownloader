@@ -81,8 +81,5 @@ class TileTestResult:
 
         只包含状态码 / 体积 / 耗时，不含 URL —— Token 脱敏由调用方负责。
         """
-        if self.has_response:
-            head = f"HTTP {self.status_code}"
-        else:
-            head = "无响应"
+        head = f"HTTP {self.status_code}" if self.has_response else "无响应"
         return f"{head} · {self.content_length} bytes · {self.elapsed_ms:.0f} ms"

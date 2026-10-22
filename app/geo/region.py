@@ -38,6 +38,7 @@ UI 的预估、进度条分母、大任务提示都必须用 selected —— 用
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from collections.abc import Callable
@@ -57,35 +58,38 @@ from app.config.settings import (
 from app.geo.bounds import GeoBounds
 from app.geo.geojson_loader import (
     GeoJSONDocument,
-    GeoJSONError,
+    # 本模块的 docstring 在 Raises 段里点名这个异常（"边界文件不合法"），
+    # 但代码里不捕获它 —— 它是给读者看的类型信息，所以显式抑制 F401。
+    GeoJSONError,  # noqa: F401
     geometry_to_bounds,
     load_geojson_document,
 )
+
 # 唯一一处「geo → planning」的依赖：区域模型要挂一个规划等级（Slice 17，Spec §7）。
 # region_level 是零依赖模块（纯 enum），因此这条边不构成循环 —— 详见
 # app/planning/zoom_strategy.py 的模块文档。
 from app.planning.region_level import RegionLevel
 
 __all__ = [
-    "RegionType",
-    "DownloadRegion",
-    "RegionPreset",
-    "RegionBoundaryMissing",
     "CHINA_REGION_PRESET",
     "REGION_PRESETS",
-    "list_region_presets",
+    "DownloadRegion",
+    "RegionBoundaryMissing",
+    "RegionPreset",
+    "RegionType",
+    "clear_region_resolvers",
     "get_region_preset",
-    "region_from_task",
+    "is_safe_region_relative_path",
+    "list_region_presets",
+    # 资源路径规则（Slice 18 抽成公开函数：目录层与扁平预设共用同一份实现）
+    "normalize_region_relative_path",
     "region_from_metadata",
+    "region_from_task",
     # 动态区域解析（Slice 22）：任务区几何不在 REGION_PRESETS 里，
     # 由业务层注册回调，本模块在"预设找不到"时问一句。
     "register_region_resolver",
-    "unregister_region_resolver",
-    "clear_region_resolvers",
-    # 资源路径规则（Slice 18 抽成公开函数：目录层与扁平预设共用同一份实现）
-    "normalize_region_relative_path",
-    "is_safe_region_relative_path",
     "resolve_region_path",
+    "unregister_region_resolver",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -116,7 +120,7 @@ class RegionType(Enum):
     POLYGON = "polygon"
 
     @classmethod
-    def parse(cls, value: object) -> "RegionType":
+    def parse(cls, value: object) -> RegionType:
         """宽容解析：认不出来的一律按 :attr:`RECTANGLE` 处理。
 
         这条宽容规则是**有意为之**（Spec §21）：老 MBTiles / 老 manifest
@@ -455,7 +459,7 @@ class DownloadRegion:
     # 构造
     # ------------------------------------------------------------------ #
     @classmethod
-    def rectangle(cls, name: str, bounds: GeoBounds) -> "DownloadRegion":
+    def rectangle(cls, name: str, bounds: GeoBounds) -> DownloadRegion:
         """构造自定义矩形区域（与 Slice 0~15 的行为完全一致）。"""
         return cls(region_type=RegionType.RECTANGLE, name=name, bounds=bounds)
 
@@ -466,7 +470,7 @@ class DownloadRegion:
         *,
         bounds: GeoBounds | None = None,
         document: GeoJSONDocument | None = None,
-    ) -> "DownloadRegion":
+    ) -> DownloadRegion:
         """由一个预设构造多边形区域。
 
         Args:
@@ -615,7 +619,7 @@ class DownloadRegion:
                 data["geometryVersion"] = self.boundary_version
         return data
 
-    def with_bounds(self, bounds: GeoBounds) -> "DownloadRegion":
+    def with_bounds(self, bounds: GeoBounds) -> DownloadRegion:
         """换一个候选范围（返回新实例；本类型不可变）。"""
         return replace(self, bounds=bounds)
 
@@ -650,10 +654,8 @@ def register_region_resolver(resolver: RegionResolver) -> None:
 
 def unregister_region_resolver(resolver: RegionResolver) -> None:
     """撤掉一个动态区域解析器（不在表里时静默返回）。"""
-    try:
+    with contextlib.suppress(ValueError):
         _DYNAMIC_REGION_RESOLVERS.remove(resolver)
-    except ValueError:
-        pass
 
 
 def clear_region_resolvers() -> None:

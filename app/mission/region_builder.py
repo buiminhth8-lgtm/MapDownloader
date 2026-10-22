@@ -50,13 +50,15 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 
+from pyproj import Transformer
 from shapely import is_valid, make_valid
 from shapely.geometry import LineString, mapping
-from shapely.ops import transform as shapely_transform, unary_union
-from pyproj import Transformer
+from shapely.ops import transform as shapely_transform
+from shapely.ops import unary_union
 
 from app.config.settings import (
     DEFAULT_MISSION_BUFFER_METERS,
@@ -80,8 +82,8 @@ from app.mission.route_loader import dedupe_waypoints
 __all__ = [
     "MissionGeometry",
     "MissionRegionBuilder",
-    "route_geojson_document",
     "region_geojson_document",
+    "route_geojson_document",
 ]
 
 #: 圆形端帽 / 圆角的弧段数。8 段在几公里尺度上肉眼已经看不出棱角；
@@ -340,7 +342,7 @@ class MissionRegionBuilder:
             for point in waypoints
         )
         digest = hashlib.sha256(
-            f"{canonical}|{float(buffer_meters):.3f}".encode("utf-8")
+            f"{canonical}|{float(buffer_meters):.3f}".encode()
         ).hexdigest()[:12]
         return f"{self._version_prefix}:{float(buffer_meters):.1f}:{digest}"
 

@@ -18,7 +18,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
 from PIL import Image
 
 from app.geo import (

@@ -61,15 +61,15 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from app.config.settings import (
     PACKAGE_BACKUP_SUFFIX_FORMAT,
-    PACKAGE_BUILDING_SUFFIX,
     PACKAGE_BUILD_STAGE_RANGES,
+    PACKAGE_BUILDING_SUFFIX,
     PACKAGE_COPY_CHUNK_SIZE,
     PACKAGE_DEFAULT_PROVIDER,
     PACKAGE_DEFAULT_TILE_SCHEME,
@@ -106,13 +106,14 @@ from app.package.models import (
     MapPackageManifest,
     PackageAborted,
     PackageBuildResult,
-    PackageRegion,
     PackageProgress,
+    PackageRegion,
     PackageValidationResult,
     now_iso,
     render_manifest_json,
 )
 from app.package.package_validator import MapPackageValidator, default_inspection_service
+
 # ``app.planning.region_level`` 是零依赖模块（纯 enum，"刻意不 import 任何东西"），
 # 因此 app.package 依赖它不构成层次倒挂，也不会造出循环 —— 与 app.geo.region
 # 依赖它是同一条边。这里只借它回答一个问题：这个包的几何是不是"任务区自己那份"。
@@ -121,8 +122,8 @@ from app.providers import describe_exception
 
 __all__ = [
     "MapPackageBuilder",
-    "SourceFacts",
     "ProgressCallback",
+    "SourceFacts",
     "make_package_id",
 ]
 
@@ -214,7 +215,7 @@ class SourceFacts:
     tile_count: int
     #: 区域信息（Slice 16）：来自 MBTiles metadata，缺省 ``None``
     #: （Slice ≤15 生成的文件没有这几项）→ manifest 里不写 ``region``。
-    region: "PackageRegion | None" = None
+    region: PackageRegion | None = None
 
 
 def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
@@ -838,7 +839,7 @@ class MapPackageBuilder:
                 percent = start
             else:
                 span = end - start
-                percent = start + int(round(span * min(progress.percent, 100) / 100))
+                percent = start + round(span * min(progress.percent, 100) / 100)
             callback(
                 PackageProgress(
                     stage=stage,
@@ -925,7 +926,7 @@ class MapPackageBuilder:
         start, end = PACKAGE_BUILD_STAGE_RANGES.get(stage, (0, 100))
         if total > 0:
             ratio = max(0.0, min(1.0, current / total))
-            percent = start + int(round((end - start) * ratio))
+            percent = start + round((end - start) * ratio)
         else:
             percent = start
         percent = 100 if stage == "done" else percent

@@ -100,7 +100,6 @@ from app.mbtiles import (
     MBTilesWriteError,
     MBTilesWriter,
 )
-from app.services.mbtiles_inspection_service import MBTilesInspectionService
 from app.models.download_task import DownloadTask, DownloadTaskStatus
 from app.models.map_layer import (
     COMPOSITION_SINGLE,
@@ -108,11 +107,13 @@ from app.models.map_layer import (
     MapType,
     composition_for,
 )
+
 #: Slice 9 起 :func:`sanitize_map_name` 住在 :mod:`app.models.naming`（见那里的
 #: 模块说明：包构建器也要用它，留在服务层会形成循环导入）。这里原样导入并在
 #: ``__all__`` 里继续导出，既有调用方与测试一行都不用改。
 from app.models.naming import sanitize_map_name
 from app.providers import TiandituProvider
+from app.services.mbtiles_inspection_service import MBTilesInspectionService
 
 __all__ = [
     "LayerArgument",
@@ -120,8 +121,8 @@ __all__ = [
     "MapDownloadService",
     "MapResumeError",
     "ResumeCompatibility",
-    "check_resume_compatibility",
     "build_output_path",
+    "check_resume_compatibility",
     "count_existing_region_tiles",
     "count_existing_tiles",
     "region_target_tiles",
@@ -604,9 +605,7 @@ class MapDownloadOutcome:
             return False
         if self.summary.failed:
             return False
-        if self.target_tiles and self.tile_count < self.target_tiles:
-            return False
-        return True
+        return not (self.target_tiles and self.tile_count < self.target_tiles)
 
     @property
     def size_text(self) -> str:

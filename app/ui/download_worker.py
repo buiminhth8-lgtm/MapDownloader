@@ -75,7 +75,7 @@ class DownloadWorker(QThread):
         bounds: GeoBounds,
         min_zoom: int,
         max_zoom: int,
-        layer: "MapLayerType | MapType",
+        layer: MapLayerType | MapType,
         output_path: str | Path,
         *,
         with_labels: bool = False,
@@ -167,7 +167,7 @@ class DownloadWorker(QThread):
     # 只读状态
     # ------------------------------------------------------------------ #
     @property
-    def layer(self) -> "MapLayerType | MapType":
+    def layer(self) -> MapLayerType | MapType:
         """本次下载的图层 / 地图类型。"""
         return self._layer
 

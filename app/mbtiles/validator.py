@@ -45,13 +45,13 @@ from app.models.map_layer import COMPOSITION_MERGED, COMPOSITION_VALUES
 from app.providers import detect_image_format
 
 __all__ = [
-    "validate_mbtiles",
+    "COMPOSITION_METADATA_KEYS",
+    "OPTIONAL_METADATA_KEYS",
+    "REQUIRED_METADATA_KEYS",
+    "parse_bool",
     "parse_bounds",
     "parse_zoom",
-    "parse_bool",
-    "REQUIRED_METADATA_KEYS",
-    "OPTIONAL_METADATA_KEYS",
-    "COMPOSITION_METADATA_KEYS",
+    "validate_mbtiles",
 ]
 
 

@@ -454,7 +454,7 @@ class RegionDataImportDialog(QDialog):
         if len(result.issues) > _MAX_ISSUE_LINES:
             details.append(f"……另有 {len(result.issues) - _MAX_ISSUE_LINES} 条，见日志")
         self._set_result_text(
-            "\n".join(lines + (["", "问题明细："] + details if details else [])),
+            "\n".join(lines + (["", "问题明细：", *details] if details else [])),
             verdict=verdict_text,
         )
 

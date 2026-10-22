@@ -31,6 +31,7 @@ from app.package import (
     verify_sha256,
 )
 
+
 # --------------------------------------------------------------------------- #
 # SHA256
 # --------------------------------------------------------------------------- #
@@ -68,7 +69,7 @@ def test_sha256_matches_hashlib_with_default_chunk_size(work_dir: Path) -> None:
     payload = b"tile-payload" * (5 * 1024 * 1024 // 12)
     target = work_dir / "big.bin"
     target.write_bytes(payload)
-    assert PACKAGE_SHA256_CHUNK_SIZE < len(payload)
+    assert len(payload) > PACKAGE_SHA256_CHUNK_SIZE
 
     assert calculate_sha256(target) == hashlib.sha256(payload).hexdigest()
 

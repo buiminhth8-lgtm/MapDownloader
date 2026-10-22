@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import ast
-import re
+import itertools
 import subprocess
 import sys
 from pathlib import Path
@@ -169,7 +169,7 @@ def test_custom_policy_spans_the_supported_zoom_range() -> None:
 @pytest.mark.parametrize("policy", list_zoom_policies(), ids=lambda p: p.level.value)
 def test_policy_invariants(policy: ZoomPolicy) -> None:
     """区间顺序自洽，且全部落在 Tile Math 支持范围内。"""
-    assert TILE_MATH_MIN_ZOOM <= policy.recommended_min_zoom
+    assert policy.recommended_min_zoom >= TILE_MATH_MIN_ZOOM
     assert policy.recommended_min_zoom <= policy.recommended_max_zoom
     assert policy.recommended_max_zoom <= policy.warning_max_zoom
     assert policy.warning_max_zoom <= TILE_MATH_MAX_ZOOM
@@ -184,7 +184,7 @@ def test_recommended_ranges_overlap_between_neighbouring_levels() -> None:
     同理。把它们接成不重叠的阶梯会让"全国概览 + 重点省"无法用同一套级别拼。
     """
     ordered = [get_zoom_policy(item) for item in _HIERARCHY_LEVELS]
-    for lower, upper in zip(ordered, ordered[1:], strict=False):
+    for lower, upper in itertools.pairwise(ordered):
         assert lower.recommended_max_zoom >= upper.recommended_min_zoom, (
             f"{lower.level.value} 与 {upper.level.value} 之间没有重叠："
             f"{lower.recommended_range_text} / {upper.recommended_range_text}"

@@ -70,7 +70,7 @@ def _seeded_task_service():
     from types import SimpleNamespace
 
     from app.geo import GeoBounds
-    from app.models import DownloadTaskStatus, MapLayerType, MapType
+    from app.models import DownloadTaskStatus, MapType
     from app.tasks import TaskService, TaskStore
 
     store = TaskStore(_Path(tempfile.mkdtemp(prefix="capture-ui-")) / "tasks.json")
@@ -164,7 +164,7 @@ def _fill_running_download(window) -> None:
     window.task_progress.set_status(UiTaskState.DOWNLOADING.display_name)
 
 
-def pump(app: "QApplication", times: int = 3) -> None:
+def pump(app: QApplication, times: int = 3) -> None:
     """空转事件循环若干轮。
 
     嵌套 QGroupBox / QLabel(wordWrap) 的布局不是一轮 processEvents 就能收敛的，

@@ -30,15 +30,15 @@ from app.config.settings import MAX_REPORTED_FAILURE_REASONS
 from app.geo import format_size
 
 __all__ = [
-    "TileCoordinate",
-    "TileFailureKind",
     "COMPOSITE_FAILURE_KINDS",
-    "TileDownloadResult",
     "DownloadProgress",
     "DownloadSummary",
-    "TileCallback",
     "ProgressCallback",
     "SkipPredicate",
+    "TileCallback",
+    "TileCoordinate",
+    "TileDownloadResult",
+    "TileFailureKind",
 ]
 
 

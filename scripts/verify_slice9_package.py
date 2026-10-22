@@ -283,7 +283,6 @@ def _layout_problems(widget) -> list[str]:
 # --------------------------------------------------------------------------- #
 def scene_pipeline(checker: Checker, work_dir: Path) -> Path:
     """``.mbtiles`` → 地图包 → 校验 → 改一个字节 → FAIL。"""
-    from app.package import MapPackageBuilder
     from app.services import MapPackageService
 
     checker.section("场景 A：构建 / 校验 / 篡改检测（服务层）")

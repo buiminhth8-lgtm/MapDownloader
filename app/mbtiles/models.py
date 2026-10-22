@@ -43,12 +43,12 @@ from app.models.map_layer import (
 )
 
 __all__ = [
-    "MBTilesMetadata",
-    "MBTilesValidationResult",
-    "SUPPORTED_TILE_FORMATS",
+    "METADATA_KEY_ORDER",
     "SUPPORTED_MAP_TYPES",
     "SUPPORTED_REGION_TYPES",
-    "METADATA_KEY_ORDER",
+    "SUPPORTED_TILE_FORMATS",
+    "MBTilesMetadata",
+    "MBTilesValidationResult",
 ]
 
 
@@ -359,7 +359,7 @@ class MBTilesMetadata:
         boundary_version: str = "",
         region_level: str = "",
         buffer_meters: str | float | None = "",
-    ) -> "MBTilesMetadata":
+    ) -> MBTilesMetadata:
         """便捷构造：直接用 :class:`~app.geo.GeoBounds` 建元数据。
 
         下载链路的入参本来就是 ``GeoBounds``，有这个工厂可以避免调用方

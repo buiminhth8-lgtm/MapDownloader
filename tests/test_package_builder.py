@@ -174,27 +174,27 @@ def _fake_diagnostics(**overrides) -> SimpleNamespace:
     真实诊断在"一张瓦片都没有"时给的是 FAIL，于是
     ``PACKAGE_ERROR_NO_TILE`` 这条分支永远走不到 —— 只有注入才能覆盖它。
     """
-    base = dict(
-        status="PASS",
-        errors=[],
-        warnings=[],
-        notices=[],
-        metadata={
+    base = {
+        "status": "PASS",
+        "errors": [],
+        "warnings": [],
+        "notices": [],
+        "metadata": {
             "name": "beijing",
             "format": "png",
             "bounds": "116.000000,39.000000,116.500000,39.500000",
         },
-        format="png",
-        bounds=(116.0, 39.0, 116.5, 39.5),
-        min_zoom=8,
-        max_zoom=9,
-        tile_count=5,
-        file_size=1024,
-        provider="tianditu",
-        map_type="vector",
-        labels=False,
-        composition=COMPOSITION_SINGLE,
-    )
+        "format": "png",
+        "bounds": (116.0, 39.0, 116.5, 39.5),
+        "min_zoom": 8,
+        "max_zoom": 9,
+        "tile_count": 5,
+        "file_size": 1024,
+        "provider": "tianditu",
+        "map_type": "vector",
+        "labels": False,
+        "composition": COMPOSITION_SINGLE,
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -1102,7 +1102,7 @@ def test_polygon_and_rectangle_packages_differ_only_by_region(
     ``createdAt`` 的格式、``bounds`` 的键序）都会在这里显形。
     """
     _register_test_preset(work_dir, monkeypatch)
-    common = dict(name="cmp", source_map_type="vector", composition=COMPOSITION_SINGLE)
+    common = {"name": "cmp", "source_map_type": "vector", "composition": COMPOSITION_SINGLE}
     polygon_source = _make_mbtiles(
         work_dir / "poly.mbtiles",
         metadata=MBTilesMetadata.for_bounds(

@@ -47,7 +47,7 @@ if TYPE_CHECKING:  # pragma: no cover - 只给类型检查器看
     from app.geo.geojson_loader import GeoJSONDocument
     from app.geo.region import DownloadRegion
 
-__all__ = ["ZoomMode", "RegionSelectionController"]
+__all__ = ["RegionSelectionController", "ZoomMode"]
 
 _logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class ZoomMode(Enum):
     CUSTOM = "custom"
 
     @classmethod
-    def parse(cls, value: object) -> "ZoomMode":
+    def parse(cls, value: object) -> ZoomMode:
         """宽容解析：认不出来的一律按 :attr:`RECOMMENDED` 处理。
 
         与 :meth:`RegionLevel.parse` 同一套路（"读历史数据的那一侧要宽容"）：
@@ -452,7 +452,7 @@ class RegionSelectionController:
         except RegionCatalogError as exc:  # pragma: no cover - id 来自本控制器
             return str(exc)
 
-    def load_document(self, region_id: str | None = None) -> "GeoJSONDocument":
+    def load_document(self, region_id: str | None = None) -> GeoJSONDocument:
         """读当前（或指定）区域的边界文档 —— 面板据此回填只读的 West/South/…
 
         读盘这件事交给加载器（路径安全、缺失文案、GeoJSON 报错都在它那里），
@@ -470,9 +470,9 @@ class RegionSelectionController:
         self,
         *,
         bounds: GeoBounds | None = None,
-        document: "GeoJSONDocument | None" = None,
+        document: GeoJSONDocument | None = None,
         geometry: Any = None,
-    ) -> "DownloadRegion | None":
+    ) -> DownloadRegion | None:
         """当前区域对应的 :class:`~app.geo.DownloadRegion`（Spec §3）。
 
         **本方法永不抛异常**，返回 ``None`` 表示"拿不到可信的区域"，

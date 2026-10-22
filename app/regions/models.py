@@ -59,20 +59,20 @@ from app.planning.region_level import (
 )
 
 __all__ = [
-    "RegionPreset",
-    "RegionCatalogError",
-    "CatalogIssue",
-    "CatalogIssueCode",
-    "CatalogValidationResult",
-    "IssueSeverity",
     # 层级规则：**从规划层转出**（同一个对象，不是第二份表）。
     # 等级字面量（COUNTRY / PROVINCE / CITY）只允许出现在 app.planning 里，
     # ``tests/test_zoom_policy.py`` 的静态守卫盯着这件事。
     "ADMINISTRATIVE_LEVELS",
     "PARENT_LEVEL_RULES",
+    "CatalogIssue",
+    "CatalogIssueCode",
+    "CatalogValidationResult",
+    "IssueSeverity",
+    "RegionCatalogError",
+    "RegionPreset",
+    "is_safe_region_relative_path",
     # 路径规则同理：转出 app.geo.region 的那一份实现。
     "normalize_region_relative_path",
-    "is_safe_region_relative_path",
     "resolve_region_path",
 ]
 
@@ -367,7 +367,7 @@ class RegionPreset:
         """
         return resolve_region_path(root, self.geojson_path)
 
-    def with_bounds(self, bounds: GeoBounds) -> "RegionPreset":
+    def with_bounds(self, bounds: GeoBounds) -> RegionPreset:
         """换一个声明范围（返回新实例；本类型不可变）。"""
         return replace(self, bounds=bounds)
 

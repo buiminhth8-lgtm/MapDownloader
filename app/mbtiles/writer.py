@@ -76,7 +76,7 @@ from app.mbtiles.reader import (
     TILE_EXISTS_SQL,
 )
 
-__all__ = ["MBTilesWriteError", "MBTilesWriter", "MBTilesTileSink"]
+__all__ = ["MBTilesTileSink", "MBTilesWriteError", "MBTilesWriter"]
 
 
 _logger = logging.getLogger(__name__)
@@ -541,7 +541,7 @@ class MBTilesWriter:
     # ------------------------------------------------------------------ #
     # context manager
     # ------------------------------------------------------------------ #
-    def __enter__(self) -> "MBTilesWriter":
+    def __enter__(self) -> MBTilesWriter:
         self.open()
         return self
 
@@ -783,7 +783,7 @@ class MBTilesTileSink:
         finally:
             self._writer.close()
 
-    async def __aenter__(self) -> "MBTilesTileSink":
+    async def __aenter__(self) -> MBTilesTileSink:
         self.start()
         return self
 

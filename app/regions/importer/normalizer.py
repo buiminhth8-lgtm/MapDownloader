@@ -23,10 +23,9 @@ Shapely 的 ``shape()`` 按 GeoJSON 规范解析坐标数组，顺序天然是
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import MultiPolygon, Polygon
 
 from app.geo.bounds import GeoBounds
 from app.planning.region_level import RegionLevel
@@ -37,7 +36,7 @@ from app.regions.importer.models import (
     sanitize_region_id,
 )
 
-__all__ = ["normalize_features", "WGS84_LON_RANGE", "WGS84_LAT_RANGE"]
+__all__ = ["WGS84_LAT_RANGE", "WGS84_LON_RANGE", "normalize_features"]
 
 #: WGS84 经度合理范围（Spec §5）。
 WGS84_LON_RANGE: tuple[float, float] = (-180.0, 180.0)

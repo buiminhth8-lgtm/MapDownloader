@@ -182,16 +182,17 @@ def test_metadata_values_are_parameterized(work_dir: Path) -> None:
 
 
 def test_write_metadata_requires_metadata_instance(work_dir: Path) -> None:
-    with MBTilesWriter(work_dir / "map.mbtiles") as writer:
-        with pytest.raises(TypeError):
-            writer.write_metadata({"name": "x"})  # type: ignore[arg-type]
+    with MBTilesWriter(work_dir / "map.mbtiles") as writer, pytest.raises(TypeError):
+        writer.write_metadata({"name": "x"})  # type: ignore[arg-type]
 
 
 def test_write_tile_before_metadata_is_rejected(work_dir: Path) -> None:
     """没有 metadata 的 MBTiles 是无效文件，宁可在写入端就拒绝。"""
-    with MBTilesWriter(work_dir / "map.mbtiles") as writer:
-        with pytest.raises(RuntimeError, match="write_metadata"):
-            writer.write_tile(3, 4, 2, FAKE_PNG)
+    with (
+        MBTilesWriter(work_dir / "map.mbtiles") as writer,
+        pytest.raises(RuntimeError, match="write_metadata"),
+    ):
+        writer.write_tile(3, 4, 2, FAKE_PNG)
 
 
 # --------------------------------------------------------------------------- #
@@ -425,12 +426,11 @@ def test_no_connection_leak_when_flush_fails(work_dir: Path) -> None:
 def test_context_manager_aborts_on_exception(work_dir: Path) -> None:
     """with 块里抛异常 -> 回滚未提交瓦片 + 关闭连接。"""
     db = work_dir / "map.mbtiles"
-    with pytest.raises(RuntimeError, match="boom"):
-        with MBTilesWriter(db) as writer:
-            writer.write_metadata(_metadata())
-            for index in range(5):
-                writer.write_tile(3, index, 0, FAKE_PNG)
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), MBTilesWriter(db) as writer:
+        writer.write_metadata(_metadata())
+        for index in range(5):
+            writer.write_tile(3, index, 0, FAKE_PNG)
+        raise RuntimeError("boom")
 
     # 已提交的 metadata 保留（它单独成事务），未提交的瓦片被丢弃
     assert _rows(db, "SELECT count(*) FROM metadata")[0][0] == 8

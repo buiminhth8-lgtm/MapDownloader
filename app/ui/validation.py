@@ -204,7 +204,7 @@ def _check_zoom(data: Mapping[str, Any]) -> list[str]:
         ]
 
     # 防御性：万一将来两个常量被改到互相矛盾，这里要能报出来而不是静默通过。
-    if not (TILE_MATH_MIN_ZOOM <= min_zoom and max_zoom <= TILE_MATH_MAX_ZOOM):
+    if not (min_zoom >= TILE_MATH_MIN_ZOOM and max_zoom <= TILE_MATH_MAX_ZOOM):
         return [
             UI_TEXT_VALIDATION_ZOOM_RANGE.format(
                 low=TILE_MATH_MIN_ZOOM, high=TILE_MATH_MAX_ZOOM

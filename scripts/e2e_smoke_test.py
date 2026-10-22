@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Windows 侧端到端冒烟测试（Slice 15 §3）。
 
 **它验证的是"这条链路整体还活着"，不是"某个函数算得对"。**
@@ -32,7 +31,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import shutil
 import struct
 import sys
@@ -47,21 +45,21 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.config import settings                                   # noqa: E402
-from app.geo.bounds import GeoBounds                               # noqa: E402
-from app.geo.tile_math import (                                   # noqa: E402
+from app.config import settings  # noqa: E402
+from app.geo.bounds import GeoBounds  # noqa: E402
+from app.geo.tile_math import (  # noqa: E402
     calculate_tile_range,
     estimate_tile_count,
     xyz_y_to_tms_y,
 )
-from app.mbtiles.models import MBTilesMetadata                    # noqa: E402
-from app.mbtiles.writer import MBTilesWriter                      # noqa: E402
-from app.package.checksum import calculate_sha256                 # noqa: E402
-from app.package.models import PACKAGE_FORMAT_VERSION             # noqa: E402
-from app.package.package_builder import MapPackageBuilder         # noqa: E402
-from app.package.package_reader import MapPackageReader           # noqa: E402
-from app.package.package_validator import MapPackageValidator     # noqa: E402
-from app.services.mbtiles_inspection_service import (             # noqa: E402
+from app.mbtiles.models import MBTilesMetadata  # noqa: E402
+from app.mbtiles.writer import MBTilesWriter  # noqa: E402
+from app.package.checksum import calculate_sha256  # noqa: E402
+from app.package.models import PACKAGE_FORMAT_VERSION  # noqa: E402
+from app.package.package_builder import MapPackageBuilder  # noqa: E402
+from app.package.package_reader import MapPackageReader  # noqa: E402
+from app.package.package_validator import MapPackageValidator  # noqa: E402
+from app.services.mbtiles_inspection_service import (  # noqa: E402
     MBTilesInspectionService,
 )
 
@@ -592,7 +590,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    zooms = tuple(sorted(set(int(z) for z in args.zooms)))
+    zooms = tuple(sorted({int(z) for z in args.zooms}))
     if not zooms:
         print("至少要指定一个缩放层级", file=sys.stderr)
         return 2
@@ -609,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runner = SmokeRunner(work_dir, zooms)
         ok = runner.run()
-    except Exception as exc:                               # noqa: BLE001
+    except Exception:                               # noqa: BLE001
         # 冒烟脚本自己崩了也要给非 0 退出码 —— 否则 CI 会把它当通过。
         import traceback
         print("-" * 72)

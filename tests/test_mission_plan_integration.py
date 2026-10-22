@@ -30,10 +30,8 @@ Inspector 找得到几何就算、找不到就认错   退回矩形算会误报"
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
-import json
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -42,7 +40,6 @@ import pytest
 from PIL import Image
 
 from app.config.settings import (
-    DEFAULT_MISSION_BUFFER_METERS,
     UI_TEXT_MISSION_DELETE_REFERENCED,
 )
 from app.geo import (
@@ -55,6 +52,14 @@ from app.geo import (
 )
 from app.geo import region as region_module
 from app.mbtiles import MBTilesMetadata, MBTilesWriter
+from app.mission import (
+    CompositeRegionService,
+    MissionRegionNotFound,
+    MissionRegionReferenced,
+    MissionRegionService,
+    MissionRegionStore,
+)
+from app.mission.models import MISSION_REGION_LEVEL
 from app.planning.download_plan import PLAN_LEVEL_ORDER, DownloadPlan
 from app.planning.plan_execution import PlanExecutionStatus, PlanItemRunStatus
 from app.planning.plan_execution_store import PlanExecutionStore
@@ -70,16 +75,6 @@ from app.services import MBTilesInspectionService
 from app.tasks.task_service import TaskService
 from app.tasks.task_store import TaskStore
 from tests.plan_fakes import FakeRunner
-
-from app.mission import (
-    CompositeRegionService,
-    MissionRegionNotFound,
-    MissionRegionReferenced,
-    MissionRegionService,
-    MissionRegionStore,
-    mission_reference_files,
-)
-from app.mission.models import MISSION_REGION_LEVEL
 
 #: 一条作业航线（杭州西湖北侧），带三个点就够画折线。
 ROUTE = [(120.00, 30.00), (120.05, 30.02), (120.10, 30.01)]
