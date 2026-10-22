@@ -67,25 +67,71 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 #: 一旦谁把它复制一份到自己仓库里"方便测试"，两端就又开始各测各的了。
 FIXTURE_PATH = BACKEND_ROOT / "tests" / "fixtures" / "map_package_v1" / "manifest.json"
 
-#: Android 侧解析器的源码路径（**跨仓库**）。
+# --------------------------------------------------------------------------- #
+# 跨仓库源码定位
+# --------------------------------------------------------------------------- #
+#: 兄弟仓库根目录（**跨仓库**）。
 #:
 #: 这是本文件唯一一处跨仓库依赖，且只在**测试**里出现（生产代码不依赖它）。
-#: 找不到时整个模块 skip，而不是 fail —— 单仓库检出（比如别人只拿了 Windows 侧）
-#: 不应该因为缺兄弟仓库而红。但一旦在能读到它，比对就是强制的。
 ANDROID_ROOT = BACKEND_ROOT.parent / "osmdroid"
-ANDROID_MANIFEST_JAVA = (
-    ANDROID_ROOT
-    / "OpenStreetMapViewer"
-    / "src"
-    / "main"
-    / "java"
-    / "org"
-    / "osmdroid"
-    / "map"
-    / "offline"
-    / "model"
-    / "OfflineMapManifest.java"
+
+#: Java 源码可能在的模块根，按"当前所在模块 → 历史上所在模块"排序。
+#:
+#: **不写死单个模块名。** ``RegionLevel`` / ``OfflineMapManifest`` 原先在
+#: ``OpenStreetMapViewer``，后来搬进 ``osmdroid-android``；当年路径写死之后，
+#: 4 个跨仓库用例从此一直 skip（"读不到就跳过"），而 Android 侧 ``RegionLevel``
+#: 缺 ``county`` 这件事就这么一路漏到了线上包格式里。守卫失效比守卫报红贵得多。
+_ANDROID_SOURCE_ROOTS = (
+    ANDROID_ROOT / "osmdroid-android" / "src" / "main" / "java",
+    ANDROID_ROOT / "OpenStreetMapViewer" / "src" / "main" / "java",
 )
+
+#: 两个跨仓库契约文件都在 ``org.osmdroid.map.offline.model`` 包里 ——
+#: ``RegionLevel`` 是"等级词汇表"，``OfflineMapManifest`` 是"字段清单"，
+#: 它们共同构成 manifest 的跨端契约。
+_ANDROID_MODEL_PACKAGE = Path("org") / "osmdroid" / "map" / "offline" / "model"
+
+
+def _locate_android_source(filename: str) -> Path:
+    """在 Android 仓库里定位一个 Java 源文件，找不到时返回**首选路径**。
+
+    返回不存在的路径而不是抛异常，是为了让模块级常量总能绑定；
+    "该不该跳过"由 :data:`ANDROID_SOURCE_AVAILABLE` 决定，而不是由文件在不在决定。
+    """
+    candidates = [root / _ANDROID_MODEL_PACKAGE / filename for root in _ANDROID_SOURCE_ROOTS]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+#: skip 的**唯一**理由：兄弟仓库没检出（比如别人只拿了 Windows 侧）。
+#:
+#: 这里刻意**不**写成 ``not ANDROID_MANIFEST_JAVA.is_file()``：那会让
+#: "仓库在、但文件搬走了"也退化成安静的 skip —— 路径过期与仓库缺失是两件事，
+#: 前者是本仓库该修的缺陷，必须红。
+ANDROID_SOURCE_AVAILABLE = ANDROID_ROOT.is_dir()
+
+_SKIP_REASON = f"没有兄弟仓库 {ANDROID_ROOT}（单仓库检出），跳过跨仓库比对"
+
+
+def _read_android_source(path: Path) -> str:
+    """读 Android 源码；仓库在却找不到文件时，**红**并说清该改哪里。"""
+    if not path.is_file():
+        searched = "\n".join(
+            f"  - {root / _ANDROID_MODEL_PACKAGE / path.name}" for root in _ANDROID_SOURCE_ROOTS
+        )
+        pytest.fail(
+            f"找到了 Android 仓库（{ANDROID_ROOT}），但 {path.name} 不在任何已知模块里：\n"
+            f"{searched}\n"
+            "说明模块又搬了、或文件改名了。请更新 _ANDROID_SOURCE_ROOTS 让它重新被检查到 —— "
+            "不要把它改回'读不到就 skip'，那正是这条守卫失效的原因。"
+        )
+    return path.read_text(encoding="utf-8")
+
+
+#: Android 侧的 manifest 解析器（**跨仓库**）。
+ANDROID_MANIFEST_JAVA = _locate_android_source("OfflineMapManifest.java")
 
 #: Java 里读取字段的辅助方法名 → 它们后面那个字符串是 manifest 的键（可带点号）。
 _JAVA_REQUIRE_CALL = re.compile(r"require(?:String|Int|Long|Double|Number|Boolean)\s*\(\s*"
@@ -102,14 +148,43 @@ def v1_manifest_dict() -> dict:
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
+#: Android 解析器里 schema 1 分支的起点 / 终点标记。
+#:
+#: 同一个类还支持 schema 2（osmdroid 自己的新包格式：``packageId`` / ``files.*`` /
+#: ``zoom.*`` / ``runtime.minVersion``），那是**另一套协议**，不是 Windows 产出的东西。
+#: 比对必须只落在 schema 1 分支上 —— 把 schema 2 的键混进来会得到一堆
+#: "Android 要、Windows 没有"的假阳性，然后逼着人去加无意义的例外。
+_JAVA_V1_BRANCH_START = "if (schema == 1) {"
+_JAVA_V1_BRANCH_ELSE = "} else {"
+
+
+def _android_v1_section(source: str) -> str:
+    """截出解析器的 **schema 1 分支 + 两版共用的尾部**（bounds 等）。
+
+    标记找不到时给出明确失败原因：那说明解析器被重构成别的形状了，
+    这时候静默抽到一堆错键比直接红掉更难查。
+    """
+    try:
+        start = source.index(_JAVA_V1_BRANCH_START)
+        else_at = source.index(_JAVA_V1_BRANCH_ELSE, start)
+        tail_start = source.index("\n        }\n", else_at) + len("\n        }\n")
+    except ValueError:
+        pytest.fail(
+            f"{ANDROID_MANIFEST_JAVA.name} 里找不到 schema 1 / schema 2 的分支标记 —— "
+            "解析器结构变了，请同步更新本文件的切片逻辑（别改成'抽全部 require 调用'，"
+            "那会把 schema 2 的键混进来）"
+        )
+    return source[start:else_at] + source[tail_start:]
+
+
 def _java_required_keys() -> set[str]:
-    """从 Android 解析器源码里抽出所有**必填**键名（保留点号路径）。"""
-    source = ANDROID_MANIFEST_JAVA.read_text(encoding="utf-8")
+    """从 Android 解析器的 **schema 1 分支**里抽出所有**必填**键名（保留点号路径）。"""
+    source = _read_android_source(ANDROID_MANIFEST_JAVA)
     # 去掉行注释，免得把注释里举的例子也当成字段。
     # 块注释（/** ... */）里有很多形如 `mbtiles.file` 的说明，一定要删干净。
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
     source = re.sub(r"//[^\n]*", "", source)
-    return set(_JAVA_REQUIRE_CALL.findall(source))
+    return set(_JAVA_REQUIRE_CALL.findall(_android_v1_section(source)))
 
 
 def _python_required_keys() -> set[str]:
@@ -134,8 +209,8 @@ def _python_required_keys() -> set[str]:
 # §1 两端字段一致性
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(
-    not ANDROID_MANIFEST_JAVA.is_file(),
-    reason=f"读不到 Android 解析器（{ANDROID_MANIFEST_JAVA}），跳过跨仓库比对",
+    not ANDROID_SOURCE_AVAILABLE,
+    reason=_SKIP_REASON,
 )
 def test_windows_and_android_agree_on_every_required_field() -> None:
     """两端对"哪些字段是必填的"定义必须完全一致（Slice 15 §1）。
@@ -160,8 +235,8 @@ def test_windows_and_android_agree_on_every_required_field() -> None:
 
 
 @pytest.mark.skipif(
-    not ANDROID_MANIFEST_JAVA.is_file(),
-    reason="读不到 Android 解析器，跳过跨仓库比对",
+    not ANDROID_SOURCE_AVAILABLE,
+    reason=_SKIP_REASON,
 )
 def test_android_accepts_unknown_extra_fields() -> None:
     """未来加字段时，Android 必须**忽略**未知键而不是拒收（Slice 15 §1）。
@@ -170,7 +245,7 @@ def test_android_accepts_unknown_extra_fields() -> None:
     这里用源码做个廉价的守卫：解析器里不应出现"枚举所有 key"的调用
     （``keys()`` / ``names()``），那才是会因未知字段而失败的写法。
     """
-    source = ANDROID_MANIFEST_JAVA.read_text(encoding="utf-8")
+    source = _read_android_source(ANDROID_MANIFEST_JAVA)
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
     source = re.sub(r"//[^\n]*", "", source)
     for risky in ("json.keys()", "json.names()", "keys().length"):
@@ -347,19 +422,7 @@ def test_fixture_round_trips_through_the_windows_model(v1_manifest_dict: dict) -
 #: "哪些等级存在"必须两端一致 —— 不一致的后果不是报错，而是**静默降级**：
 #: Android 的 ``RegionLevel.parse`` 认不出来就返回 ``UNKNOWN``，包照常能用，
 #: 只是永远排在同级候选的最后。这类问题只能在真机上慢慢看出来。
-ANDROID_REGION_LEVEL_JAVA = (
-    ANDROID_ROOT
-    / "OpenStreetMapViewer"
-    / "src"
-    / "main"
-    / "java"
-    / "org"
-    / "osmdroid"
-    / "map"
-    / "offline"
-    / "model"
-    / "RegionLevel.java"
-)
+ANDROID_REGION_LEVEL_JAVA = _locate_android_source("RegionLevel.java")
 
 #: Java 枚举常量：``NAME（"展示名", 具体度）,`` —— 最后一项以 ``;`` 结尾而不是 ``,``，
 #: 早先只认逗号的版本会静默漏掉 ``UNKNOWN``（那正是本用例要盯住的那一个）。
@@ -371,7 +434,7 @@ _JAVA_ENUM_CONSTANT = re.compile(
 
 def _java_region_levels() -> dict[str, int]:
     """``{等级名（小写）: 具体度}`` —— 从 Android 源码里**抽**出来，不是抄一份。"""
-    source = ANDROID_REGION_LEVEL_JAVA.read_text(encoding="utf-8")
+    source = _read_android_source(ANDROID_REGION_LEVEL_JAVA)
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
     source = re.sub(r"//[^\n]*", "", source)
     found = _JAVA_ENUM_CONSTANT.findall(source)
@@ -380,8 +443,8 @@ def _java_region_levels() -> dict[str, int]:
 
 
 @pytest.mark.skipif(
-    not ANDROID_REGION_LEVEL_JAVA.is_file(),
-    reason=f"读不到 Android 等级枚举（{ANDROID_REGION_LEVEL_JAVA}），跳过跨仓库比对",
+    not ANDROID_SOURCE_AVAILABLE,
+    reason=_SKIP_REASON,
 )
 def test_both_ends_share_one_region_level_vocabulary() -> None:
     """``region.level`` 的取值集合两端一致（Slice 25 §4）。
@@ -410,8 +473,8 @@ def test_both_ends_share_one_region_level_vocabulary() -> None:
 
 
 @pytest.mark.skipif(
-    not ANDROID_REGION_LEVEL_JAVA.is_file(),
-    reason="读不到 Android 等级枚举，跳过跨仓库比对",
+    not ANDROID_SOURCE_AVAILABLE,
+    reason=_SKIP_REASON,
 )
 def test_both_ends_agree_on_which_level_is_more_specific() -> None:
     """层次越细越"具体"这条排序两端一致（Slice 24 §5-3）。

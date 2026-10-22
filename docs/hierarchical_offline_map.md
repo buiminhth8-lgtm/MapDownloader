@@ -1,4 +1,4 @@
-# 分级离线地图体系（全国 → 省 → 市 → 任务区）
+# 分级离线地图体系（全国 → 省 → 市 → 县 → 任务区）
 
 > 这份文档回答一个问题：**"分级"到底分的是什么、谁说了算、信息怎么从 Windows 走到手机。**
 >
@@ -39,16 +39,24 @@
 
 ---
 
-## 2. 四级阶梯与唯一真值来源
+## 2. 分级阶梯与唯一真值来源
 
 | 等级 | `value` | 推荐 Zoom | 典型边界来源 | Android 具体度 |
 | --- | --- | --- | --- | --- |
-| 全国 / 大区域概览 | `country` | **Z4~10** | `resources/regions/country/*.geojson` | 1 |
-| 省 / 自治区 / 直辖市 | `province` | **Z9~13** | `resources/regions/province/*.geojson` | 2 |
-| 市 / 区县 | `city` | **Z12~16** | `resources/regions/city/*.geojson` | 3 |
-| 作业区 / 航线走廊 | `mission` | **Z15~18** | 用户数据目录（**不在资源目录里**） | 4 |
+| 全国 / 大区域概览 | `country` | **Z4~10** | `generated/`（三份天地图数据合成的全国边界） | 1 |
+| 省 / 自治区 / 直辖市 | `province` | **Z9~13** | `generated/`（`scripts/import_china_admin_regions.py`） | 2 |
+| 市 / 地区 / 自治州 | `city` | **Z12~16** | 同上 | 3 |
+| 县 / 区 / 县级市 / 旗 | `county` | **Z14~18** | 同上 | 4 |
+| 作业区 / 航线走廊 | `mission` | **Z15~18** | 用户数据目录（**不在资源目录里**） | 5 |
 | 自定义矩形 | `custom` | 不套用建议 | 无 | 0 |
-| （Android 专有）未知 | `unknown` | — | 老包 | -1 |
+| （Android 专有）未知 | `unknown` | — | 老包 / 认不出的 `level` | -1 |
+
+> **「Android 具体度」是排序用的权重，不是 Zoom 区间**，两者互不相干：它只决定"两张包
+> 都盖得住这个点、都支持当前 Zoom 时，哪张更该被选中"（越大越具体）。词汇表一旦分叉，
+> 后果不是报错而是**静默降级** —— Android 的 `RegionLevel.parse` 认不出来就返回
+> `UNKNOWN`，包照常可用，只是永远排在候选最后。所以这两个仓库的等级清单由
+> `tests/test_package_protocol_v1.py` 直接读 Android 源码逐项比对（不再是"读不到就跳过"）。
+> 上一次分叉正是 `county`：Windows 从 Slice 27 起就写它，Android 到 Slice 28 才认得。
 
 三条硬规则：
 
@@ -80,7 +88,7 @@
                           DownloadRiskAnalyzer
                     （**只读**已算好的估算，不重算瓦片）
                                   │
-                      DownloadPlan（全国 → 省 → 市 → 任务区）
+                      DownloadPlan（全国 → 省 → 市 → 县 → 任务区）
                                   │
                           PlanScheduler（严格串行）
                                   │
@@ -188,7 +196,7 @@ MapResourceManager.applyAuto(lat, lon, zoom)
   切换目标要越过 `目标.minZoom + 0.5`。反方向（当前包已经显示不了当前 Zoom）
   走硬过滤、**不设迟滞** —— 那里的迟滞等于"让用户继续看一张取不到瓦片的图"。
 
-于是"已经在用某张包"之后，选择只会往**更具体**的方向走（全国 → 省 → 市 → 任务区），
+于是"已经在用某张包"之后，选择只会往**更具体**的方向走（全国 → 省 → 市 → 县 → 任务区），
 这正好是 `RegionLevel.getSpecificity()` 那一级。**这就是 `level` 必须跨端的全部理由。**
 
 ---

@@ -1,6 +1,6 @@
-"""行政等级（Slice 17，Spec §2）。
+"""行政等级（Slice 17，Spec §2；Slice 27 扩到县级）。
 
-``COUNTRY / PROVINCE / CITY / MISSION`` 是**规划视角**上的层级，回答的是
+``COUNTRY / PROVINCE / CITY / COUNTY / MISSION`` 是**规划视角**上的层级，回答的是
 "这块地有多大、打算拿它干什么"，而不是"几何长什么样"（那是
 :class:`~app.geo.RegionType` 的职责）。两者正交：
 
@@ -38,8 +38,14 @@ class RegionLevel(Enum):
     """下载区域的规划层级。
 
     ``value`` 是**会出现在日志与文档里的稳定标识**：日志里写
-    ``level=country`` 比 ``level=RegionLevel.COUNTRY`` 好 grep，也便于将来
-    Android 侧用同一个字符串沟通。因此它是契约，改名等于打断下游。
+    ``level=country`` 比 ``level=RegionLevel.COUNTRY`` 好 grep，也便于 Android 侧
+    用同一个字符串沟通。因此它是契约，改名等于打断下游。
+
+    **它同时是跨端契约，不只是日志格式**：这些值会写进每个包的
+    ``manifest.json`` 的 ``region.level``，Android 的 ``RegionLevel`` 按同一套字符串
+    解析。认不出来时它不报错，而是静默降级成"未知等级"（选包里排最后）——
+    所以新增一个成员时必须**同时**在 Android 侧加上，由
+    ``tests/test_package_protocol_v1.py`` 读 Android 源码逐项比对兜住。
     """
 
     #: 全国 —— 大范围概览，高 Zoom 没有意义（Spec §3）。
