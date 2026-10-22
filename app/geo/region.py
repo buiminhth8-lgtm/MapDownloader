@@ -566,8 +566,9 @@ class DownloadRegion:
         "没有这个键"来猜。``region_id`` / ``boundary_version`` 只在有值时写，
         避免矩形包多出两个空值键。
 
-        **``region_level`` 只要有等级就写（Slice 25 修正）**：矩形是 ``custom``、
-        行政区是 ``country`` / ``province`` / ``city``、任务区是 ``mission``。
+        **``region_level`` 只要有等级就写（Slice 25 修正，Slice 27 补县级）**：
+        矩形是 ``custom``、行政区是 ``country`` / ``province`` / ``city`` /
+        ``county``、任务区是 ``mission``。
         Slice 22 曾以"等级能从 ``region_id`` 反查"为由只给任务区写 ——
         那句话只对**本工具自己**成立：Android 侧没有区域目录，反查不出来，
         于是行政区包在那边一律落到"未知等级"，分层选包的等级优先级整条失效。

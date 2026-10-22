@@ -135,7 +135,7 @@
 | `type` | 全部 | **几何类型**：`rectangle` / `polygon`。**不是**等级 |
 | `id` | 有区域时 | `china` / `hangzhou` / `mission-001` |
 | `boundaryVersion` | 有边界版本时 | 这批瓦片是按哪一版几何裁的 |
-| `level` | **全部**（Slice 25 起） | `country` / `province` / `city` / `mission` / `custom` |
+| `level` | **全部**（Slice 25 起） | `country` / `province` / `city` / `county` / `mission` / `custom` |
 | `bufferMeters` | 只有任务区 | 走廊半径（米） |
 | `geometryVersion` | 只有任务区 | 任务区那份**不在资源目录里**的几何的版本 |
 

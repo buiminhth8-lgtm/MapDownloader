@@ -443,7 +443,7 @@ print(m.region.to_dict() if m.region else '没有 region 子对象')
 不专门去看状态行，很难发现。
 
 **修**：Slice 25 起 Windows 侧所有区域都写 `level`（矩形 `custom`、
-行政三级 `country`/`province`/`city`、任务区 `mission`）。老包不会自动补 ——
+行政四级 `country`/`province`/`city`/`county`、任务区 `mission`）。老包不会自动补 ——
 重新下载 + 重新打包即可。
 
 ---

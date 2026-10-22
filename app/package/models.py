@@ -201,8 +201,8 @@ class PackageRegion:
         boundary_version: 边界数据版本；未知为 ``None``。任务区的几何版本号
             也走这个字段（下载链路上它们的语义完全相同：**这批瓦片是按哪一版
             几何裁的**）。
-        level: 区域等级（``country`` / ``province`` / ``city`` / ``mission`` /
-            ``custom``）。**只要有等级就写**（Slice 25 起）：它是跨端契约，
+        level: 区域等级（``country`` / ``province`` / ``city`` / ``county`` /
+            ``mission`` / ``custom``）。**只要有等级就写**（Slice 25 起）：它是跨端契约，
             Android 侧没有区域目录、反查不出等级，靠这个键才能排"哪一级更贴地"
             （Slice 22 只给任务区写，见 ``app/geo/region.py::metadata_rows``
             的说明）。老包没有这个键 → 读到时为 ``None``。
