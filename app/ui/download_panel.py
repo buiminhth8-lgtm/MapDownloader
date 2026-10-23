@@ -405,10 +405,24 @@ class DownloadPanel(QGroupBox):
         self._region_type_combo = QComboBox(self)
         for candidate in (RegionType.RECTANGLE, RegionType.POLYGON):
             self._region_type_combo.addItem(candidate.display_name, candidate)
+        # 两者**互斥**：选了这个就没有那个。文字上要写明白，否则用户会以为
+        # "先选个市，再改一下经纬度微调"是可能的（它从来不是：行政区域模式下
+        # 经纬度只读、由边界文件决定）。
         self._region_type_combo.setToolTip(
-            "自定义矩形：按下面四个经纬度下载整个矩形\n"
-            "行政区域：按行政区边界精确裁剪，只下载与区域相交的瓦片"
+            "两种范围二选一，互斥：\n"
+            "自定义矩形：手填 West / East / South / North，下载整个矩形\n"
+            "行政区域：按国家 / 省 / 市 / 县四级选，按行政区边界精确裁剪，只下载与之相交的瓦片"
         )
+
+        #: 上一次在「自定义矩形」模式下**用户自己填**的那四个数
+        #: ``(west, south, east, north)``。用途只有一个：从行政区域切回矩形时
+        #: 把它还回去 —— 否则四个框里留着的是上一个行政区的外包矩形，用户会以为
+        #: "我上次填的就是这个"，而它其实是别人算出来的。
+        #:
+        #: 存元组而不是 :class:`~app.geo.bounds.GeoBounds`：用户是一个框一个框
+        #: 敲的，中途必然出现 ``west >= east`` 的瞬时状态，而 ``GeoBounds``
+        #: 在构造时就会校验并在那种状态下抛异常。
+        self._manual_bounds: tuple[float, float, float, float] | None = None
 
         # --- Slice 19：国家 → 省 → 市 三段级联（Spec §1 / §2）；Slice 27 加"县"---
         # 四段下拉的条目一律来自 RegionService（控制器负责问），面板不解析
@@ -430,7 +444,11 @@ class DownloadPanel(QGroupBox):
         self._level_title = QLabel("下载级别", self)
         self._level_label = _WrappingLabel("", self)
 
-        #: 行政区域模式下代替手工输入的范围提示（只读展示）
+        #: 行政区域模式下**代替**那四个手填框的一行只读范围（Slice 30）。
+        #:
+        #: 它不是"另一个边界输入框"：行政区域模式下手填框整行收起，范围一律由
+        #: GeoJSON 的外包矩形决定，这一行只是把那个数**念给用户听**（否则用户
+        #: 不知道"这次按哪块地算候选瓦片"）。矩形模式下它同样收起。
         self._bounds_hint_label = _WrappingLabel("", self)
 
         # --- Slice 19：下载策略（推荐 / 自定义，Spec §1 / §4 / §5 / §6）---
@@ -480,17 +498,23 @@ class DownloadPanel(QGroupBox):
         grid.addWidget(self._level_title, 5, 0)
         grid.addWidget(self._level_label, 5, 1, 1, 3)
 
-        self._bounds_hint_title = QLabel("边界范围", self)
+        self._bounds_hint_title = QLabel("区域范围", self)
         grid.addWidget(self._bounds_hint_title, 6, 0)
         grid.addWidget(self._bounds_hint_label, 6, 1, 1, 3)
 
-        grid.addWidget(QLabel("West", self), 7, 0)
+        # 四个手填框的**标签**也要留住引用：行政区域模式下整行（标签 + 输入框）
+        # 一起收起。只藏输入框的话会剩下「West」「East」四个孤零零的标签。
+        self._west_title = QLabel("West", self)
+        self._east_title = QLabel("East", self)
+        self._south_title = QLabel("South", self)
+        self._north_title = QLabel("North", self)
+        grid.addWidget(self._west_title, 7, 0)
         grid.addWidget(self._west_spin, 7, 1)
-        grid.addWidget(QLabel("East", self), 7, 2)
+        grid.addWidget(self._east_title, 7, 2)
         grid.addWidget(self._east_spin, 7, 3)
-        grid.addWidget(QLabel("South", self), 8, 0)
+        grid.addWidget(self._south_title, 8, 0)
         grid.addWidget(self._south_spin, 8, 1)
-        grid.addWidget(QLabel("North", self), 8, 2)
+        grid.addWidget(self._north_title, 8, 2)
         grid.addWidget(self._north_spin, 8, 3)
 
         self._zoom_mode_row = QWidget(self)
@@ -531,6 +555,15 @@ class DownloadPanel(QGroupBox):
         # 那句提醒，而不是等他点了「计算」才发现。
         self._min_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
         self._max_zoom_spin.valueChanged.connect(self._refresh_zoom_policy_hint)
+        # 记住"用户自己填的矩形"：只在矩形模式且不是程序在改控件时记录
+        for spin in (self._west_spin, self._south_spin, self._east_spin, self._north_spin):
+            spin.valueChanged.connect(self._on_manual_bounds_edited)
+        self._manual_bounds = (
+            self._west_spin.value(),
+            self._south_spin.value(),
+            self._east_spin.value(),
+            self._north_spin.value(),
+        )
         # 初始为矩形：行政区域那几行收起，经纬度框可编辑 —— 与 Slice ≤15 一模一样
         self._apply_region_mode()
 
@@ -787,14 +820,81 @@ class DownloadPanel(QGroupBox):
 
     @Slot()
     def _on_region_changed(self, *_args) -> None:
-        """区域类型变化：切换界面形态并按需加载边界文件。
+        """区域类型变化：两条范围路径**互相清场**，再切换界面形态。
+
+        「自定义矩形」与「行政区域」是互斥的两种"要下哪块地"。互斥不能只靠
+        "把另一组控件藏起来"：藏起来的那一组仍然活着，一切回来就露出来 ——
+        * 切到矩形：四个框里躺着上一个行政区的**外包矩形**，用户会以为那就是
+          他上次填的范围；
+        * 切到行政区域：级联里还留着上一次的市，用户以为范围就是那个市。
+
+        所以两边都清：
+
+        * 进矩形 → 清掉行政区域选择（回到"国家 = 中国、其余全部"），并把四个框
+          恢复成**用户自己填过的**那一组数（``_manual_bounds``）；
+        * 进行政区域 → 行政区选择由用户重新点（级联此时是空的），四个框的内容
+          由边界文件回填，用户填过的矩形已经记在 ``_manual_bounds`` 里不会丢。
 
         参数写成可变参数：``currentIndexChanged`` 带一个 ``int``，而
         ``reload_region_boundary`` 那一路不带 —— 签名统一成 ``*_args``
         后不必为它们各写一个槽。
         """
+        if self.current_region_type() is RegionType.RECTANGLE:
+            self._clear_region_selection()
+            self._restore_manual_bounds()
         self._apply_region_mode()
         self.region_changed.emit()
+
+    def _clear_region_selection(self) -> None:
+        """清空四级级联（进「自定义矩形」时调用）—— 严格互斥的另一半。
+
+        清完国家那一段会**重新选中目录里的第一个国家**（``_fill_country_combo``
+        的既有行为），于是界面停在"中国 + 不限定省 / 市 / 县"，与刚打开的界面
+        完全一致 —— 用户想下行政区就重新点一遍，不会误以为还沿用着上次的范围。
+        """
+        self._region_document = None
+        self._region_error = ""
+        if self._controller.selected_region_id is None and not self._controller.error:
+            # 本来就没选（或已经被切走清过一次）→ 不重填下拉，省掉一串无意义的
+            # clear/addItem 与随之而来的 currentIndexChanged
+            return
+        self._controller.reset()
+        self._reload_region_cascade()
+
+    def _on_manual_bounds_edited(self, *_args) -> None:
+        """用户自己改了某个经纬度框 → 记下来（``_manual_bounds``）。
+
+        三个前提缺一不可：
+
+        * 不是程序在改控件（``_syncing``）—— 回填任务记录、恢复偏好都会
+          一路 ``setValue``，把它们记成"用户填的"就等于让矩形模式继承别人算的数；
+        * 当前是矩形模式 —— 行政区域模式下这四个框是边界文件回填的**只读展示**；
+        * 值此时是合法的（``GeoBounds`` 会校验）。这里不校验：用户是一个框一个框
+          敲的，中途必然短暂出现 ``west >= east``，那不是错误状态，只是还没敲完。
+        """
+        if self._syncing or self.current_region_type() is RegionType.POLYGON:
+            return
+        self._manual_bounds = (
+            self._west_spin.value(),
+            self._south_spin.value(),
+            self._east_spin.value(),
+            self._north_spin.value(),
+        )
+
+    def _restore_manual_bounds(self) -> None:
+        """把用户上次在矩形模式填的四个数还回去（切回矩形时调用）。"""
+        if self._manual_bounds is None:
+            return
+        west, south, east, north = self._manual_bounds
+        self._syncing = True
+        try:
+            for spin, value in zip(
+                (self._west_spin, self._south_spin, self._east_spin, self._north_spin),
+                (west, south, east, north),
+            ):
+                spin.setValue(value)
+        finally:
+            self._syncing = False
 
     @Slot()
     def _on_cascade_changed(self, *_args) -> None:
@@ -841,14 +941,27 @@ class DownloadPanel(QGroupBox):
         return None if entry is None else entry.id
 
     def _apply_region_mode(self) -> None:
-        """按区域类型切换控件可见性与可编辑性（Spec §1 / §7）。"""
+        """按区域类型切换控件可见性与可编辑性（Spec §1 / §7）。
+
+        两条路径**互斥**（Slice 30）：要么看见四个经纬度框（自定义矩形），
+        要么看见四级级联 + 只读的「区域范围」行（行政区域），不会同时出现。
+        唯一看不见的例外是 `区域类型` 那一行本身 —— 它是切换器。
+        """
         is_polygon = self.current_region_type() is RegionType.POLYGON
 
         # 行政区域那一整块：矩形模式下全部收起。QGridLayout 在整行控件都隐藏时
         # 会把这行的高度压到 0，所以不会留下空白条 —— 矩形模式的界面与
-        # Slice ≤18 **逐像素一致**（Spec §7 要求的"旧行为完全兼容"）。
+        # Slice ≤15 **逐像素一致**（Spec §7 要求的"旧行为完全兼容"）。
         for widget in self._polygon_only_widgets():
             widget.setVisible(is_polygon)
+
+        # 四个手填框（连同 West / East / South / North 四个标签）：行政区域模式下
+        # 整行收起。范围在这里是**算出来的**，摆一个可编辑的框在旁边，用户会以为
+        # "选完行政区还能再改两下"——改不了（只读），但"为什么改不了"要猜。
+        # 值仍然照旧回填：`get_form_data()` / `current_region()` 读的还是这四个框，
+        # 那条 6 位小数精度的契约（见 `current_region` 的注释）一个字都没动。
+        for widget in self._rectangle_only_widgets():
+            widget.setVisible(not is_polygon)
 
         # 行政区域模式下经纬度只读：范围由边界文件决定。允许手改会造成
         # "界面显示的范围"与"实际裁剪依据（GeoJSON）"对不上 —— 而用户看不出这点。
@@ -897,6 +1010,23 @@ class DownloadPanel(QGroupBox):
             self._zoom_explain_label,
         )
 
+    def _rectangle_only_widgets(self) -> tuple[QWidget, ...]:
+        """只在「自定义矩形」模式下出现的控件 —— 四个经纬度框及其标签。
+
+        与 :meth:`_polygon_only_widgets` 严格互补：任取一个模式，两组里必然
+        恰好有一组可见（``区域类型`` 那一行两边都在，它是切换器）。
+        """
+        return (
+            self._west_title,
+            self._west_spin,
+            self._east_title,
+            self._east_spin,
+            self._south_title,
+            self._south_spin,
+            self._north_title,
+            self._north_spin,
+        )
+
     def _load_selected_region(self) -> None:
         """加载当前生效区域的边界，缓存几何并回填只读范围（Spec §8）。
 
@@ -939,15 +1069,24 @@ class DownloadPanel(QGroupBox):
             return
 
         self._region_document = document
-        # 回填四个（只读）框：用户能看见"这次按哪块范围算候选瓦片"
-        self._west_spin.setValue(bounds.west)
-        self._south_spin.setValue(bounds.south)
-        self._east_spin.setValue(bounds.east)
-        self._north_spin.setValue(bounds.north)
+        # 回填四个框：`get_form_data()` / `current_region()` 读的就是它们（详见
+        # `current_region()` 里那条"6 位小数与 metadata 精度一致"的契约）。
+        # 这四个框在行政区域模式是**收起**的，回填不是为了给人看，而是为了让
+        # 下游仍然只有一份数；给人看的是下面那行「区域范围」。
+        # 这段 setValue 是程序在改控件 → 用 `_syncing` 挡住 `_manual_bounds`
+        # 记录，否则切回矩形模式时会把行政区的外包矩形当成"用户填的"。
+        self._syncing = True
+        try:
+            self._west_spin.setValue(bounds.west)
+            self._south_spin.setValue(bounds.south)
+            self._east_spin.setValue(bounds.east)
+            self._north_spin.setValue(bounds.north)
+        finally:
+            self._syncing = False
         self._bounds_hint_label.set_text(
-            f"{bounds.west:.4f}, {bounds.south:.4f}, "
+            f"{bounds.west:.4f}, {bounds.south:.4f} ~ "
             f"{bounds.east:.4f}, {bounds.north:.4f}"
-            "（候选范围，最终只下载与行政区边界相交的瓦片）"
+            "（由行政区边界决定，不可编辑；最终只下载与边界相交的瓦片）"
         )
 
     def reload_region_boundary(self) -> None:
@@ -1691,10 +1830,17 @@ class DownloadPanel(QGroupBox):
         Returns:
             ``True`` 表示地图类型也成功回填了；``False`` 表示没认出来。
         """
-        self._west_spin.setValue(float(task.west))
-        self._south_spin.setValue(float(task.south))
-        self._east_spin.setValue(float(task.east))
-        self._north_spin.setValue(float(task.north))
+        # 四个数是**从任务记录回来的**，不是用户此刻填的 → 用 `_syncing` 挡住
+        # `_manual_bounds` 记录。否则"回填一条矩形任务"会被记成用户手填的范围，
+        # 之后从行政区域切回矩形就会拿到这条任务的边界（Slice 30）。
+        self._syncing = True
+        try:
+            self._west_spin.setValue(float(task.west))
+            self._south_spin.setValue(float(task.south))
+            self._east_spin.setValue(float(task.east))
+            self._north_spin.setValue(float(task.north))
+        finally:
+            self._syncing = False
         # 任务里的 zoom 可能超出 UI 下拉范围（例如由命令行建的记录）：
         # setValue 会自动 clamp 到控件范围，不会抛异常。
         self._min_zoom_spin.setValue(int(task.min_zoom))
@@ -1984,9 +2130,15 @@ class DownloadPanel(QGroupBox):
     def bounds_spins(self) -> tuple[QDoubleSpinBox, ...]:
         """暴露四个经纬度输入框（西 / 南 / 东 / 北）。
 
-        行政区域模式下它们是只读的（范围由边界文件决定），同样是控件属性。
+        行政区域模式下这一整行是**收起**的（范围由边界文件决定，不是让用户填），
+        所以断言要看 ``isVisible()``；框里的值仍然被回填，``value()`` 读得到。
         """
         return (self._west_spin, self._south_spin, self._east_spin, self._north_spin)
+
+    @property
+    def manual_bounds(self) -> tuple[float, float, float, float] | None:
+        """用户上次在「自定义矩形」模式填的四个数（“切回矩形时恢复什么”的唯一来源）。"""
+        return self._manual_bounds
 
     @property
     def level_label(self) -> QLabel:
@@ -2013,7 +2165,11 @@ class DownloadPanel(QGroupBox):
 
     @property
     def bounds_hint_label(self) -> QLabel:
-        """暴露行政区「边界范围」提示标签（Slice 16）。"""
+        """暴露「区域范围」只读行（Slice 16 起就有，Slice 30 改了语义）。
+
+        它不再是"边界范围输入"的一部分：行政区域模式下四个手填框收起，这一行
+        只是把 GeoJSON 外包矩形**念出来**（"由行政区边界决定，不可编辑"）。
+        """
         return self._bounds_hint_label
 
     @property

@@ -829,3 +829,119 @@ def test_county_under_a_province_survives_restart(
     recommendation = panel.current_zoom_recommendation()
     assert recommendation is not None
     assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 17)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 30：两条"要下哪块地"互斥
+#
+# 「自定义矩形」与「行政区域」本来就在同一个下拉里二选一，但界面上两组控件
+# 曾经**同时存在**：选了行政区，四个经纬度框还在（只读、被边界文件回填），
+# 看不见"这到底是选区域还是填范围"。这里守的是"选了这边就没有那边"，
+# 以及更隐蔽的一半 —— 切换模式时两边的值不许互相污染。
+# --------------------------------------------------------------------------- #
+def test_polygon_mode_has_no_manual_bounds_row(panel: DownloadPanel) -> None:
+    """选行政区域 → 没有边界范围输入：四个手填框连同标签整行收起。
+
+    ``isVisibleTo(panel)`` 而不是 ``isVisible()``：裸面板没有 ``show()``，
+    后者一律返回 ``False``（假绿）。前者问的是"面板显示出来时它会不会显示"。
+    """
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_region_id("rivertown")
+
+    assert [spin.isVisibleTo(panel) for spin in panel.bounds_spins] == [False] * 4
+    # 取而代之的是那一行只读的范围（它才是"这块地有多大"的显示）
+    assert panel.bounds_hint_label.isVisibleTo(panel) is True
+    # 值仍然被回填：`get_form_data()` / `current_region()` 读的还是这四个框，
+    # "收起"不等于"失效"
+    assert panel.current_bounds().west == 110.0
+
+
+def test_rectangle_mode_has_no_region_rows(panel: DownloadPanel) -> None:
+    """反过来：自定义矩形模式下四级级联与「区域范围」行全部收起。"""
+    assert panel.current_region_type() is RegionType.RECTANGLE
+
+    for widget in (
+        panel.country_combo,
+        panel.province_combo,
+        panel.city_combo,
+        panel.county_combo,
+        panel.level_label,
+        panel.bounds_hint_label,
+    ):
+        assert widget.isVisibleTo(panel) is False
+    assert [spin.isVisibleTo(panel) for spin in panel.bounds_spins] == [True] * 4
+
+
+def test_switching_to_rectangle_drops_the_selected_region(panel: DownloadPanel) -> None:
+    """选了边界范围就意味着**没有**行政区域：选择本身被清掉，不是只藏起来。
+
+    这条用 ``region_controller`` 断言而不是看界面：藏起来的控件照样有值，
+    而"还留着上次那个市"正是切回来时会骗人的地方。
+    """
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_region_id("rivertown")
+    assert panel.current_region_id() == "rivertown"
+
+    panel.set_region_type(RegionType.RECTANGLE)
+
+    assert panel.current_region_id() is None
+    assert panel.current_region_level() is RegionLevel.CUSTOM
+    # 四级级联真的清空了 —— 停在"国家 = 中国、其余全部"（与刚打开界面一致），
+    # 而不是继续挂着刚才那个市。清空≠空白：`_fill_country_combo` 的既有行为是
+    # 目录里只有一个国家时自动选中它。
+    controller = panel.region_controller
+    assert (controller.province, controller.city, controller.county) == (None, None, None)
+    assert controller.level is RegionLevel.COUNTRY
+
+
+def test_region_extent_row_says_it_is_derived(panel: DownloadPanel) -> None:
+    """那行范围必须自报家门是**算出来的**，否则它看起来还是"边界范围输入"。"""
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_region_id("rivertown")
+
+    text = panel.bounds_hint_label.text()
+    assert "110.0000" in text and "111.0000" in text
+    assert "由行政区边界决定" in text
+    assert "不可编辑" in text
+
+
+def test_switching_modes_never_carries_bounds_across(panel: DownloadPanel) -> None:
+    """两边的值互不污染：矩形填的数不会被行政区外包矩形顶掉。
+
+    这是"互斥"里最容易漏的一半 —— 只清控件可见性的话，切回来的四个框里躺着的是
+    上一个行政区的外包矩形，用户会以为"我上次填的就是这个"。
+    """
+    panel._west_spin.setValue(100.0)
+    panel._south_spin.setValue(20.0)
+    panel._east_spin.setValue(101.0)
+    panel._north_spin.setValue(21.0)
+    assert panel.manual_bounds == (100.0, 20.0, 101.0, 21.0)
+
+    panel.set_region_type(RegionType.POLYGON)
+    panel.set_region_id("rivertown")
+    assert panel.current_bounds().west == 110.0, "行政区域模式下由边界文件回填"
+
+    panel.set_region_type(RegionType.RECTANGLE)
+    assert (
+        panel._west_spin.value(),
+        panel._south_spin.value(),
+        panel._east_spin.value(),
+        panel._north_spin.value(),
+    ) == (100.0, 20.0, 101.0, 21.0)
+
+
+def test_rectangle_restores_the_defaults_when_the_user_never_typed(
+    qapp, region_resources
+) -> None:
+    """用户从没填过矩形 → 切回矩形拿到的是默认的北京那一小块，不是上次那个区。"""
+    fresh = DownloadPanel()
+    fresh.set_region_type(RegionType.POLYGON)
+    fresh.set_region_id("rivertown")
+    fresh.set_region_type(RegionType.RECTANGLE)
+
+    assert (
+        fresh._west_spin.value(),
+        fresh._south_spin.value(),
+        fresh._east_spin.value(),
+        fresh._north_spin.value(),
+    ) == (116.0, 39.0, 117.0, 40.0)

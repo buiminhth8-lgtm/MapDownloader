@@ -199,7 +199,7 @@ def china_relative_path() -> str:
 def use_temp_region_resources(regions_dir: Path) -> None:
     """把行政区资源目录重定向到临时目录（仓库资源区保持干净）。
 
-    两件事：
+    三件事：
 
     1. 改 ``app.geo.region`` 模块里的两个全局 ``REGION_RESOURCE_DIR`` /
        ``REGION_PRESETS``。``RegionPreset.geojson_path`` / ``get_region_preset``
@@ -219,6 +219,18 @@ def use_temp_region_resources(regions_dir: Path) -> None:
     region_module.REGION_RESOURCE_DIR = regions_dir
     region_module.REGION_PRESETS = (CHINA_REGION_PRESET,)
     shutil.copyfile(SHIPPED_REGIONS_DIR / INDEX_FILENAME, regions_dir / INDEX_FILENAME)
+
+    # 3. Slice 26 起主窗口注入的是 ``prefer_generated=True`` 的 RegionService，
+    #    它走 ``effective_region_root()``，读的**不是**上面那个全局，而是
+    #    ``app.config.settings.REGION_DATA_ROOT``（仓库里那份真实导入数据集
+    #    ``resources/regions/generated/``）。开发机上导入过县级数据之后，
+    #    generated/ 就存在，于是整份合成夹具被静默绕过 —— 表现为一堆
+    #    "怎么突然就不对了"的失败（边界版本 2026-10、边界文件找不到、张数 160739…）。
+    #    这是脚本自身的隔离缺陷，不是产品缺陷：把那个全局也指到临时目录下一个
+    #    **不存在**的路径，``effective_region_root()`` 就按设计回退到夹具。
+    from app.config import settings as settings_module
+
+    settings_module.REGION_DATA_ROOT = regions_dir / "no-generated-dataset"
 
 
 def _estimate(region) -> object:
@@ -271,7 +283,18 @@ def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
     )
     checker.check(
         not panel._west_spin.isReadOnly(),
-        "矩形模式下经纬度可编辑（行政区域模式才只读）",
+        "矩形模式下经纬度可编辑（行政区域模式才收起）",
+    )
+    # Slice 30：两条范围路径互斥 —— 矩形模式下四个框是**可见的**，而级联那一整块
+    # 与「区域范围」行全都收起。只断言"可编辑"不够：控件藏起来时 `isReadOnly()`
+    # 照样返回 `False`。
+    checker.check(
+        all(spin.isVisibleTo(panel) for spin in panel.bounds_spins),
+        "矩形模式下四个经纬度框可见",
+    )
+    checker.check(
+        not panel.bounds_hint_label.isVisibleTo(panel),
+        "矩形模式下没有「区域范围」行（那是行政区域才有的只读展示）",
     )
     checker.check(
         panel.region_error == "",
@@ -357,6 +380,16 @@ def scene_polygon_missing_boundary(
         panel._west_spin.isReadOnly() and panel._north_spin.isReadOnly(),
         "行政区域模式下经纬度只读（范围由边界文件决定）",
     )
+    # Slice 30：行政区域模式下这一整行**收起** —— 界面上不留可填的边界范围，
+    # 免得用户以为"选完区域还能再改两下"。取而代之的是下面那行只读的「区域范围」。
+    checker.check(
+        not any(spin.isVisibleTo(panel) for spin in panel.bounds_spins),
+        "行政区域模式下四个经纬度框收起（互斥：选了区域就没有边界范围输入）",
+    )
+    checker.check(
+        panel.bounds_hint_label.isVisibleTo(panel),
+        "行政区域模式下有「区域范围」只读行",
+    )
     hint = panel._bounds_hint_label.text()
     checker.check(
         "边界不可用" in hint,
@@ -441,8 +474,9 @@ def scene_polygon_ready(app, window, checker: Checker, shots: bool) -> object:
         region.boundary_version or "",
     )
     checker.check(
-        "（候选范围" in panel._bounds_hint_label.text(),
-        "候选范围提示里说明「最终只下载与边界相交的瓦片」",
+        "由行政区边界决定" in panel._bounds_hint_label.text()
+        and "最终只下载与边界相交的瓦片" in panel._bounds_hint_label.text(),
+        "「区域范围」行说明了范围来自边界文件、且最终只下载与边界相交的瓦片",
         panel._bounds_hint_label.text(),
     )
 
@@ -506,6 +540,47 @@ def scene_polygon_ready(app, window, checker: Checker, shots: bool) -> object:
     )
 
     _shot(window, "slice16_polygon_selected.png", shots)
+
+    # --- Slice 30：两条范围路径互斥（来回切一次，看两边有没有互相污染） ---
+    from app.geo import RegionType as _RegionType
+
+    polygon_bounds = panel.current_bounds()
+    checker.check(panel.set_region_type(_RegionType.RECTANGLE), "切回「自定义矩形」成功")
+    _pump(app)
+    checker.check(
+        panel.current_region_id() is None and panel.current_region_level().value == "custom",
+        "切回矩形后**没有**生效的行政区域（选择被清掉，不是只藏起来）",
+        str(panel.current_region_id()),
+    )
+    checker.check(
+        panel.region_controller.selected_region_id is not None
+        and (panel.region_controller.province, panel.region_controller.city,
+             panel.region_controller.county) == (None, None, None),
+        "级联落回「国家 = 中国、其余全部」（与刚打开界面一致，要重新选）",
+        panel.region_controller.path_text,
+    )
+    checker.check(
+        all(spin.isVisibleTo(panel) for spin in panel.bounds_spins)
+        and not panel.bounds_hint_label.isVisibleTo(panel),
+        "矩形模式下只有四个经纬度框，没有「区域范围」行",
+    )
+    restored = panel.current_bounds()
+    checker.check(
+        (restored.west, restored.south, restored.east, restored.north) == BOUNDS,
+        "切回矩形拿到的是**用户自己填的那四个数**，不是刚才那个行政区的外包矩形",
+        f"{restored.west}, {restored.south}, {restored.east}, {restored.north}",
+    )
+
+    checker.check(panel.set_region_type(_RegionType.POLYGON), "再切回「行政区域」成功")
+    _pump(app)
+    again = panel.current_bounds()
+    checker.check(
+        (again.west, again.south, again.east, again.north)
+        == (polygon_bounds.west, polygon_bounds.south, polygon_bounds.east, polygon_bounds.north),
+        "行政区域模式下的范围仍来自边界文件（用户填的矩形没有把它顶掉）",
+        f"{again.west}, {again.south}, {again.east}, {again.north}",
+    )
+
     return region
 
 
