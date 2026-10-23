@@ -407,6 +407,6 @@ def test_the_report_matches_a_real_estimator_run(
     assert report.total_tiles == item.selected_tiles
     assert report.estimated_bytes == item.estimated_bytes
     assert report.items[0].zoom_text == item.zoom_text
-    # 城市级推荐 Z12~16，条目就是按推荐区间加的 → 不该有"超推荐"
-    assert report.items[0].report.recommended_range_text == "Z12~16"
+    # 城市级推荐 Z12~15，条目就是按推荐区间加的 → 不该有"超推荐"
+    assert report.items[0].report.recommended_range_text == "Z12~15"
     assert report.items[0].report.over_recommended_tiles == 0

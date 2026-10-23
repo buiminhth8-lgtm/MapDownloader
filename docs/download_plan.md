@@ -16,7 +16,7 @@ Region Selection        DownloadPanel 的三级级联（Slice 19）
         │
         ▼
 Zoom Strategy           ZoomStrategyService（Slice 17）
-（推荐区间 / 自定义）     COUNTRY Z4~10 / PROVINCE Z9~13 / CITY Z12~16 / MISSION Z15~18
+（推荐区间 / 自定义）     COUNTRY Z5~10 / PROVINCE Z9~13 / CITY Z12~15 / MISSION Z15~18
         │               推荐模式下**唯一**的来源；自定义模式原样收下，只警告
         ▼
 DownloadPlan            region_id + 等级 + min/max zoom + enabled
@@ -52,9 +52,9 @@ DownloadTask × N        现有的任务记录模型（Slice 5），形状与单
    ```text
    ┌ 示例计划   输出目录：D:/out/离线计划 ─────────────────────────────────┐
    │ 已形成三级离线地图覆盖：全国级 → 省级 → 市级                          │
-   │ ☑ 示例国    全国级  Z4~10     268 张    7.85 MB   可参与下载         │
+   │ ☑ 示例国    全国级  Z5~10     268 张    7.85 MB   可参与下载         │
    │ ☑ 示例北省  省级    Z9~13   3,449 张  100.98 MB   可参与下载         │
-   │ ☑ 示例河市  市级    Z12~16 53,585 张    1.53 GB   可参与下载         │
+   │ ☑ 示例河市  市级    Z12~15 53,585 张    1.53 GB   可参与下载         │
    │ 合计：3 个区域 / 57,302 张 / 1.63 GB                                 │
    │ 提醒：计划规模偏大：57,302 张瓦片（超过 50,000 张）…                   │
    │ [重新估算] [移除] [清空] [生成任务]                     [关闭]        │

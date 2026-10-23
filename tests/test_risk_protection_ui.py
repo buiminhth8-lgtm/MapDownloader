@@ -136,7 +136,7 @@ class _FakeEstimate:
 
 
 def _city_report(max_zoom: int = 18) -> DownloadRiskReport:
-    """城市级（推荐 Z12~16）的真实报告：逐级张数往上翻，因此 Z17 起超推荐。"""
+    """城市级（推荐 Z12~15）的真实报告：逐级张数往上翻，因此 Z16 起超推荐。"""
     per_zoom = [(zoom, 1_000 * (zoom - 11)) for zoom in range(12, max_zoom + 1)]
     return DownloadRiskAnalyzer(strategy=ZoomStrategyService()).analyze(
         RegionLevel.CITY, 12, max_zoom, _FakeEstimate(per_zoom)
@@ -343,7 +343,7 @@ def test_applying_the_recommended_zoom_only_happens_on_click(
     _flush(qapp)
 
     assert panel.zoom_mode is ZoomMode.RECOMMENDED
-    assert [spin.value() for spin in panel.zoom_spins] == [12, 16]
+    assert [spin.value() for spin in panel.zoom_spins] == [12, 15]
     assert recomputed == [1]  # 改完立刻重算（否则界面会停在旧张数上）
     assert "采用推荐 Zoom" in window.log_panel.to_text()
 

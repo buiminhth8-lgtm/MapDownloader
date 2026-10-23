@@ -373,13 +373,19 @@ def test_a_small_ready_plan_has_no_warnings_at_all(
     assert result.warnings == ()
 
 
-def test_a_full_three_level_plan_trips_the_size_reminder(
+def test_a_full_three_level_plan_no_longer_trips_the_size_reminder(
     validator: PlanValidator, builder: DownloadPlanBuilder, estimator: DownloadPlanEstimator
 ) -> None:
-    """全国 + 省 + 市 三级的**默认**配置会走到规模提醒（仍然只是提醒）。
+    """全国 + 省 + 市 三级的**默认**（推荐）配置，规模已经不到提醒线。
 
-    这条是在钉住产品行为而不是夹具：默认阈值 5 万张，而三级推荐的合计约 5.7 万张
-    —— "照推荐配一遍就会被提醒一句"。它是**提醒**不是错误，计划照常能生成任务。
+    Slice 29 之前这条断言的是相反的结论：当时推荐区间是 Z4~10 / Z12~16，
+    三级加起来约 5.7 万张，撞上"照推荐配一遍就会被提醒一句"。收紧到
+    Z5~10 / Z12~15 之后只有约 1.7 万张 —— 推荐值本身已经把规模管住了，
+    提醒留给"用户自己非要往高 Zoom 走"的场景（见
+    :func:`test_large_plan_is_only_a_warning`，那条用注入阈值验机制本身）。
+
+    留着这条是为了记住那个取舍：**推荐区间不只是"建议"，它同时是规模闸门**。
+    把它放回去（比如把城市级改回 Z16），这条会重新变红。
     """
     plan = _ready_plan(builder, estimator, "demoland", "northland", "rivertown")
 
@@ -387,8 +393,9 @@ def test_a_full_three_level_plan_trips_the_size_reminder(
 
     assert result.ok is True, result.message()
     codes = {row.code for row in result.warnings}
-    assert PlanIssueCode.LARGE_TILE_COUNT in codes
-    assert codes <= {PlanIssueCode.LARGE_TILE_COUNT, PlanIssueCode.LARGE_SIZE}
+    assert PlanIssueCode.LARGE_TILE_COUNT not in codes, (
+        f"推荐配置不该撞上规模提醒，实际 {sorted(c.value for c in codes)}"
+    )
 
 
 def test_zoom_beyond_the_recommendation_is_only_a_warning(

@@ -137,16 +137,22 @@ def test_every_region_level_has_a_policy() -> None:
 @pytest.mark.parametrize(
     ("level", "low", "high", "warning"),
     [
-        (RegionLevel.COUNTRY, 4, 10, 10),
+        # Slice 29 按"数据饱和点 + 体积可接受点"重新标定（见 zoom_policy 文档）：
+        # 全国下界 4→5（Z4 一屏 8000 公里，没有参考价值）、
+        # 城市上界 16→15（市级全域 Z16 = 1.4 GB）、
+        # 县级上界 18→17（Z18 多为 2 米影像的插值放大）。
+        # 任务区保持 15~18 —— 它是无人机主力档，范围小、体积撑得住。
+        (RegionLevel.COUNTRY, 5, 10, 10),
         (RegionLevel.PROVINCE, 9, 13, 14),
-        (RegionLevel.CITY, 12, 16, 16),
+        (RegionLevel.CITY, 12, 15, 16),
+        (RegionLevel.COUNTY, 14, 17, 18),
         (RegionLevel.MISSION, 15, 18, 18),
     ],
 )
 def test_default_policy_numbers_match_the_spec(
     level: RegionLevel, low: int, high: int, warning: int
 ) -> None:
-    """Spec §3 的四个区间，逐个数钉死。"""
+    """Spec §3 的区间，逐个数钉死。"""
     policy = get_zoom_policy(level)
     assert policy.level is level
     assert policy.recommended_min_zoom == low
@@ -191,19 +197,24 @@ def test_recommended_ranges_overlap_between_neighbouring_levels() -> None:
         )
 
 
-def test_policy_descriptions_are_the_spec_sentences() -> None:
-    assert get_zoom_policy(RegionLevel.COUNTRY).description == (
-        "全国级地图建议用于大范围概览，高 Zoom 应按省、市或任务区域下载。"
-    )
-    assert get_zoom_policy(RegionLevel.PROVINCE).description == (
-        "省级地图适合省域浏览和城市定位。"
-    )
-    assert get_zoom_policy(RegionLevel.CITY).description == (
-        "城市级地图适合城市范围任务规划。"
-    )
-    assert get_zoom_policy(RegionLevel.MISSION).description == (
-        "任务区适合高精度 Zoom，仅建议用于有限作业区域。"
-    )
+def test_every_description_states_its_own_range() -> None:
+    """每条推荐说明都必须写出**它自己那个区间**。
+
+    原先这条是逐字钉死四句话。Slice 29 给说明补了"约多少米/像素、多大体积"
+    之后，逐字比对变成了负担：改一个数字要同步改文案，而文案措辞本来就该
+    随场景优化。这里改成检查**自洽性** —— 说明里必须出现
+    ``Z5~10`` 这样的区间原文。
+
+    它守的是真缺陷：区间从 Z4~10 改成 Z5~10 却忘了改说明时，用户在界面上
+    看到的是"Z5~10"，而推荐说明还在讲 Z4 —— 两句话互相矛盾，比没有说明更糟。
+    """
+    for policy in list_zoom_policies():
+        if policy.is_custom:
+            continue
+        assert policy.recommended_range_text in policy.description, (
+            f"{policy.level.value} 的说明没写出自己的区间 "
+            f"{policy.recommended_range_text}：{policy.description!r}"
+        )
 
 
 # --------------------------------------------------------------------------- #

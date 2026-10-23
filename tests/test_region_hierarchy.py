@@ -349,9 +349,9 @@ def test_every_catalog_level_survives_into_the_package_metadata(region_root) -> 
 @pytest.mark.parametrize(
     "region_id, expected",
     [
-        ("demoland", "Z4~10"),
+        ("demoland", "Z5~10"),
         ("northland", "Z9~13"),
-        ("rivertown", "Z12~16"),
+        ("rivertown", "Z12~15"),
     ],
 )
 def test_level_drives_the_zoom_recommendation(region_root, region_id, expected) -> None:
@@ -387,7 +387,7 @@ def test_evaluate_reports_a_warning_without_touching_the_user_range(region_root)
         "demoland", min_zoom=8, max_zoom=18
     )
 
-    assert recommendation.range_text == "Z4~10"
+    assert recommendation.range_text == "Z5~10"
     assert (recommendation.requested_min_zoom, recommendation.requested_max_zoom) == (8, 18)
     assert recommendation.warning is True
 
@@ -417,10 +417,10 @@ def test_recommend_with_estimate_uses_the_regions_own_level(region_root) -> None
 
 
 def test_recommend_with_estimate_defaults_to_the_recommended_span(region_root) -> None:
-    """不给 Zoom 就按推荐区间预估（全国级 → Z4~10）。"""
+    """不给 Zoom 就按推荐区间预估（全国级 → Z5~10）。"""
     plan = _service(region_root).recommend_with_estimate("demoland")
 
-    assert (plan.estimated_min_zoom, plan.estimated_max_zoom) == (4, 10)
+    assert (plan.estimated_min_zoom, plan.estimated_max_zoom) == (5, 10)
     assert plan.used_recommended_zoom is True
     assert plan.selected_tiles > 0
 

@@ -315,7 +315,11 @@ def test_zoom_follows_the_level(
         recommendation.max_zoom,
     )
     assert panel.zoom_policy_text.splitlines()[0] == f"推荐 Zoom：{recommendation.range_text}"
-    assert panel.zoom_explain_text == recommendation.reason
+    # 推荐说明 = 策略原文 + 一行"换算到地面"（Slice 29）。
+    # 断言 startswith 而不是相等：换算那行的纬度来自当前范围，数值随区域变，
+    # 逐字比对会把"换个夹具就能过"的脆弱断言写进测试里。
+    assert panel.zoom_explain_text.startswith(recommendation.reason)
+    assert "换算到地面：" in panel.zoom_explain_text
 
 
 def test_switching_region_reapplies_the_recommendation(panel: DownloadPanel) -> None:
@@ -481,7 +485,7 @@ def test_polygon_estimate_uses_the_selected_tiles(window_factory) -> None:
     text = panel.result_label.text()
     assert text.splitlines()[0] == "区域：示例河市"
     assert "级别：城市级" in text
-    assert "推荐 Zoom：Z12~16" in text
+    assert "推荐 Zoom：Z12~15" in text
     assert "区域内瓦片" in text and "候选瓦片" in text
     assert "Zoom 明细（候选 / 选中 / 过滤 / 预计容量）：" in text
     assert panel.current_region() is not None
@@ -777,7 +781,7 @@ def test_county_zoom_recommendation_matches_the_level(
     assert panel.current_region_level() is RegionLevel.COUNTY
     recommendation = panel.current_zoom_recommendation()
     assert recommendation is not None
-    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 18)
+    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 17)
 
 
 # --------------------------------------------------------------------------- #
@@ -824,4 +828,4 @@ def test_county_under_a_province_survives_restart(
     assert panel.current_region_id() == "directcounty"
     recommendation = panel.current_zoom_recommendation()
     assert recommendation is not None
-    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 18)
+    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 17)

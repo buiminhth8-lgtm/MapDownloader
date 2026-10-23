@@ -124,7 +124,7 @@ def test_rows_follow_the_hierarchy_order(
     assert dialog.table().rowCount() == 3
     assert dialog.table().item(0, 0).text() == "示例国"
     assert dialog.table().item(1, 1).text() == "省级"
-    assert dialog.table().item(2, 2).text() == "Z12~16"
+    assert dialog.table().item(2, 2).text() == "Z12~15"
 
 
 def test_unestimated_rows_show_a_dash_not_a_zero(

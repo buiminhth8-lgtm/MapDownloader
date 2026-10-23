@@ -1,7 +1,7 @@
 # 行政区域级联选择 + 推荐 Zoom（Slice 19）
 
 > **Slice 27 更新**：级联已从"国家 → 省 → 市"扩成"**国家 → 省 → 市 → 县**"，
-> `RegionLevel` 增加 `COUNTY`（推荐区间 `Z14~18`）、`PARENT_LEVEL_RULES` 允许
+> `RegionLevel` 增加 `COUNTY`（推荐区间 `Z14~17`）、`PARENT_LEVEL_RULES` 允许
 > `COUNTY → {CITY, PROVINCE}`（直辖市下辖区、省直辖县级市的父级是省）。
 > 下文写"三段"的地方是 Slice 19 当时的形状，控件与数据源没变（都是遍历目录来的），
 > 只是多了一段。县级的真机验收见 `e2e_acceptance_checklist.md` 的 **E 段**。
@@ -37,7 +37,7 @@
 | `下载级别` | `城市级 · 演示国 / 北省 / 河城` | 新增：等级 + 完整路径 |
 | `边界范围` | 四个只读经纬度 + 候选范围提示 | Slice 16 起就有 |
 | `下载策略` | ◉ 推荐 Zoom ○ 自定义 Zoom | 新增 |
-| `Zoom 建议` | `推荐 Zoom: Z12~16` / `当前 Zoom: Z12~16` | Slice 17 起就有 |
+| `Zoom 建议` | `推荐 Zoom: Z12~15` / `当前 Zoom: Z12~15` | Slice 17 起就有 |
 | `Min Zoom` / `Max Zoom` | 推荐模式下只读 | 值随等级自动填 |
 | `推荐说明` | 一句来自策略层的理由 | 新增 |
 
@@ -49,7 +49,7 @@
 | 截图 | 内容 |
 | --- | --- |
 | `docs/images/slice19_cascade_city.png` | 级联选到市级，级别行与推荐区间可见（Slice 19 的截图，当时还没有「县区」那一段） |
-| `docs/images/slice19_zoom_recommended.png` | 推荐模式：Min/Max 自动填成 Z12~16 |
+| `docs/images/slice19_zoom_recommended.png` | 推荐模式：Min/Max 自动填成 Z12~15 |
 | `docs/images/slice19_zoom_warning.png` | 自定义 8~17：给出「城市级」警告但值没被改 |
 | `docs/images/slice19_polygon_estimate.png` | 真点「计算」后的结果区（含逐级明细四列） |
 
@@ -101,7 +101,7 @@ def level(self) -> RegionLevel:
 
 | | 推荐 Zoom（默认） | 自定义 Zoom |
 | --- | --- | --- |
-| Min / Max 的值 | 按等级从策略表取（Z4~10 / Z9~13 / Z12~16） | 用户说了算 |
+| Min / Max 的值 | 按等级从策略表取（Z5~10 / Z9~13 / Z12~15） | 用户说了算 |
 | Min / Max 可编辑 | ❌ `setReadOnly(True)` | ✅ |
 | 超范围时 | 不可能超（值就是建议值） | `Zoom 建议` 行给出警告 |
 | 阻塞下载 | 否 | 否 |
@@ -110,13 +110,13 @@ def level(self) -> RegionLevel:
 每条"看到警告"的用例旁边都有一条"用户的值没被改"。
 
 推荐模式下把 Min/Max 设成只读，是为了避免一类**看不出来的错误**：界面显示
-`Z12~16`、实际拿去下载的却是用户上次手打的 `8~17`。只读让"显示的"与"生效的"
+`Z12~15`、实际拿去下载的却是用户上次手打的 `8~17`。只读让"显示的"与"生效的"
 不可能不一致。
 
 **模式切换不改值**：
 
 ```
-推荐（显示 Z12~16）→ 点自定义 → 值仍是 12 ~ 16，但可编辑了
+推荐（显示 Z12~15）→ 点自定义 → 值仍是 12 ~ 16，但可编辑了
 自定义 8~17 → 点推荐 → 值变成 12 ~ 16，且重新只读
 ```
 
@@ -175,7 +175,7 @@ def current_region(self) -> DownloadRegion | None:
 ```
 区域：河城
 级别：城市级
-推荐 Zoom：Z12~16
+推荐 Zoom：Z12~15
 候选瓦片：769
 区域内瓦片：769
 过滤瓦片：0

@@ -35,6 +35,7 @@ from app.planning.risk_policy import (
     VERY_LARGE_TILE_THRESHOLD,
     RiskPolicy,
 )
+from app.planning.zoom_policy import get_zoom_policy
 from app.planning.zoom_strategy import ZoomStrategyService
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -189,12 +190,15 @@ def test_the_size_dimension_can_raise_the_level(
 def test_over_recommended_tiles_and_percent(
     analyzer: DownloadRiskAnalyzer,
 ) -> None:
-    """只统计**推荐上界以上**的那些 zoom（全国推荐 Z4~10，所以 Z11 起才算）。"""
+    """只统计**推荐上界以上**的那些 zoom（全国推荐到 Z10，所以 Z11 起才算）。"""
     counts = {8: 100, 9: 200, 10: 700, 11: 1_000, 12: 4_000}
     report = analyzer.analyze(RegionLevel.COUNTRY, 8, 12, _estimate(counts))
 
-    assert report.recommended_min_zoom == 4
-    assert report.recommended_max_zoom == 10
+    # 数值问策略表，不在这里抄第二份（唯一的真值在 test_zoom_policy.py）
+    policy = get_zoom_policy(RegionLevel.COUNTRY)
+    assert report.recommended_min_zoom == policy.recommended_min_zoom
+    assert report.recommended_max_zoom == policy.recommended_max_zoom
+    assert policy.recommended_max_zoom == 10, "下面按 Z10 分界统计，策略改了要同步改这里"
     assert report.over_recommended_tiles == 1_000 + 4_000
     expected_percent = (5_000 / 6_000) * 100.0
     assert report.over_recommended_percent == pytest.approx(expected_percent)
@@ -242,7 +246,9 @@ def test_country_zoom_8_to_18_is_dangerous(analyzer: DownloadRiskAnalyzer) -> No
     assert report.requires_confirmation is True
     assert report.requires_strong_confirmation is True
     # 推荐区间必须说出来（否则用户只知道"危险"，不知道"那该怎么办"）
-    assert report.recommended_range_text == "Z4~10"
+    assert report.recommended_range_text == get_zoom_policy(
+        RegionLevel.COUNTRY
+    ).recommended_range_text
     assert "Z10" in "".join(report.reasons)
     # 超大张数与容量都要有具体数字
     joined = "\n".join(report.reasons)
@@ -265,7 +271,10 @@ def test_the_dangerous_report_text_is_human_readable(
     assert f"预计瓦片：{format_tile_count(report.total_tiles)}" in lines
     assert f"预计容量：{format_size(report.estimated_bytes)}" in lines
     assert "实际 Zoom：Z8~18" in lines
-    assert "推荐 Zoom：Z4~10" in lines
+    assert (
+        f"推荐 Zoom：{get_zoom_policy(RegionLevel.COUNTRY).recommended_range_text}"
+        in lines
+    )
     assert "原因：" in lines and "建议：" in lines
     assert all(len(line.strip()) > 1 for line in lines)
 

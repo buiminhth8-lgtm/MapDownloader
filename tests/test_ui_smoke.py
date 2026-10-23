@@ -3534,7 +3534,7 @@ def test_zoom_hint_is_hidden_for_a_custom_rectangle(window: MainWindow) -> None:
 
 
 def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
-    """选中中国 Preset → 第一行就是「推荐 Zoom：Z4~10」。
+    """选中中国 Preset → 第一行就是「推荐 Zoom：Z5~10」。
 
     注意这里**不需要**边界文件就位：等级来自预设，用户应该能看到"选中的是哪个
     区域、它建议多少 Zoom"，而不是等他把文件放好了才知道。
@@ -3544,7 +3544,7 @@ def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
 
     assert panel.current_region_level().value == "country"
     assert panel.zoom_hint_label.isHidden() is False
-    assert panel.zoom_policy_text.splitlines()[0] == "推荐 Zoom：Z4~10"
+    assert panel.zoom_policy_text.splitlines()[0] == "推荐 Zoom：Z5~10"
 
 
 def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> None:
@@ -3554,7 +3554,7 @@ def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> 
     panel.set_zoom_range(8, 18)
 
     text = panel.zoom_policy_text
-    assert "推荐 Zoom：Z4~10" in text
+    assert "推荐 Zoom：Z5~10" in text
     assert "当前 Zoom：Z8~18" in text
     assert "警告：" in text and "超出全国级推荐范围" in text
 
@@ -3566,11 +3566,11 @@ def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> 
 def test_zoom_hint_is_quiet_inside_the_recommendation(window: MainWindow) -> None:
     panel = window.download_panel
     panel.set_region_type(RegionType.POLYGON)
-    panel.set_zoom_range(4, 10)
+    panel.set_zoom_range(5, 10)
 
     assert panel.zoom_policy_text.splitlines() == [
-        "推荐 Zoom：Z4~10",
-        "当前 Zoom：Z4~10",
+        "推荐 Zoom：Z5~10",
+        "当前 Zoom：Z5~10",
     ]
 
 
@@ -3726,7 +3726,7 @@ def test_region_combo_follows_a_redirected_catalog(
 def test_picking_a_city_uses_the_city_zoom_policy(
     window: MainWindow, monkeypatch, region_root: Path
 ) -> None:
-    """层级 → Zoom 这条线在界面上真的通着：选市显示 Z12~16，选省显示 Z9~13。"""
+    """层级 → Zoom 这条线在界面上真的通着：选市显示 Z12~15，选省显示 Z9~13。"""
     panel = window.download_panel
     _use_region_root(monkeypatch, region_root)
     panel.reload_region_boundary()
@@ -3734,7 +3734,7 @@ def test_picking_a_city_uses_the_city_zoom_policy(
 
     assert panel.set_region_id("rivertown") is True
     assert panel.current_region_level() is RegionLevel.CITY
-    assert "推荐 Zoom：Z12~16" in panel.zoom_policy_text
+    assert "推荐 Zoom：Z12~15" in panel.zoom_policy_text
     assert panel.current_region() is not None, "边界文件就在临时树里，应当能加载"
 
     assert panel.set_region_id("northland") is True

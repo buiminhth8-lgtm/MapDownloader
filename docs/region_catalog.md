@@ -245,7 +245,7 @@ service.path_text("hangzhou")            # '中国 / 浙江省 / 杭州市'
 
 # Zoom 建议（完全复用 Slice 17，没有第二份策略表）
 rec = service.get_zoom_recommendation("hangzhou")
-rec.range_text                           # 'Z12~16'
+rec.range_text                           # 'Z12~15'
 
 # 拿去做下载（复用 Slice 16 的链路）
 region = service.get_download_region("hangzhou")

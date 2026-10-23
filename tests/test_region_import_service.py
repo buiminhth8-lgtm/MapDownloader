@@ -301,9 +301,9 @@ def test_generated_regions_get_the_right_zoom_recommendations(
     _service, _factory, report = published
     service = RegionService(root=report.output_root)
 
-    assert service.get_zoom_recommendation("test_country").range_text == "Z4~10"
+    assert service.get_zoom_recommendation("test_country").range_text == "Z5~10"
     assert service.get_zoom_recommendation("test_province_a").range_text == "Z9~13"
-    assert service.get_zoom_recommendation("test_city_a1").range_text == "Z12~16"
+    assert service.get_zoom_recommendation("test_city_a1").range_text == "Z12~15"
 
 
 def test_generated_regions_feed_the_polygon_download_chain(

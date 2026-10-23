@@ -74,6 +74,7 @@ from app.models.map_layer import (
 from app.planning import (
     RegionLevel,
     ZoomRecommendation,
+    describe_resolution,
 )
 from app.regions import RegionService
 from app.ui.region_selection import RegionSelectionController, ZoomMode
@@ -1129,13 +1130,36 @@ class DownloadPanel(QGroupBox):
         self._zoom_hint_label.setVisible(True)
         self._zoom_hint_label.set_text("\n".join(recommendation.as_lines()))
         # 推荐说明只在真的建议时出现；文案来自策略层（界面不抄一份）
-        if recommendation.reason:
+        explain = self._explain_with_resolution(recommendation)
+        if explain:
             self._zoom_explain_title.setVisible(True)
             self._zoom_explain_label.setVisible(True)
-            self._zoom_explain_label.set_text(recommendation.reason)
+            self._zoom_explain_label.set_text(explain)
         else:  # pragma: no cover - 策略层的 description 不允许为空
             self._zoom_explain_title.setVisible(False)
             self._zoom_explain_label.setVisible(False)
+
+    def _explain_with_resolution(self, recommendation: ZoomRecommendation) -> str:
+        """推荐说明 + 一行"这相当于多清楚"（Slice 29）。
+
+        ``Zoom`` 只是投影空间里的编号，用户真正关心的是"能不能看清单栋房子"。
+        这一行把区间换算成米/像素，让"Z15 和 Z16 差在哪"变成可判断的问题。
+
+        **纬度取当前范围的几何中心**：同一级 Zoom 在北纬 45° 与 22.5° 的
+        米/像素差 30%，写死一个纬度会给出与实际不符的数字。取不到范围
+        （边界还没铺好、四至非法）时**只显示策略说明**，不猜。
+        """
+        reason = recommendation.reason
+        try:
+            bounds = self.current_bounds()
+            latitude = (bounds.south + bounds.north) / 2.0
+            resolution = describe_resolution(
+                recommendation.min_zoom, recommendation.max_zoom, latitude
+            )
+        except ValueError:
+            return reason
+        line = f"换算到地面：{resolution}"
+        return f"{reason}\n{line}" if reason else line
 
     def _hide_zoom_hint(self) -> None:
         """整行收起建议与说明（矩形 / 自定义等级）。"""

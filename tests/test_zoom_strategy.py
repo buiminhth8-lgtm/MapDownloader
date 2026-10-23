@@ -44,6 +44,18 @@ from app.planning import (
 
 ZOOM = 12
 
+
+def _policy_range(level: RegionLevel) -> tuple[int, int]:
+    """某等级的推荐区间，**直接问策略表**。
+
+    这里验的是"服务把策略原样传导出去"，不是"策略里写的是几" —— 后者由
+    ``test_zoom_policy.py::test_default_policy_numbers_match_the_spec`` 唯一
+    钉死一次。两边都抄数字的话，Slice 29 调一次预设值要改十几处，漏一处就是
+    一条假失败，反而掩盖真缺陷。
+    """
+    policy = get_zoom_policy(level)
+    return policy.recommended_min_zoom, policy.recommended_max_zoom
+
 #: 与 ``tests/test_polygon_download.py`` 同一块地（北京一带的 10×10 瓦片）。
 BASE_X, BASE_Y = 3372, 1552
 BLOCK = 10
@@ -161,7 +173,8 @@ def test_service_can_be_fed_a_custom_table() -> None:
     assert custom.get_policy(RegionLevel.COUNTRY).recommended_range_text == "Z3~6"
     assert custom.recommend(RegionLevel.COUNTRY).range_text == "Z3~6"
     # 默认服务不受影响（互不干扰）
-    assert get_zoom_policy(RegionLevel.COUNTRY).recommended_range_text == "Z4~10"
+    default_policy = get_zoom_policy(RegionLevel.COUNTRY)
+    assert default_policy.recommended_range_text == "Z5~10"
 
 
 @pytest.mark.parametrize("bad", ["country", None, 4, object()])
@@ -176,17 +189,18 @@ def test_get_policy_rejects_bad_levels(
 # recommend：纯推荐
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    ("level", "low", "high"),
+    "level",
     [
-        (RegionLevel.COUNTRY, 4, 10),
-        (RegionLevel.PROVINCE, 9, 13),
-        (RegionLevel.CITY, 12, 16),
-        (RegionLevel.MISSION, 15, 18),
+        RegionLevel.COUNTRY,
+        RegionLevel.PROVINCE,
+        RegionLevel.CITY,
+        RegionLevel.MISSION,
     ],
 )
 def test_recommend_returns_the_policy_range(
-    service: ZoomStrategyService, level: RegionLevel, low: int, high: int
+    service: ZoomStrategyService, level: RegionLevel
 ) -> None:
+    low, high = _policy_range(level)
     recommendation = service.recommend(level)
     assert (recommendation.min_zoom, recommendation.max_zoom) == (low, high)
     assert recommendation.level is level
@@ -211,15 +225,16 @@ def test_recommend_for_custom_still_answers(service: ZoomStrategyService) -> Non
     ("level", "low", "high", "warning"),
     [
         # Spec §13 点名的四条
-        (RegionLevel.COUNTRY, 4, 10, False),
+        (RegionLevel.COUNTRY, 5, 10, False),
         (RegionLevel.COUNTRY, 8, 18, True),
         (RegionLevel.PROVINCE, 9, 13, False),
-        (RegionLevel.CITY, 12, 16, False),
+        (RegionLevel.CITY, 12, 15, False),
         (RegionLevel.MISSION, 15, 18, False),
         # 阈值上下各一条：警告的判据是 max_zoom > warning_max_zoom
-        (RegionLevel.COUNTRY, 4, 11, True),
+        (RegionLevel.COUNTRY, 5, 11, True),
         (RegionLevel.PROVINCE, 9, 14, False),  # Z14 是过渡带，不警告
         (RegionLevel.PROVINCE, 9, 15, True),
+        (RegionLevel.CITY, 12, 16, False),  # Z16 = 警告阈值本身，不警告
         (RegionLevel.CITY, 12, 17, True),
         (RegionLevel.MISSION, 15, 19, True),
         # 自定义等级：合法 Zoom 一律不因等级策略报警（Spec §5）
@@ -241,33 +256,39 @@ def test_evaluate_decides_warning_from_the_upper_bound(
 
 
 def test_evaluate_never_rewrites_the_user_zoom(service: ZoomStrategyService) -> None:
-    """Spec §10 的核心：中国 + Z8~18 → 推荐 Z4~10、warning=True，但**不改** 8~18。"""
+    """Spec §10 的核心：中国 + Z8~18 → 给出推荐区间、warning=True，但**不改** 8~18。"""
+    low, high = _policy_range(RegionLevel.COUNTRY)
     recommendation = service.evaluate(RegionLevel.COUNTRY, 8, 18)
-    assert (recommendation.min_zoom, recommendation.max_zoom) == (4, 10)
+    assert (recommendation.min_zoom, recommendation.max_zoom) == (low, high)
     assert (recommendation.requested_min_zoom, recommendation.requested_max_zoom) == (
         8,
         18,
     )
     assert recommendation.warning is True
     assert recommendation.exceeds_recommendation is True
-    assert "Z4~10" in recommendation.warning_text
+    assert f"Z{low}~{high}" in recommendation.warning_text
     assert "Z8~18" in recommendation.warning_text
 
 
 def test_evaluate_within_recommendation_is_quiet(service: ZoomStrategyService) -> None:
-    recommendation = service.evaluate(RegionLevel.COUNTRY, 4, 10)
+    low, high = _policy_range(RegionLevel.COUNTRY)
+    recommendation = service.evaluate(RegionLevel.COUNTRY, low, high)
     assert recommendation.warning is False
     assert recommendation.exceeds_recommendation is False
     assert recommendation.warning_text == ""
-    assert recommendation.as_lines() == ["推荐 Zoom：Z4~10", "当前 Zoom：Z4~10"]
+    assert recommendation.as_lines() == [
+        f"推荐 Zoom：Z{low}~{high}",
+        f"当前 Zoom：Z{low}~{high}",
+    ]
 
 
 def test_evaluate_warning_line_carries_the_reason(
     service: ZoomStrategyService,
 ) -> None:
+    low, high = _policy_range(RegionLevel.COUNTRY)
     lines = service.evaluate(RegionLevel.COUNTRY, 8, 18).as_lines()
     assert len(lines) == 3
-    assert lines[0] == "推荐 Zoom：Z4~10"
+    assert lines[0] == f"推荐 Zoom：Z{low}~{high}"
     assert lines[1] == "当前 Zoom：Z8~18"
     assert lines[2].startswith("警告：")
     assert get_zoom_policy(RegionLevel.COUNTRY).description in lines[2]
@@ -320,24 +341,26 @@ def test_estimate_reuses_the_region_tile_estimator(
 ) -> None:
     """期望值不是写死的：直接调一次估算器，两边必须逐字段一致。"""
     plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
-    expected = RegionTileEstimator(rectangle).estimate(4, 10)
+    low, high = _policy_range(RegionLevel.COUNTRY)
+    expected = RegionTileEstimator(rectangle).estimate(low, high)
 
     assert plan.estimate is not None
     assert plan.selected_tiles == expected.selected_tiles
     assert plan.candidate_tiles == expected.candidate_tiles
     assert plan.size_text == expected.size_text
     assert plan.used_recommended_zoom is True
-    assert (plan.estimated_min_zoom, plan.estimated_max_zoom) == (4, 10)
+    assert (plan.estimated_min_zoom, plan.estimated_max_zoom) == (low, high)
     assert plan.average_tile_size == DEFAULT_AVERAGE_TILE_SIZE
 
 
 def test_estimate_reports_candidate_and_selected_truthfully(
     service: ZoomStrategyService, rectangle: DownloadRegion
 ) -> None:
+    low, high = _policy_range(RegionLevel.COUNTRY)
     plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
     expected_candidate = sum(
         calculate_tile_range(rectangle.bounds, zoom).tile_count
-        for zoom in range(4, 11)
+        for zoom in range(low, high + 1)
     )
     assert plan.candidate_tiles == expected_candidate
     assert plan.selected_tiles == expected_candidate, "矩形：选中 == 候选"
@@ -389,9 +412,10 @@ def test_estimate_on_a_polygon_uses_the_real_geometry(
 def test_estimate_lines_show_recommendation_tiles_and_size(
     service: ZoomStrategyService, rectangle: DownloadRegion
 ) -> None:
+    low, high = _policy_range(RegionLevel.COUNTRY)
     plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
     lines = plan.as_lines()
-    assert lines[0] == "推荐 Zoom：Z4~10"
+    assert lines[0] == f"推荐 Zoom：Z{low}~{high}"
     assert f"{PLAN_TILES_LABEL}{plan.selected_tiles:,}" in lines
     assert f"{PLAN_SIZE_LABEL}{plan.size_text}" in lines
 
