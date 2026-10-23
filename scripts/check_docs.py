@@ -14,8 +14,9 @@
 1. ``docs/`` 根目录只允许 ``*.md`` 与 ``images/``（截图必须进 images/）；
 2. 所有图片引用都能解析到真实文件（跳过 ``*`` / ``{}`` 这类通配写法）；
 3. 所有文档间链接都能解析（含相对路径与 ``../``）；
-4. ``docs/`` 下每份文档都被索引或别的文档链接到（孤儿文档）；
-5. 索引 ``docs/README.md`` 本身存在。
+4. 同文件内的 ``](#anchor)`` 都能对上真实标题（章节改名后目录没跟上的那种）；
+5. ``docs/`` 下每份文档都被索引或别的文档链接到（孤儿文档）；
+6. 索引 ``docs/README.md`` 本身存在。
 
 **不检查**内容是否正确 —— 那是评审的事。这里只保证"结构没散"。
 """
@@ -43,6 +44,33 @@ PLACEHOLDER_MARKERS = ("NN", "xxx", "场景", "<", ">")
 
 #: markdown 链接：``](target.md)`` / ``](target.md#anchor)``
 MD_LINK_RE = re.compile(r"\]\(([^)\s#]+\.md)(#[^)\s]*)?\)")
+
+#: 同文件锚点链接：``](#anchor)``
+ANCHOR_LINK_RE = re.compile(r"\]\(#([^)\s]+)\)")
+
+#: 围栏代码块与行内代码。锚点检查要跳过它们：文档里写 ``](#章节)`` 这种
+#: 示例是正常的，不该被当成真链接。**图片检查不跳过** —— 本项目习惯把
+#: 图片路径写在反引号里（表格第一列），那是真引用。
+FENCED_CODE_RE = re.compile(r"```.*?```", re.S)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def _without_code(text: str) -> str:
+    return INLINE_CODE_RE.sub("", FENCED_CODE_RE.sub("", text))
+
+#: 标题（用于算 anchor）
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.M)
+
+
+def _anchor(title: str) -> str:
+    """按 GitHub 的规则把标题变成锚点：小写、去标点、空格转连字符。
+
+    只实现本项目用得到的部分（中文、英文、数字、空格、``/``、``：``、括号）。
+    真正的 GitHub 规则更细，但这里只需要"能区分两个标题"。
+    """
+    slug = title.strip().lower()
+    slug = re.sub(r"[^\w\u4e00-\u9fff\s-]", "", slug)
+    return slug.replace(" ", "-")
 
 
 def _markdown_files() -> list[Path]:
@@ -118,6 +146,27 @@ def check_md_links(files: list[Path]) -> tuple[list[str], set[Path]]:
     return problems, linked
 
 
+def check_anchors(files: list[Path]) -> tuple[list[str], int]:
+    """同文件内的 ``](#anchor)`` 是否指向真实标题。
+
+    这类断链最阴：Markdown 不会报错，点一下**什么都不发生**（页面停在原地），
+    读者会以为"点了没反应"而不是"链接坏了"。README 的目录是重灾区 ——
+    章节改名之后目录没人跟着改，一年后就变成一堆死锚点。
+    """
+    problems = []
+    checked = 0
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        anchors = {_anchor(m.group(2)) for m in HEADING_RE.finditer(text)}
+        for match in ANCHOR_LINK_RE.finditer(_without_code(text)):
+            checked += 1
+            if match.group(1) not in anchors:
+                problems.append(
+                    f"{path.relative_to(ROOT)} 的锚点 #{match.group(1)} 找不到对应标题"
+                )
+    return problems, checked
+
+
 def check_orphans(files: list[Path], linked: set[Path]) -> list[str]:
     """docs/ 下每份文档都该被索引或别的文档提到。"""
     problems = []
@@ -141,13 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     problems += image_problems
     md_problems, linked = check_md_links(files)
     problems += md_problems
+    anchor_problems, anchor_count = check_anchors(files)
+    problems += anchor_problems
     problems += check_orphans(files, linked)
 
     if not INDEX.is_file():
         problems.append("docs/README.md（文档地图）不存在")
 
     if verbose:
-        print(f"检查了 {len(files)} 份文档、{image_count} 处图片引用")
+        print(f"检查了 {len(files)} 份文档、{image_count} 处图片引用、{anchor_count} 处锚点链接")
         for path in files:
             print(f"  {path.relative_to(ROOT)}")
 
@@ -157,7 +208,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {item}")
         return 1
 
-    print(f"文档结构 OK：{len(files)} 份文档、{image_count} 处图片引用，无杂物 / 无断链 / 无孤儿")
+    print(
+        f"文档结构 OK：{len(files)} 份文档、{image_count} 处图片引用、"
+        f"{anchor_count} 处锚点，无杂物 / 无断链 / 无死锚 / 无孤儿"
+    )
     return 0
 
 
