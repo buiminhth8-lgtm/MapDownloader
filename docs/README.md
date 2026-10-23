@@ -118,6 +118,9 @@
    两份文档写同一个数字，迟早有一份是错的。
 4. **截图放 `docs/images/`**，命名 `sliceNN_场景.png`。验收脚本
    （`scripts/verify_slice*.py`、`scripts/capture_ui.py`）已经默认写到这里。
+   例外：`capture_ui.py` 的默认产物 `ui_main_window.png` 是**临时渲染图**
+   （每次内容都不同），`.gitignore` 按文件名挡住了它，**文档里不要引用它** ——
+   要留档就用 `-o docs/images/sliceNN_xxx.png` 指定成正式名字再提交。
 5. **改完自查**：
    ```bash
    # 图片引用有没有断（相对仓库根）
