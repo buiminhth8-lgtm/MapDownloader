@@ -41,7 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 假 Token（**禁止**替换为真实密钥）
 FAKE_TOKEN = "abcdefghijklmn"
@@ -92,7 +92,7 @@ def _pump(app, times: int = 8) -> None:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把控件存成 ``docs/<name>``。
+    """把控件存成 ``docs/images/<name>``。
 
     ``grab()`` **不会**触发布局重算，所以先 ``activate()`` 再空转几轮事件循环。
     """

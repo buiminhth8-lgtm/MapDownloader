@@ -15,7 +15,7 @@
 - 真的跑完整条链路（``.mbtiles`` → ``map.mbtiles`` + ``manifest.json`` → 校验）；
 - 真的改**一个字节**，然后断言结论从 PASS 变成 FAIL（Spec §35 第 11 步）；
 - 真的起 windows 平台插件、真的 ``show()`` 打包对话框、真的点按钮；
-- 截图落在 ``docs/slice9_*.png``；
+- 截图落在 ``docs/images/slice9_*.png``；
 - 全程**只碰临时目录**，不碰你的真实地图与任务记录。
 
 用法::
@@ -44,7 +44,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 连续两个及以上 ASCII 字母 → 判为"漏改的英文按钮"。
 _ENGLISH_BUTTON = re.compile(r"[A-Za-z]{2,}")
@@ -121,7 +121,7 @@ def _wait_until(app, predicate, timeout_s: float = 60.0) -> bool:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把任意控件存成 ``docs/<name>``。
+    """把任意控件存成 ``docs/images/<name>``。
 
     ``grab()`` **不会**触发布局重算：``resize()`` 之后直接截，截到的是上一轮
     尺寸下的排版。所以先 ``activate()`` 再空转几轮事件循环。
@@ -247,7 +247,7 @@ def _has_chunked_read(source: str, function_name: str) -> bool:
 def _layout_problems(widget) -> list[str]:
     """顶层布局里"摆坏了"的地方 —— 用几何量，不靠看截图。
 
-    起因很实在：``docs/slice9_package_dialog.png`` 缩图之后，第一个 group box 的
+    起因很实在：``docs/images/slice9_package_dialog.png`` 缩图之后，第一个 group box 的
     标题看着像和别的东西叠在一起。逐行扫像素才发现 y=0~9 完全是空的 —— 是缩图的
     抗锯齿骗了眼睛。**人眼会被骗，``geometry()`` 不会**：
 

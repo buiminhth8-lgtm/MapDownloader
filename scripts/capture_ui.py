@@ -2,11 +2,11 @@
 
 用法::
 
-    python scripts/capture_ui.py                      # 输出到 ui_main_window.png
-    python scripts/capture_ui.py -o docs/ui.png       # 指定输出路径
+    python scripts/capture_ui.py                      # 输出到 docs/images/ui_main_window.png
+    python scripts/capture_ui.py -o docs/images/ui.png   # 指定输出路径
     python scripts/capture_ui.py --offscreen          # 无显示环境（CI）
-    python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
-    python scripts/capture_ui.py --with-tasks --with-progress -o docs/slice7_download_gui.png
+    python scripts/capture_ui.py --with-tasks -o docs/images/slice5_task_panel.png
+    python scripts/capture_ui.py --with-tasks --with-progress -o docs/images/slice7_download_gui.png
 
 说明：脚本只做"装配 + 渲染 + 截图"，不进入 ``app.exec()`` 事件循环，
        因此不会阻塞终端。
@@ -28,7 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_OUTPUT = PROJECT_ROOT / "ui_main_window.png"
+#: 默认落在 ``docs/images/``（与验收脚本的截图同一个目录）——
+#: 落在仓库根会慢慢堆出一堆没人管的 png，截图要么进 images/，要么别提交。
+DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "images" / "ui_main_window.png"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

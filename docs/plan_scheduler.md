@@ -214,11 +214,11 @@ PlanScheduler:   Task1 ──完成──► Task2 ──完成──► Task3 �
 
 | 状态 | 截图 |
 | --- | --- |
-| 已完成 | `docs/slice21_plan_completed.png` |
-| 已暂停 | `docs/slice21_plan_paused.png` |
-| 部分失败 | `docs/slice21_plan_partial_failed.png` |
-| 已取消 | `docs/slice21_plan_cancelled.png` |
-| 恢复（上次未完成） | `docs/slice21_plan_recovery.png` |
+| 已完成 | `docs/images/slice21_plan_completed.png` |
+| 已暂停 | `docs/images/slice21_plan_paused.png` |
+| 部分失败 | `docs/images/slice21_plan_partial_failed.png` |
+| 已取消 | `docs/images/slice21_plan_cancelled.png` |
+| 恢复（上次未完成） | `docs/images/slice21_plan_recovery.png` |
 
 ## 代码位置
 

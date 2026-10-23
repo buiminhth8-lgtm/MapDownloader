@@ -15,23 +15,14 @@
 
 ## 目录
 
+- [**文档地图**](docs/README.md) —— 按"我想干什么"找文档（全部专题文档的入口）
 - [这套东西是什么](#这套东西是什么) —— 架构与完整链路
 - [快速开始](#快速开始) —— 五分钟跑通一次
 - [安装](#安装)
 - [用法：下载地图](#用法下载地图)
-- [用法：按行政区域下载（GeoJSON 多边形）](docs/polygon_region_download.md) —— Slice 16
-- [Zoom 策略：分级推荐区间](docs/zoom_strategy.md) —— Slice 17
-- [行政区域层级模型（中国 → 省 → 市）](docs/region_catalog.md) —— Slice 18
-- [行政区域级联选择 + 推荐 Zoom](docs/region_selection_ui.md) —— Slice 19
-- [多级下载计划（全国 / 省 / 市）](docs/download_plan.md) —— Slice 20
-- [计划批量调度（串行执行 / 暂停 / 继续 / 取消 / 重试 / 跳过）](docs/plan_scheduler.md) —— Slice 21
-- [任务区域：航线走廊的高精度离线图](docs/mission_region.md) —— Slice 22
-- [下载风险分析（等级 / 详情 / 强确认 / 计划级四选一）](docs/download_risk_analysis.md) —— Slice 23
-- [**分级离线地图体系（全国 → 省 → 市 → 任务区）**](docs/hierarchical_offline_map.md) —— Slice 16~25 总入口
-- [行政区数据导入管线（授权 GeoJSON → RegionCatalog）](docs/region_data_pipeline.md) —— Slice 26
 - [用法：检查 MBTiles](#用法检查-mbtiles)
 - [用法：生成离线地图包](#用法生成离线地图包)
-- [地图包格式](#地图包格式)
+- [地图包格式](#地图包格式) —— 跨端契约
 - [用法：传输到 Android 设备](#用法传输到-android-设备)
 - [Android 端：导入与使用](#android-端导入与使用)
 - [三种底图模式：ONLINE / OFFLINE / AUTO](#三种底图模式online--offline--auto)
@@ -39,6 +30,11 @@
 - [端到端验收](#端到端验收)
 - [常见问题](#常见问题)
 - [开发记录（按 Slice）](#开发记录按-slice)
+
+> 专题文档（行政区域与层级 / Zoom 策略 / 计划与调度 / 任务区 / 风险分析 /
+> 行政区数据导入 / 分级离线体系 / 端到端验收清单 / 排查手册）统一从
+> [docs/README.md](docs/README.md) 进 —— 那里按任务分组，并标了推荐阅读顺序。
+> **不要按 Slice 编号顺序读那些文档**：编号是开发顺序，不是知识依赖顺序。
 
 ---
 
@@ -634,15 +630,15 @@ cd D:/project/osmdroid && ./gradlew :OpenStreetMapViewer:testDebugUnitTest :Open
 .venv/Scripts/python.exe scripts/verify_slice23_risk.py
 ```
 
-截图落在 `docs/slice23_risk_area_normal.png`（面板风险区："正常"档，按钮置灰）、
-`docs/slice23_risk_area_large.png`（城市 Z12~17：较大 ▲ + 超出推荐占比 74.9%）、
-`docs/slice23_risk_details.png`（逐 Zoom 明细四列 + 合计行）、
-`docs/slice23_zoom_applied.png`（点「采用推荐 Zoom」后换模式并重算）、
-`docs/slice23_confirm_very_large.png`（很大档：警告图标）、
-`docs/slice23_dangerous_task.png`（危险档：手输确认词）、
-`docs/slice23_plan_risk_column.png`（计划页风险列 / 合计行带总风险，状态列没被顶掉）、
-`docs/slice23_plan_choice.png`（计划级四选一，默认「返回修改」）、
-`docs/slice23_plan_dangerous.png`（计划级危险档：同一个窗口多出确认词输入框）。
+截图落在 `docs/images/slice23_risk_area_normal.png`（面板风险区："正常"档，按钮置灰）、
+`docs/images/slice23_risk_area_large.png`（城市 Z12~17：较大 ▲ + 超出推荐占比 74.9%）、
+`docs/images/slice23_risk_details.png`（逐 Zoom 明细四列 + 合计行）、
+`docs/images/slice23_zoom_applied.png`（点「采用推荐 Zoom」后换模式并重算）、
+`docs/images/slice23_confirm_very_large.png`（很大档：警告图标）、
+`docs/images/slice23_dangerous_task.png`（危险档：手输确认词）、
+`docs/images/slice23_plan_risk_column.png`（计划页风险列 / 合计行带总风险，状态列没被顶掉）、
+`docs/images/slice23_plan_choice.png`（计划级四选一，默认「返回修改」）、
+`docs/images/slice23_plan_dangerous.png`（计划级危险档：同一个窗口多出确认词输入框）。
 
 细节见 [docs/download_risk_analysis.md](docs/download_risk_analysis.md)。
 
@@ -964,9 +960,12 @@ Slice 19 之后，"选哪块地"已经很顺了，但**一次还是一次**：�
 
 ## Slice 19：行政区域级联选择 + 推荐 Zoom
 
+> 历史章节。这里写的是 Slice 19 当时的形状（三级）；Slice 27 已扩成
+> **国 → 省 → 市 → 县区** 四级，当前状态见上面的「当前进度」。
+
 Slice 18 把"一个中国预设"升级成了**层级目录**，但界面上还是**一条下拉列全部行政区**
 —— 国家和省、市混在一起，用户看不出哪条挂在谁下面。这一版把它换成
-**国家 → 省 → 市三段级联**，并让 Zoom 由区域等级决定：
+**国家 → 省 → 市三级级联**，并让 Zoom 由区域等级决定：
 
 ```text
 国家： [演示国 ▾]        ← 只列国家级
@@ -1067,7 +1066,7 @@ Zoom 明细（候选 / 选中 / 过滤 / 预计容量）：
 详见 [docs/region_selection_ui.md](docs/region_selection_ui.md)。
 实机验收：`python scripts/verify_slice19_region_ui.py`
 （真 windows 平台插件、真窗口、真关窗再开新窗口、真点「计算」，90 项检查，
-截图落 `docs/slice19_*.png`）。
+截图落 `docs/images/slice19_*.png`）。
 
 ## Slice 18：行政区域层级模型（中国 → 省 → 市）
 
@@ -1153,8 +1152,9 @@ Slice 17 那张策略表得到。存一份进目录就是第二个真相，改�
 条目类型没变，所以面板其余代码一行没动。于是"把资源目录指到别处"这件事对界面
 同样成立。**没有**做层级下拉、省市选择器、区域管理页 —— 那些是 Slice 19 / 20。
 
-> **Slice 19 更新**：层级下拉已经做了。那条"列全部行政区"的下拉被**三段级联**
-> 取代，数据来源仍是本 Slice 的 `RegionService`，等级也仍由目录条目给出。
+> **Slice 19 更新**：层级下拉已经做了。那条"列全部行政区"的下拉被**级联下拉**
+> 取代（Slice 19 是国/省/市三级，Slice 27 补了县区，现在四级），数据来源仍是
+> 本 Slice 的 `RegionService`，等级也仍由目录条目给出。
 > 见上面那一章与 [docs/region_selection_ui.md](docs/region_selection_ui.md)。
 
 目录读不出来时（文件丢了 / JSON 语法错 / 版本号不认识）**不让界面崩**：
@@ -1164,7 +1164,7 @@ Slice 17 那张策略表得到。存一份进目录就是第二个真相，改�
 
 详见 [docs/region_catalog.md](docs/region_catalog.md)。
 实机验收：`python scripts/verify_slice18_regions.py`
-（真 windows 平台插件、真窗口、三级目录、路径安全、截图落 `docs/slice18_regions_*.png`）。
+（真 windows 平台插件、真窗口、三级目录、路径安全、截图落 `docs/images/slice18_regions_*.png`）。
 
 ## Slice 17：分级 Zoom 策略
 
@@ -1206,7 +1206,7 @@ Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
 策略层只负责把推荐区间递进去，不重新实现一遍多边形统计。
 
 详见 [docs/zoom_strategy.md](docs/zoom_strategy.md)。实机验收：
-`python scripts/verify_slice17_zoom.py`（51 项检查，截图落 `docs/slice17_zoom_*.png`）。
+`python scripts/verify_slice17_zoom.py`（51 项检查，截图落 `docs/images/slice17_zoom_*.png`）。
 
 ## Slice 16：GeoJSON 区域下载与中国行政区域预设
 
@@ -1304,7 +1304,7 @@ Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
 ```
 
 验收脚本走五个场景（矩形基线 / 边界缺失 / 边界就位 / 下载→Inspector→打包 / 静态守卫），
-截图落在 `docs/slice16_*.png`。完整说明与 13 步手工清单见
+截图落在 `docs/images/slice16_*.png`。完整说明与 13 步手工清单见
 [`docs/polygon_region_download.md`](docs/polygon_region_download.md)。
 
 ### 这一 Slice 明确**不做**的事
@@ -1873,13 +1873,13 @@ python -m pytest tests/test_region_selection_controller.py \
 ## 界面留档
 
 ```bash
-python scripts/capture_ui.py                   # 渲染主窗口为 ui_main_window.png
+python scripts/capture_ui.py                   # 渲染主窗口为 docs/images/ui_main_window.png
 python scripts/capture_ui.py --offscreen       # 无显示环境（离屏渲染）
-python scripts/capture_ui.py --with-tasks -o docs/slice5_task_panel.png
+python scripts/capture_ui.py --with-tasks -o docs/images/slice5_task_panel.png
 ```
 
 `--with-tasks` 会预置几条不同状态的任务记录，用于留档 Slice 5 的「下载任务」面板
-（见 `docs/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
+（见 `docs/images/slice5_task_panel.png`）。它写的是**临时目录**里的 `tasks.json`，
 不会碰到你真实的 `data/tasks.json`。
 
 Slice 17 的「Zoom 建议」行同样有实机留档 —— 那一行是**新增控件**，最容易被挤扁：
@@ -1890,9 +1890,9 @@ python scripts/verify_slice17_zoom.py --offscreen  # 无显示环境（CI）
 python scripts/verify_slice17_zoom.py --no-shots   # 只跑检查，不截图
 ```
 
-截图落在 `docs/slice17_zoom_rectangle_baseline.png`（自定义矩形：整行收起）、
-`docs/slice17_zoom_recommended.png`（中国 + Z4~10：只有推荐与当前）、
-`docs/slice17_zoom_warning.png`（中国 + Z8~18：警告出现，而 Zoom 仍是你设的 8~18）。
+截图落在 `docs/images/slice17_zoom_rectangle_baseline.png`（自定义矩形：整行收起）、
+`docs/images/slice17_zoom_recommended.png`（中国 + Z4~10：只有推荐与当前）、
+`docs/images/slice17_zoom_warning.png`（中国 + Z8~18：警告出现，而 Zoom 仍是你设的 8~18）。
 脚本最后一段还会**真的跑一次多边形下载**（MockTransport 供瓦片，不触网），
 断言"库里张数 == 区域内张数"，证明策略层没有碰坏 Slice 16 的下载链路。
 
@@ -1905,9 +1905,9 @@ python scripts/verify_slice18_regions.py --offscreen  # 无显示环境（CI）
 python scripts/verify_slice18_regions.py --no-shots   # 只跑检查，不截图
 ```
 
-截图落在 `docs/slice18_regions_dropdown.png`（下拉项全部来自目录）、
-`docs/slice18_regions_city_zoom.png`（选中市级：建议 Z12~16、自定义 8~17 会报警）、
-`docs/slice18_regions_three_levels.png`（按市级区域真的算一次）。
+截图落在 `docs/images/slice18_regions_dropdown.png`（下拉项全部来自目录）、
+`docs/images/slice18_regions_city_zoom.png`（选中市级：建议 Z12~16、自定义 8~17 会报警）、
+`docs/images/slice18_regions_three_levels.png`（按市级区域真的算一次）。
 脚本在临时目录里造的是**合成方块**，不往仓库的 `resources/regions/` 写任何东西 ——
 法定地图内容必须由使用者用授权数据自己放。
 
@@ -1920,10 +1920,10 @@ python scripts/verify_slice19_region_ui.py --offscreen  # 无显示环境（CI�
 python scripts/verify_slice19_region_ui.py --no-shots   # 只跑检查，不截图
 ```
 
-截图落在 `docs/slice19_cascade_city.png`（三段级联选到市级）、
-`docs/slice19_zoom_recommended.png`（推荐模式：Min/Max 自动填 Z12~16 且只读）、
-`docs/slice19_zoom_warning.png`（自定义 8~17：有警告，值没被改）、
-`docs/slice19_polygon_estimate.png`（真点「计算」后的结果区，含逐级明细四列）。
+截图落在 `docs/images/slice19_cascade_city.png`（级联选到市级；当时是三级，Slice 27 已补县区）、
+`docs/images/slice19_zoom_recommended.png`（推荐模式：Min/Max 自动填 Z12~16 且只读）、
+`docs/images/slice19_zoom_warning.png`（自定义 8~17：有警告，值没被改）、
+`docs/images/slice19_polygon_estimate.png`（真点「计算」后的结果区，含逐级明细四列）。
 恢复那一段是**真的关一次窗**（走 `closeEvent` → `_save_preferences`）再用同一个
 偏好文件开一个新窗口 —— 写个 `set_region_id()` 再断言控件状态是自欺。
 
@@ -1935,11 +1935,11 @@ python scripts/verify_slice10_android.py --offscreen  # 无显示环境（CI）
 python scripts/verify_slice10_android.py --no-shots   # 只跑检查，不截图
 ```
 
-截图落在 `docs/slice10_device_panel.png`（刷新之后的三台设备 + 详情）、
-`docs/slice10_transfer_confirm.png`（传输确认框）、
-`docs/slice10_transfer_progress.png`（传输中，进度条真的在走）、
-`docs/slice10_transfer_done.png`（完成）、
-`docs/slice10_overwrite_confirm.png`（设备上已有同名包 → 覆盖确认）。
+截图落在 `docs/images/slice10_device_panel.png`（刷新之后的三台设备 + 详情）、
+`docs/images/slice10_transfer_confirm.png`（传输确认框）、
+`docs/images/slice10_transfer_progress.png`（传输中，进度条真的在走）、
+`docs/images/slice10_transfer_done.png`（完成）、
+`docs/images/slice10_overwrite_confirm.png`（设备上已有同名包 → 覆盖确认）。
 
 > "量出来，不要看" 这条经验在 Slice 10 又用了一次：设备区的滚动条**只能靠量**。
 > `offscreen` 字体偏小，pytest 里 `verticalScrollBar().maximum()` 是 0；切到真实
@@ -1958,8 +1958,8 @@ python scripts/verify_slice9_package.py --no-shots   # 只跑检查，不截图
 **B** 警告确认 / FAIL 拒包 / 覆盖备份，**C** 真窗口点按钮（构建 → 校验 → 篡改后重验），
 **D** 静态守卫（对话框里没有 SQLite 调用、校验器里没有 `INSERT/UPDATE/DELETE/DROP`、
 `checksum.py` 里没有整文件 `read_bytes`）。截图落在
-`docs/slice9_package_{dialog,complete,validate_pass,verify_fail}.png` 与
-`docs/slice9_validate_dialog.png`。
+`docs/images/slice9_package_{dialog,complete,validate_pass,verify_fail}.png` 与
+`docs/images/slice9_validate_dialog.png`。
 
 > 场次 C 里有一条断言是拿**几何量**做的，不是看图：`_layout_problems()` 会检查顶层
 > 布局里兄弟控件的 `geometry()` 有没有相交、有没有控件越过内容区顶边或对话框底边。
@@ -1975,7 +1975,7 @@ python scripts/verify_slice8_inspector.py --no-shots   # 只跑检查，不截�
 ```
 
 它真的造四种文件（正常 / 缺瓦片 / 含坏图片 / 非 SQLite）、真的点按钮、真的等后台
-线程，然后按结论分别截 `docs/slice8_inspector_{pass,warning,fail,idle}.png`。
+线程，然后按结论分别截 `docs/images/slice8_inspector_{pass,warning,fail,idle}.png`。
 
 > 为什么不能只靠 `pytest`：`pytest` 跑在 Qt `offscreen` 平台上，没有真实字体、
 > 没有 DPI 缩放、没有系统深浅色主题。而"检查"这个功能的价值**恰恰全在展示上**。
@@ -2022,11 +2022,11 @@ DPI 缩放、没有系统深浅色主题，`QMessageBox` 也不是真的窗口�
 
 | 场次 | 验的是什么 | 产出 |
 |---|---|---|
-| A | 空闲 → 计算 → 预估结果六行（含 Zoom 区间与地图类型） | `slice7_scene_a_estimate.png` |
-| B | 预计 > 10,000 张 → 大任务确认框（只提示、不限制） | `slice7_scene_b_large_task.png` |
-| C | 目标 `.mbtiles` 已存在 → 三选一；再走一遍「重新下载」的二次确认 | `slice7_scene_c_existing.png` / `slice7_scene_c2_restart.png` |
-| D | 下载中（限速 10 请求/秒，保证"进行中"是可观察的中间态）→ 暂停 / 继续 → 完成小结 | `slice7_scene_d1_downloading.png` / `slice7_scene_d2_complete.png` |
-| E | 部分瓦片失败 → 失败小结 +「继续补齐」+ 任务落盘为 FAILED | `slice7_scene_e_failed.png` |
+| A | 空闲 → 计算 → 预估结果六行（含 Zoom 区间与地图类型） | `docs/images/slice7_scene_a_estimate.png` |
+| B | 预计 > 10,000 张 → 大任务确认框（只提示、不限制） | `docs/images/slice7_scene_b_large_task.png` |
+| C | 目标 `.mbtiles` 已存在 → 三选一；再走一遍「重新下载」的二次确认 | `docs/images/slice7_scene_c_existing.png` / `docs/images/slice7_scene_c2_restart.png` |
+| D | 下载中（限速 10 请求/秒，保证"进行中"是可观察的中间态）→ 暂停 / 继续 → 完成小结 | `docs/images/slice7_scene_d1_downloading.png` / `docs/images/slice7_scene_d2_complete.png` |
+| E | 部分瓦片失败 → 失败小结 +「继续补齐」+ 任务落盘为 FAILED | `docs/images/slice7_scene_e_failed.png` |
 
 它还会顺手查两件只有实机能查的事：**每个弹窗的按钮文案里有没有残留英文**
 （`_english_buttons()`），以及流程跑完**主窗口必须关得掉**。数字对不上就以非 0 退出码结束。
@@ -2064,8 +2064,8 @@ tianditu-offline-tool/
 ├── resources/regions/      行政区目录元数据（Slice 18 ✅）：index.json + README.md 随仓库分发；
 │                           country/ province/ city/ 三个数据目录**只放 .gitkeep**，
 │                           *.geojson 在 .gitignore 里（授权数据不进提交）
-├── docs/                   设计文档 + 界面留档截图（slice7_*.png / slice8_inspector_*.png / slice9_package_*.png / slice10_*.png /
-│                           slice16_polygon_*.png / slice17_zoom_*.png / slice18_regions_*.png）
+├── docs/                   设计文档 + 界面留档截图（docs/images/slice7_*.png / docs/images/slice8_inspector_*.png / docs/images/slice9_package_*.png / docs/images/slice10_*.png /
+│                           docs/images/slice16_polygon_*.png / docs/images/slice17_zoom_*.png / docs/images/slice18_regions_*.png）
 ├── scripts/capture_ui.py   界面截图留档脚本
 ├── scripts/verify_slice19_region_ui.py Slice 19 级联 + 推荐 Zoom 验收（真窗口 + 真关窗再开 + 90 项检查 + 截图）
 ├── scripts/verify_slice18_regions.py Slice 18 行政区域层级验收（真窗口 + 三级目录 + 路径安全 + 79 项检查 + 截图）
@@ -2524,7 +2524,7 @@ Slice 25 在这条思路上又加了一层：**`region.level` 的取值集合两
 它同样读 Java 源码（`RegionLevel.java` 的枚举常量），断言 Windows 的值域
 不超出 Android 的、且 Android 只多一个 `UNKNOWN`；还断言两端对"哪一级更具体"
 的排序一致（Windows 的下载顺序 `PLAN_LEVEL_ORDER` 与 Android 的
-`getSpecificity()` 在行政三级 + 任务区这段互为逆序）。
+`getSpecificity()` 在行政四级 + 任务区这段互为逆序）。
 读不到兄弟仓库时整个模块 **skip 而不是 fail**，但 skip 是看得见的。
 
 ---

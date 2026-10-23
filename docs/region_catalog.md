@@ -276,9 +276,10 @@ region.geometry, region.bounds           # 交给既有的估算器 / 过滤器
 **没有**做层级下拉、省市选择器、区域管理页 —— 那些是 Slice 19 / 20。
 
 > **Slice 19 更新（2026-09-20）**：层级导航已经接上了。那个"一条下拉列全部行政区"
-> 的控件被**三段级联**（国家 / 省 / 市）取代，数据来源仍是本 Slice 的
-> `RegionService`（`list_countries()` / `list_provinces()` / `list_cities()`），
-> 等级也仍由目录条目给出。细节见 [region_selection_ui.md](region_selection_ui.md)。
+> 的控件被**级联下拉**（国家 / 省 / 市，Slice 27 起多一段「县区」）取代，数据来源
+> 仍是本 Slice 的 `RegionService`（`list_countries()` / `list_provinces()` /
+> `list_cities()` / `list_counties()`），等级也仍由目录条目给出。
+> 细节见 [region_selection_ui.md](region_selection_ui.md)。
 
 ---
 
@@ -298,13 +299,13 @@ region.geometry, region.bounds           # 交给既有的估算器 / 过滤器
 ```
 
 `scripts/verify_slice18_regions.py` 覆盖 Spec §19 的手工验收步骤，
-截图落在 `docs/slice18_regions_*.png`：
+截图落在 `docs/images/slice18_regions_*.png`：
 
 | 截图 | 内容 |
 | --- | --- |
-| `slice18_regions_dropdown.png` | 下拉框来自目录，中国还在 |
-| `slice18_regions_three_levels.png` | 三级目录可用 + 路径文本 |
-| `slice18_regions_city_zoom.png` | 选中市级区域时的 Zoom 建议来自策略层 |
+| `images/slice18_regions_dropdown.png` | 下拉框来自目录，中国还在 |
+| `images/slice18_regions_three_levels.png` | 三级目录可用 + 路径文本 |
+| `images/slice18_regions_city_zoom.png` | 选中市级区域时的 Zoom 建议来自策略层 |
 
 ---
 

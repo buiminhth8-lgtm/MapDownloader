@@ -19,7 +19,7 @@
 - 真的跑一遍下载链路（``httpx.MockTransport`` 供瓦片，**不触网**）→ 真的落一个
   ``.mbtiles`` → 真的过 Inspector → 真的打一个地图包，然后断言 manifest 里的
   ``region`` 子对象；
-- 截图落在 ``docs/slice16_*.png``；
+- 截图落在 ``docs/images/slice16_*.png``；
 - 全程只碰临时目录：**不动**你的真实地图、任务记录，也**不会**往仓库的
   ``resources/regions/`` 里写任何东西（中国国界数据必须由用户自己放，Spec §3）。
 
@@ -46,7 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 假 Token（**禁止**替换为真实密钥）
 FAKE_TOKEN = "abcdefghijklmn"
@@ -97,7 +97,7 @@ def _pump(app, times: int = 8) -> None:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把控件存成 ``docs/<name>``。
+    """把控件存成 ``docs/images/<name>``。
 
     ``grab()`` **不会**触发布局重算 —— ``resize()`` 之后直接截，截到的是上一轮尺寸
     下的排版。所以先 ``activate()`` 再空转几轮事件循环。

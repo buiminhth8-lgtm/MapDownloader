@@ -48,7 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 当前 ``QApplication``（截图前要空转事件循环让布局收敛）
 _APP = None
@@ -87,7 +87,7 @@ def _pump(app, times: int = 8) -> None:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把控件存成 ``docs/<name>``（``grab()`` 不触发布局重算，先 ``activate()``）。"""
+    """把控件存成 ``docs/images/<name>``（``grab()`` 不触发布局重算，先 ``activate()``）。"""
     if not enabled:
         return
     layout = widget.layout()

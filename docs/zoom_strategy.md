@@ -201,13 +201,13 @@ python scripts/verify_slice17_zoom.py --no-shots     # 只跑检查，不落截�
 ```
 
 `scripts/verify_slice17_zoom.py` 覆盖 Spec §17 的 7 步手工验收，截图落在
-`docs/slice17_zoom_*.png`：
+`docs/images/slice17_zoom_*.png`：
 
 | 截图 | 内容 |
 | --- | --- |
-| `slice17_zoom_rectangle_baseline.png` | 自定义矩形：建议行整行收起 |
-| `slice17_zoom_recommended.png` | 中国 + Z4~10：只有推荐与当前，没有警告 |
-| `slice17_zoom_warning.png` | 中国 + Z8~18：警告出现，Zoom 仍是你设的 8~18 |
+| `images/slice17_zoom_rectangle_baseline.png` | 自定义矩形：建议行整行收起 |
+| `images/slice17_zoom_recommended.png` | 中国 + Z4~10：只有推荐与当前，没有警告 |
+| `images/slice17_zoom_warning.png` | 中国 + Z8~18：警告出现，Zoom 仍是你设的 8~18 |
 
 ---
 

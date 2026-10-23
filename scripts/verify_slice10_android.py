@@ -53,7 +53,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 当前 ``QApplication``；``_shot`` 需要它来空转事件循环。
 _APP = None
@@ -405,7 +405,7 @@ def _wait_until(app, predicate, timeout_s: float = 60.0) -> bool:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把任意控件存成 ``docs/<name>``（先 ``activate()`` 再空转，见 Slice 9 的教训）。"""
+    """把任意控件存成 ``docs/images/<name>``（先 ``activate()`` 再空转，见 Slice 9 的教训）。"""
     if not enabled or widget is None:
         return
     layout = widget.layout()

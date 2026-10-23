@@ -6,8 +6,9 @@
 > 下文写"三段"的地方是 Slice 19 当时的形状，控件与数据源没变（都是遍历目录来的），
 > 只是多了一段。县级的真机验收见 `e2e_acceptance_checklist.md` 的 **E 段**。
 
-这个 Slice 把 Slice 18 准备好的**层级目录**接到了界面上：用户按 **国家 → 省 → 市**
-三段下拉选区域，界面按区域的**等级**自动给出推荐 Zoom 区间；想自己定 Zoom 就切到
+这个 Slice 把 Slice 18 准备好的**层级目录**接到了界面上：用户按 **国家 → 省 → 市
+→ 县区** 四级下拉选区域（Slice 19 只有前三段，Slice 27 补了县区），界面按区域的
+**等级**自动给出推荐 Zoom 区间；想自己定 Zoom 就切到
 「自定义 Zoom」，超范围只提醒、不改值。
 
 它**不包含**：多区域下载计划（一次下一串省市）、任务编排（Mission）、区域管理页
@@ -15,7 +16,7 @@
 
 | 这一 Slice 交付 | 在哪 |
 | --- | --- |
-| 三段级联下拉 + 等级显示 | `app/ui/download_panel.py` |
+| 四级级联下拉（Slice 27 起含县区）+ 等级显示 | `app/ui/download_panel.py` |
 | 选择状态 / 等级推导 / Zoom 建议的转发 | `app/ui/region_selection.py`（新） |
 | 推荐 / 自定义策略与持久化 | `app/ui/preferences.py`、`app/ui/main_window.py` |
 | 单元测试 | `tests/test_region_selection_controller.py`（29）、`tests/test_download_panel_region_selection.py`（27） |
@@ -47,10 +48,10 @@
 
 | 截图 | 内容 |
 | --- | --- |
-| `docs/slice19_cascade_city.png` | 三段级联选到市级，级别行与推荐区间可见 |
-| `docs/slice19_zoom_recommended.png` | 推荐模式：Min/Max 自动填成 Z12~16 |
-| `docs/slice19_zoom_warning.png` | 自定义 8~17：给出「城市级」警告但值没被改 |
-| `docs/slice19_polygon_estimate.png` | 真点「计算」后的结果区（含逐级明细四列） |
+| `docs/images/slice19_cascade_city.png` | 级联选到市级，级别行与推荐区间可见（Slice 19 的截图，当时还没有「县区」那一段） |
+| `docs/images/slice19_zoom_recommended.png` | 推荐模式：Min/Max 自动填成 Z12~16 |
+| `docs/images/slice19_zoom_warning.png` | 自定义 8~17：给出「城市级」警告但值没被改 |
+| `docs/images/slice19_polygon_estimate.png` | 真点「计算」后的结果区（含逐级明细四列） |
 
 ---
 

@@ -327,15 +327,15 @@ DownloadRiskAnalyzer.analyze_plan()         整份计划 → PlanRiskReport
 
 | 文件 | 看什么 |
 | --- | --- |
-| `slice23_risk_area_normal.png` | 面板风险区「正常」档：等级行带中文与记号，「采用推荐 Zoom」置灰 |
-| `slice23_risk_area_large.png` | 「较大」档：`较大（LARGE）▲` + 张数 / 容量 / 超推荐占比 74.9% |
-| `slice23_risk_details.png` | 「查看详情」：逐 Zoom 四列 + 合计行，推荐列三态 |
-| `slice23_zoom_applied.png` | 点「采用推荐 Zoom」→ 换到推荐模式并立刻重算 |
-| `slice23_confirm_large.png` / `slice23_confirm_very_large.png` | 启动保护：问号 / 警告图标 |
-| `slice23_dangerous_task.png` | 危险档强确认：确认词输入框 + 置灰的「仍然继续」 |
-| `slice23_plan_risk_column.png` | 计划页风险列与合计行总风险；**状态列没被顶掉** |
-| `slice23_plan_choice.png` | 计划级四选一，默认「返回修改」 |
-| `slice23_plan_dangerous.png` | 计划级危险档：同一个窗口多出确认词框 |
+| `images/slice23_risk_area_normal.png` | 面板风险区「正常」档：等级行带中文与记号，「采用推荐 Zoom」置灰 |
+| `images/slice23_risk_area_large.png` | 「较大」档：`较大（LARGE）▲` + 张数 / 容量 / 超推荐占比 74.9% |
+| `images/slice23_risk_details.png` | 「查看详情」：逐 Zoom 四列 + 合计行，推荐列三态 |
+| `images/slice23_zoom_applied.png` | 点「采用推荐 Zoom」→ 换到推荐模式并立刻重算 |
+| `images/slice23_confirm_large.png` / `images/slice23_confirm_very_large.png` | 启动保护：问号 / 警告图标 |
+| `images/slice23_dangerous_task.png` | 危险档强确认：确认词输入框 + 置灰的「仍然继续」 |
+| `images/slice23_plan_risk_column.png` | 计划页风险列与合计行总风险；**状态列没被顶掉** |
+| `images/slice23_plan_choice.png` | 计划级四选一，默认「返回修改」 |
+| `images/slice23_plan_dangerous.png` | 计划级危险档：同一个窗口多出确认词框 |
 
 验收脚本共 **92 项检查**：`--offscreen` 与真实平台各跑一遍。
 真实平台这一遍不是为了"再确认一次"，而是因为 offscreen 下字体更小、没有 DPI 缩放

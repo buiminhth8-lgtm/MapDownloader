@@ -7,7 +7,7 @@
 
 - 真的起 windows 平台插件、真的显示主窗口；
 - 真的点按钮（``QPushButton.click()`` / ``QMessageBox`` 的按钮）；
-- 每个场景截一张图，落在 ``docs/slice7_*.png``，人可以直接看；
+- 每个场景截一张图，落在 ``docs/images/slice7_*.png``，人可以直接看；
 - 全程用 ``httpx.MockTransport`` 假服务端，**不触网、不消耗天地图配额**；
 - 任务记录与界面偏好都写到临时目录，**不碰真实用户数据与注册表**。
 
@@ -46,7 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 FAKE_TOKEN = "abcdefghijklmn"
 FAKE_PNG = b""  # 运行时填充（必须是一张真 PNG：合成模式要解码）
 
@@ -129,7 +129,7 @@ def _english_buttons(labels: list[str]) -> list[str]:
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把任意控件（主窗口 / 弹窗）存成 ``docs/<name>``。
+    """把任意控件（主窗口 / 弹窗）存成 ``docs/images/<name>``。
 
     弹窗刻意**单独截**：``QMessageBox`` 是独立的顶层窗口，跟着主窗口一起截
     会被窗口右边界切掉一半（截出来正好是最需要看的那行字被裁掉）。

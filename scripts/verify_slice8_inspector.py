@@ -9,7 +9,7 @@
 
 - 真的起 windows 平台插件、真的 ``show()`` 检查对话框；
 - 真的点 ``[快速检查]`` / ``[深度检查]``，真的等后台线程跑完；
-- 每种结论（PASS / WARNING / FAIL）各截一张图，落在 ``docs/slice8_*.png``；
+- 每种结论（PASS / WARNING / FAIL）各截一张图，落在 ``docs/images/slice8_*.png``；
 - 全程**只碰临时目录**，不碰你的真实地图与任务记录；
 - 附带断言"检查不跑在 Qt 主线程"与"对话框里没有 SQL"。
 
@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DOCS = PROJECT_ROOT / "docs"
+DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 连续两个及以上 ASCII 字母 → 判为"漏改的英文按钮"。
 _ENGLISH_BUTTON = re.compile(r"[A-Za-z]{2,}")
@@ -112,7 +112,7 @@ def _start_and_wait(dialog, app, *, deep: bool, timeout_ms: int = 60_000):
 
 
 def _shot(widget, name: str, enabled: bool) -> None:
-    """把任意控件存成 ``docs/<name>``。
+    """把任意控件存成 ``docs/images/<name>``。
 
     ``grab()`` **不会**触发布局重算：``resize()`` 之后直接截，截到的是上一轮
     尺寸下的排版（表现是"大小 28.00 KB"被裁成"大小 28"）。所以这里先
