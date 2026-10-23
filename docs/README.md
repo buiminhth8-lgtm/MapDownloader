@@ -121,13 +121,12 @@
    例外：`capture_ui.py` 的默认产物 `ui_main_window.png` 是**临时渲染图**
    （每次内容都不同），`.gitignore` 按文件名挡住了它，**文档里不要引用它** ——
    要留档就用 `-o docs/images/sliceNN_xxx.png` 指定成正式名字再提交。
-5. **改完自查**：
+5. **改完自查**（一条命令）：
    ```bash
-   # 图片引用有没有断（相对仓库根）
-   ls docs/images | wc -l
-   # 有没有过期表述残留（按需扩展关键词）
-   grep -rn "三段级联\|只有三级" docs/*.md
+   python scripts/check_docs.py
    ```
+   它查四件事：`docs/` 根目录有没有杂物、图片引用有没有断、文档间链接有没有断、
+   有没有孤儿文档（新增文档忘了加进本索引就会被抓到）。退出码非 0 就是没整理好。
 6. **跨端契约只有一份真值。** Windows 侧与 Android 侧的字段、枚举、
    版本号一致性由测试机械核对（`tests/test_package_protocol_v1.py`），
    文档里的表是给人读的解释，**不是定义**。

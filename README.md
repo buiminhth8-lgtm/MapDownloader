@@ -26,7 +26,9 @@
 - [用法：传输到 Android 设备](#用法传输到-android-设备)
 - [Android 端：导入与使用](#android-端导入与使用)
 - [三种底图模式：ONLINE / OFFLINE / AUTO](#三种底图模式online--offline--auto)
-- [测试](#测试)
+- [测试：按模块跑](#测试按模块跑)
+- [测试：全量与端到端脚本](#测试全量与端到端脚本)
+- [文档自检](#文档自检)
 - [端到端验收](#端到端验收)
 - [常见问题](#常见问题)
 - [开发记录（按 Slice）](#开发记录按-slice)
@@ -350,7 +352,7 @@ Slice 26 打通了"授权数据能导进来"，但导进来的只有三层：国
 
 ```bash
 # 全量单测
-.venv/Scripts/python.exe -m pytest                                   # 2501 passed / 4 skipped
+.venv/Scripts/python.exe -m pytest                                   # 全量（数字以实际输出为准）
 
 # 主链路（离线）
 .venv/Scripts/python.exe scripts/e2e_smoke_test.py                   # 6/6
@@ -427,7 +429,7 @@ Authorized Region Dataset (GeoJSON FeatureCollection)
 
 ```bash
 # 全量单测（含 6 组 importer/UI 用例 + 11 个自建几何夹具，不依赖真实中国边界）
-.venv/Scripts/python.exe -m pytest                                   # 2491 passed / 4 skipped
+.venv/Scripts/python.exe -m pytest                                   # 全量（数字以实际输出为准）
 
 # 主链路（离线）
 .venv/Scripts/python.exe scripts/e2e_smoke_test.py                   # 6/6
@@ -503,7 +505,7 @@ Android:  region_id=hangzhou → 查不到     → UNKNOWN        ❌ 静默降�
 
 ```bash
 # 全量单测（Windows）
-cd D:/project/MapDownloader && .venv/Scripts/python.exe -m pytest -q          # 2404 passed
+cd D:/project/MapDownloader && .venv/Scripts/python.exe -m pytest -q          # 全量（数字以实际输出为准）
 
 # 主链路（离线）
 .venv/Scripts/python.exe scripts/e2e_smoke_test.py                            # 6 段
@@ -1790,10 +1792,12 @@ python -m pip install -r requirements-lock.txt
 python -m app.main
 ```
 
-## 测试
+## 测试：按模块跑
+
+> 全量测试与端到端脚本在后面的[测试：全量与端到端脚本](#测试全量与端到端脚本)。
 
 ```bash
-python -m pytest                # 2404 passed
+python -m pytest                # 全量（不写死数字：以实际输出为准）
 python -m pytest tests/test_resume_download.py -q   # 只跑断点续传链路
 python -m pytest tests/test_mbtiles_diagnostics.py tests/test_mbtiles_inspection_service.py -q
                                                     # 只跑 Slice 8 诊断规则 + 编排层
@@ -2482,7 +2486,7 @@ Android 侧在**另一个仓库**：`D:\project\osmdroid`（fork 的 osmdroid，
 
 ---
 
-## 测试
+## 测试：全量与端到端脚本
 
 ```bash
 # 全部单元测试
@@ -2525,7 +2529,23 @@ Slice 25 在这条思路上又加了一层：**`region.level` 的取值集合两
 不超出 Android 的、且 Android 只多一个 `UNKNOWN`；还断言两端对"哪一级更具体"
 的排序一致（Windows 的下载顺序 `PLAN_LEVEL_ORDER` 与 Android 的
 `getSpecificity()` 在行政四级 + 任务区这段互为逆序）。
-读不到兄弟仓库时整个模块 **skip 而不是 fail**，但 skip 是看得见的。
+
+**跳过条件只有一个**：兄弟仓库**根本不存在**（`osmdroid` 目录不在）。
+仓库在、但源码文件或字段找不到时是 **fail 而不是 skip**，报错里会列出搜索过的
+路径 —— 早先那版是"读不到就 skip"，等于没有守卫：字段改名之后测试一直"绿"，
+直到真机导入才炸。
+
+---
+
+## 文档自检
+
+```bash
+.venv/Scripts/python.exe scripts/check_docs.py
+```
+
+查 `docs/` 的结构：根目录有没有散落的截图、图片引用有没有断、文档间链接有没有断、
+有没有孤儿文档。退出码非 0 就是没整理好。规则见
+[docs/README.md](docs/README.md) 末尾的「文档规范」。
 
 ---
 
