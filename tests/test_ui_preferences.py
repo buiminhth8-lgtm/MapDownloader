@@ -354,6 +354,65 @@ def test_region_selection_defaults_to_empty(preferences: UiPreferences) -> None:
     assert preferences.region_selection.is_empty is True
 
 
+def test_county_id_round_trip(preferences: UiPreferences) -> None:
+    """县级 id 要能单独往返（Slice 28）。
+
+    它是"最具体那一级"，决定下载范围。这条看似只是多一个字段，
+    但漏掉它的后果是静默放大范围（县 → 市/省），不报错。
+    """
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="china",
+            province_id="jiangsu",
+            city_id="nanjing",
+            county_id="gulou",
+        )
+    )
+
+    stored = preferences.region_selection
+    assert stored.county_id == "gulou"
+    assert stored.city_id == "nanjing"
+    assert stored.is_empty is False
+
+
+def test_clearing_the_county_leaves_nothing_behind(preferences: UiPreferences) -> None:
+    """"不限定县区"要能把上次的县**清掉**。
+
+    留着的话，恢复流程会优先用它 → 用户明明选了"整个市"，下载的还是那个县
+    （范围反而变小，张数对不上，且同样不报错）。
+    """
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="china",
+            province_id="jiangsu",
+            city_id="nanjing",
+            county_id="gulou",
+        )
+    )
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="china",
+            province_id="jiangsu",
+            city_id="nanjing",
+        )
+    )
+
+    assert preferences.region_selection.county_id is None
+
+
+def test_county_key_is_managed(preferences: UiPreferences) -> None:
+    """县级键必须进 `stored_keys()`：漏了它，"不存 Token"那条断言就看不到它，
+    而它本身也确实该被纳入统一管理（清理配置时要一起清）。"""
+    preferences.set_region_selection(
+        RegionSelection(region_type="polygon", country_id="china", county_id="gulou")
+    )
+
+    assert "download/county_id" in preferences.stored_keys()
+
+
 def test_zoom_mode_round_trip(preferences: UiPreferences) -> None:
     assert preferences.zoom_mode is None
     preferences.set_zoom_mode("recommended")

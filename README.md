@@ -1018,11 +1018,12 @@ Min Zoom: 12（只读）    Max Zoom: 16（只读）
 | 键 | 值 |
 | --- | --- |
 | `download/region_type` | `rectangle` / `polygon` |
-| `download/country_id` / `province_id` / `city_id` | 三段 id **分别**存 |
+| `download/country_id` / `province_id` / `city_id` / `county_id` | 四级 id **分别**存 |
 | `download/zoom_mode` | `recommended` / `custom` |
 | `download/custom_min_zoom` / `custom_max_zoom` | 用户自己定的区间 |
 
-三段分开存：界面是按三段恢复的，只存末端 id 就得反推"它的父亲是谁"——那是目录的职责。
+四级分开存：界面是按四级恢复的，只存末端 id 就得反推"它的父亲是谁"——那是目录的职责。
+`county_id` 是 Slice 28 补的：漏了它，选了县关窗再开，范围会**静默**放大成整个市（或省）。
 Slice ≤18 的老键 `download/min_zoom` / `download/max_zoom` **只读不写**（升级后上次调好
 的区间不会变成"从没设过"），`clear()` 会把老键一起删。偏好里存着不存在的 id 时**逐级
 回退**：市 → 省 → 国，一个都不认识才落回自定义矩形。

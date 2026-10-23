@@ -57,6 +57,7 @@ _KEY_REGION_TYPE = f"{_DOWNLOAD_GROUP}/region_type"
 _KEY_COUNTRY_ID = f"{_DOWNLOAD_GROUP}/country_id"
 _KEY_PROVINCE_ID = f"{_DOWNLOAD_GROUP}/province_id"
 _KEY_CITY_ID = f"{_DOWNLOAD_GROUP}/city_id"
+_KEY_COUNTY_ID = f"{_DOWNLOAD_GROUP}/county_id"
 _KEY_ZOOM_MODE = f"{_DOWNLOAD_GROUP}/zoom_mode"
 _KEY_GEOMETRY = f"{_WINDOW_GROUP}/geometry"
 
@@ -76,6 +77,7 @@ _MANAGED_KEYS: tuple[str, ...] = (
     _KEY_COUNTRY_ID,
     _KEY_PROVINCE_ID,
     _KEY_CITY_ID,
+    _KEY_COUNTY_ID,
     _KEY_ZOOM_MODE,
     _KEY_GEOMETRY,
 )
@@ -86,9 +88,9 @@ _LEGACY_KEYS: tuple[str, ...] = (_LEGACY_KEY_MIN_ZOOM, _LEGACY_KEY_MAX_ZOOM)
 
 @dataclass(frozen=True)
 class RegionSelection:
-    """行政区选择在偏好里的快照（Slice 19，Spec §14）。
+    """行政区选择在偏好里的快照（Slice 19，Spec §14；Slice 28 补县级）。
 
-    三个 id 分开存而不是只存一个"当前生效 id"：界面是按三段下拉恢复的，
+    各段 id 分开存而不是只存一个"当前生效 id"：界面是按四级下拉恢复的，
     只存一个末端 id 就得反推"它的父亲是谁"——那是目录的职责，不该在
     偏好这一层再实现一遍。
 
@@ -97,18 +99,29 @@ class RegionSelection:
         country_id: 国家 id。
         province_id: 省 id（"不限定省"时是 ``None``）。
         city_id: 市 id（"不限定市"时是 ``None``）。
+        county_id: 县/区 id（"不限定县区"时是 ``None``）。**必须是独立字段**：
+            直辖市下辖区与普通县都可能成为最具体的那一级，而"最具体一级"
+            决定了下载范围 —— 丢了它就会静默放大成整个市/省，
+            不报错、只是多下一片。
     """
 
     region_type: str = ""
     country_id: str | None = None
     province_id: str | None = None
     city_id: str | None = None
+    county_id: str | None = None
 
     @property
     def is_empty(self) -> bool:
         """一条都没存过。"""
         return not any(
-            (self.region_type, self.country_id, self.province_id, self.city_id)
+            (
+                self.region_type,
+                self.country_id,
+                self.province_id,
+                self.city_id,
+                self.county_id,
+            )
         )
 
 
@@ -202,14 +215,20 @@ class UiPreferences:
             country_id=self._read_text(_KEY_COUNTRY_ID),
             province_id=self._read_text(_KEY_PROVINCE_ID),
             city_id=self._read_text(_KEY_CITY_ID),
+            county_id=self._read_text(_KEY_COUNTY_ID),
         )
 
     def set_region_selection(self, selection: RegionSelection) -> None:
-        """记住行政区选择（空字段会被清除，不会留下上一次的残值）。"""
+        """记住行政区选择（空字段会被清除，不会留下上一次的残值）。
+
+        清除很关键：从"选了县"改回"只选到市"时，若县 id 留着，下次恢复会
+        直接落回那个县 —— 界面上看是市，实际下的却是县。
+        """
         self._write_text(_KEY_REGION_TYPE, selection.region_type or None)
         self._write_text(_KEY_COUNTRY_ID, selection.country_id)
         self._write_text(_KEY_PROVINCE_ID, selection.province_id)
         self._write_text(_KEY_CITY_ID, selection.city_id)
+        self._write_text(_KEY_COUNTY_ID, selection.county_id)
 
     @property
     def zoom_mode(self) -> str | None:

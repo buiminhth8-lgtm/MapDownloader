@@ -3626,9 +3626,13 @@ class MainWindow(QMainWindow):
     def _restore_region_selection(self, selection: RegionSelection) -> None:
         """恢复上次的行政区选择；认不出来就**安全回退**（Spec §14）。
 
-        回退是**逐级**的：市认不出来试省，省认不出来试国，一个都不认识才落回
-        自定义矩形。一个"已经不存在的旧 id"往往只是目录改名或删了一层，用户
-        真正想下的多半还是那个国家 —— 直接扔掉整条链才是真正的退步。
+        回退是**逐级**的：县认不出来试市，市认不出来试省，省认不出来试国，
+        一个都不认识才落回自定义矩形。一个"已经不存在的旧 id"往往只是目录
+        改名或删了一层，用户真正想下的多半还是那个上级区域 —— 直接扔掉整条
+        链才是真正的退步。
+
+        注意逐级回退会**放大**下载范围（县 → 市 → 省），所以每降一级都写一条
+        WARNING 日志：静默放大比报错更糟 —— 用户会以为下的还是那个县。
 
         全程不抛异常：偏好是锦上添花，读不出来就该当没存过。
         """
@@ -3638,9 +3642,19 @@ class MainWindow(QMainWindow):
             # 上次就是自定义矩形（或值认不出来）→ 保持默认的矩形
             return
 
-        deepest = selection.city_id or selection.province_id or selection.country_id
+        deepest = (
+            selection.county_id
+            or selection.city_id
+            or selection.province_id
+            or selection.country_id
+        )
         service = self.download_panel.region_controller.service
-        for candidate in (selection.city_id, selection.province_id, selection.country_id):
+        for candidate in (
+            selection.county_id,
+            selection.city_id,
+            selection.province_id,
+            selection.country_id,
+        ):
             if not candidate:
                 continue
             # 先问目录里有没有这一条，再动界面：`set_region_id` 会把面板切到
@@ -3675,18 +3689,22 @@ class MainWindow(QMainWindow):
         prefs.set_output_dir(str(data["output_dir"]))
         prefs.set_map_type(data["map_type"].value)
         prefs.set_zoom_range(data["min_zoom"], data["max_zoom"])
-        # 行政区选择（Slice 19，Spec §14）：三段 id 分别存，恢复时按
-        # 国 → 省 → 市 逐级铺（见 `_restore_region_selection`）。
+        # 行政区选择（Slice 19，Spec §14）：四级 id 分别存，恢复时按
+        # 国 → 省 → 市 → 县区 逐级铺（见 `_restore_region_selection`）。
+        # 县级必须存：直辖市下辖区与普通县都可能是最具体那级，
+        # 漏存会让重启后的下载范围静默放大成整个市/省。
         controller = panel.region_controller
         country = controller.country
         province = controller.province
         city = controller.city
+        county = controller.county
         prefs.set_region_selection(
             RegionSelection(
                 region_type=data["region_type"].value,
                 country_id=country.id if country is not None else None,
                 province_id=province.id if province is not None else None,
                 city_id=city.id if city is not None else None,
+                county_id=county.id if county is not None else None,
             )
         )
         prefs.set_zoom_mode(data["zoom_mode"].value)

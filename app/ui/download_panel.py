@@ -606,7 +606,8 @@ class DownloadPanel(QGroupBox):
             # 还没选省 → 城市无可选项。留着空下拉而不是禁用：禁用会让用户
             # 以为"这个功能坏了"，而"先选省份"是能自己推断出来的。
             self._city_combo.addItem(_ANY_CITY_TEXT, None)
-            self._controller.select_city(None)
+            if self._controller.city is not None:
+                self._controller.select_city(None)
             return
         self._city_combo.addItem(_ANY_CITY_TEXT, None)
         for entry in self._controller.list_cities():
@@ -618,7 +619,16 @@ class DownloadPanel(QGroupBox):
         if wanted is not None and self._select_entry(self._city_combo, wanted.id):
             return
         self._city_combo.setCurrentIndex(0)
-        self._controller.select_city(None)
+        # **只在自己这一段原本有值时才清**（Slice 28 修正）。
+        #
+        # `select_city(None)` 会顺带清掉 `_county_id`，而"省下面没有市、
+        # 直接挂县"是**正常数据形态**，不是"市被删了"：重庆等直辖市下辖区、
+        # 省直辖县级市都是这样（本仓库的真实目录里这类县有 155 个）。
+        # 无条件清的话，这类县在 `set_region_id()` / 恢复偏好时永远选不上 ——
+        # `select_region()` 刚把四级铺好，紧接着这一行又把县抹掉，
+        # 界面上只剩"重庆市"，且**不报任何错**。
+        if wanted is not None:
+            self._controller.select_city(None)
 
     def _fill_county_combo(self) -> None:
         """填「县区」下拉（首个条目是"全部"；市/省下没有县时只剩它）。
@@ -1910,6 +1920,11 @@ class DownloadPanel(QGroupBox):
     def city_combo(self) -> QComboBox:
         """暴露「城市」下拉框（Slice 19；第 0 项是"全部"）。"""
         return self._city_combo
+
+    @property
+    def county_combo(self) -> QComboBox:
+        """暴露「县区」下拉框（Slice 27 加；第 0 项是"全部"）。"""
+        return self._county_combo
 
     @property
     def region_combo(self) -> QComboBox:

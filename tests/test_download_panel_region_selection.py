@@ -66,6 +66,159 @@ def window_factory(qapp, tasks_file: Path, preferences, region_resources: Path):
         win.close()
 
 
+#: 挂在 ``rivertown``（110~111 / 33~34）里面的一小块县（Slice 28）
+COUNTY_GEOJSON: dict = {
+    "type": "Feature",
+    "properties": {
+        "name": "示例河县",
+        "id": "democounty",
+        "boundaryVersion": "2026-09-fixture",
+    },
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [110.2, 33.2],
+                [110.8, 33.2],
+                [110.8, 33.8],
+                [110.2, 33.8],
+                [110.2, 33.2],
+            ]
+        ],
+    },
+}
+
+
+#: 直辖市（省下面直接挂县、中间没有市）—— 对应现实里的重庆/省直辖县级市
+DIRECT_PROVINCE_GEOJSON: dict = {
+    "type": "Feature",
+    "properties": {
+        "name": "示例直辖市",
+        "id": "directland",
+        "boundaryVersion": "2026-09-fixture",
+    },
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [112.0, 30.0],
+                [113.0, 30.0],
+                [113.0, 31.0],
+                [112.0, 31.0],
+                [112.0, 30.0],
+            ]
+        ],
+    },
+}
+
+#: 挂在直辖市下面的区（父级是**省**，不是市）
+DIRECT_COUNTY_GEOJSON: dict = {
+    "type": "Feature",
+    "properties": {
+        "name": "示例中区",
+        "id": "directcounty",
+        "boundaryVersion": "2026-09-fixture",
+    },
+    "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [112.2, 30.2],
+                [112.8, 30.2],
+                [112.8, 30.8],
+                [112.2, 30.8],
+                [112.2, 30.2],
+            ]
+        ],
+    },
+}
+
+
+@pytest.fixture
+def region_resources_with_county(monkeypatch, region_resources: Path) -> Path:
+    """在合成树上**再追加县级数据**，覆盖两种父级形态。
+
+    追加三条（都是自造几何，不是真实国界）：
+
+    - ``democounty``：父级是**市**（``rivertown``）—— 绝大多数县是这样；
+    - ``directland`` + ``directcounty``：一个**省**下面直接挂县、中间没有市
+      —— 对应现实里的直辖市下辖区 / 省直辖县级市。
+
+    第二种形态是必须有的：``_fill_city_combo()`` 有个"省下没有市"的分支，
+    它曾经无调 ``select_city(None)``，那会把刚铺好的县一起抹掉 —— 光有第一种
+    形态的夹具测不出来（见 `test_county_under_a_province_can_be_selected`）。
+
+    为什么不直接把县塞进 ``tests/fixtures/regions/catalog``：那份夹具被十几个
+    计划/估算/风险用例共用，多几条会让"遍历所有条目"的断言各多出一行，
+    而那些用例跟县级毫无关系。只在验证**县级**的地方追加，影响面最小
+    （与 conftest 里 ``triangleland`` 的处理一致）。
+    """
+    import json
+
+    (region_resources / "county").mkdir(exist_ok=True)
+    (region_resources / "county" / "democounty.geojson").write_text(
+        json.dumps(COUNTY_GEOJSON, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (region_resources / "province" / "directland.geojson").write_text(
+        json.dumps(DIRECT_PROVINCE_GEOJSON, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (region_resources / "county" / "directcounty.geojson").write_text(
+        json.dumps(DIRECT_COUNTY_GEOJSON, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    index_path = region_resources / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["regions"].extend(
+        [
+            {
+                "id": "democounty",
+                "name": "示例河县",
+                "level": "county",
+                "parentId": "rivertown",
+                "geojson": "county/democounty.geojson",
+                "boundaryVersion": "2026-09-fixture",
+            },
+            {
+                "id": "directland",
+                "name": "示例直辖市",
+                "level": "province",
+                "parentId": "demoland",
+                "geojson": "province/directland.geojson",
+                "boundaryVersion": "2026-09-fixture",
+            },
+            {
+                "id": "directcounty",
+                "name": "示例中区",
+                "level": "county",
+                "parentId": "directland",
+                "geojson": "county/directcounty.geojson",
+                "boundaryVersion": "2026-09-fixture",
+            },
+        ]
+    )
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return region_resources
+
+
+@pytest.fixture
+def county_window_factory(qapp, tasks_file: Path, preferences, region_resources_with_county):
+    """同上，但目录里有县（测县级持久化用）。"""
+    created: list[MainWindow] = []
+
+    def factory() -> MainWindow:
+        win = MainWindow(
+            task_service=TaskService(TaskStore(tasks_file)), preferences=preferences
+        )
+        created.append(win)
+        return win
+
+    yield factory
+    for win in created:
+        win._exit_confirmed = True
+        win.close()
+
+
 def _select(panel: DownloadPanel, country=None, province=None, city=None) -> None:
     """按 id 依次点三段下拉（``None`` 表示不点那一段）。"""
     combos = {
@@ -495,3 +648,180 @@ def test_preferences_round_trip(window_factory, preferences) -> None:
     assert stored.province_id == "northland"
     assert stored.city_id == "rivertown"
     assert preferences.zoom_mode == "recommended"
+
+
+# --------------------------------------------------------------------------- #
+# 县级持久化（Slice 28）
+#
+# 这一组守的是**静默放大**：县级选择丢了不报错、不弹窗，只是下次打开时
+# 范围从"一个县"变成"整个市"或"整个省" —— 用户会以为下的还是那个县，
+# 直到发现张数从几百变成几万。
+# --------------------------------------------------------------------------- #
+def test_county_selection_is_persisted(county_window_factory, preferences) -> None:
+    """选了县 → 关窗：县 id 必须落盘，祖先三级也一并落盘。"""
+    window = county_window_factory()
+    assert window.download_panel.set_region_id("democounty")
+    window._save_preferences()
+
+    stored = preferences.region_selection
+    assert stored.county_id == "democounty"
+    # 祖先三级不是"顺便存的"：恢复时是先靠它们把下拉铺开，再落到县；
+    # 只有县 id 的话，界面能恢复但"当前在哪一省"显示不出来。
+    assert stored.city_id == "rivertown"
+    assert stored.province_id == "northland"
+    assert stored.country_id == "demoland"
+
+
+def test_county_selection_is_restored(county_window_factory, preferences) -> None:
+    """重开工具：省 / 市 / 县区三段下拉都要回到那个县，范围不能变大。"""
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="demoland",
+            province_id="northland",
+            city_id="rivertown",
+            county_id="democounty",
+        )
+    )
+
+    panel = county_window_factory().download_panel
+
+    assert panel.current_region_type() is RegionType.POLYGON
+    assert panel.current_region_id() == "democounty"
+    # 光看 current_region_id 不够：它只是控制器里的字段。下拉本身也得对上，
+    # 否则用户看到的是"市级"，而实际下载按县级算 —— 界面与行为不一致。
+    # itemData 存的是整条 RegionPreset（不只是 id），所以取 .id 比。
+    assert panel.county_combo.currentData().id == "democounty"
+    assert panel.city_combo.currentData().id == "rivertown"
+
+
+def test_county_survives_a_save_restore_cycle(
+    county_window_factory, preferences
+) -> None:
+    """真实的"关窗 → 重开"两段式：第二段必须还原到同一个县。"""
+    first = county_window_factory()
+    first.download_panel.set_region_id("democounty")
+    first._save_preferences()
+
+    second = county_window_factory().download_panel
+    assert second.current_region_id() == "democounty"
+
+
+def test_switching_to_a_city_clears_the_stale_county(
+    county_window_factory, preferences
+) -> None:
+    """从县改选到市：落盘的县 id 必须**被清掉**。
+
+    留着的话下次打开会直接落回那个县 —— 界面上明明是市，下的却是县。
+    与"不限定省要清掉上次的省"是同一条规矩。
+    """
+    window = county_window_factory()
+    window.download_panel.set_region_id("democounty")
+    window._save_preferences()
+    assert preferences.region_selection.county_id == "democounty"
+
+    window.download_panel.set_region_id("rivertown")
+    window._save_preferences()
+
+    stored = preferences.region_selection
+    assert stored.city_id == "rivertown"
+    assert stored.county_id is None
+
+
+def test_unknown_county_falls_back_to_the_city(
+    county_window_factory, preferences
+) -> None:
+    """县从目录里消失了：退回**市**，并明确告警（范围变大了）。
+
+    这里最容易写错的是"退回矩形"：那会把用户上次数小时的配置整个扔掉。
+    逐级回退的每一步都放大范围，所以必须留下痕迹 —— 静默放大是最糟的结果。
+    """
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="demoland",
+            province_id="northland",
+            city_id="rivertown",
+            county_id="atlantis",
+        )
+    )
+
+    window = county_window_factory()
+    panel = window.download_panel
+
+    assert panel.current_region_type() is RegionType.POLYGON
+    assert panel.current_region_id() == "rivertown"
+    assert "只剩" in window.log_panel.to_text()
+
+
+def test_county_zoom_recommendation_matches_the_level(
+    county_window_factory, preferences
+) -> None:
+    """县级恢复后推荐区间必须按**县**算（Z14~18），不是按市（Z12~16）。
+
+    持久化修好了但等级没跟着走，会得到一个"选了县、Zoom 按市算"的混合体 ——
+    它比"县丢了"更难发现，因为界面上县是选中的。
+    """
+    preferences.set_region_selection(
+        RegionSelection(
+            region_type="polygon",
+            country_id="demoland",
+            province_id="northland",
+            city_id="rivertown",
+            county_id="democounty",
+        )
+    )
+
+    panel = county_window_factory().download_panel
+
+    assert panel.current_region_level() is RegionLevel.COUNTY
+    recommendation = panel.current_zoom_recommendation()
+    assert recommendation is not None
+    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 18)
+
+
+# --------------------------------------------------------------------------- #
+# 省直辖的县（直辖市下辖区 / 省直辖县级市）
+#
+# 这一组对应真实的 155 个县：它们的父级是**省**，中间没有市。
+# 界面上"城市"下拉因此只有「全部」一项 —— 正是"省下没有市"那个分支。
+# --------------------------------------------------------------------------- #
+def test_county_under_a_province_can_be_selected(county_window_factory) -> None:
+    """省下面直接挂县时，`set_region_id` 必须真的选到县。
+
+    缺陷现场（Slice 28 修）：`_fill_city_combo()` 在"省下没有城市"的分支里
+    无调 `select_city(None)`，而它会连带把 `_county_id` 清掉 ——
+    `select_region()` 刚铺好的四级被紧跟着的一行抹掉，界面上只剩"示例直辖市"。
+    整个链路**不抛异常、不报错**，只是范围悄悄从"一个区"变成"整个直辖市"。
+
+    所以这里不能只断言 `set_region_id` 返回 True（它当时也返回 True）。
+    """
+    panel = county_window_factory().download_panel
+
+    assert panel.set_region_id("directcounty")
+    assert panel.current_region_id() == "directcounty"
+    assert panel.current_region_level() is RegionLevel.COUNTY
+    # 城市下拉确实没有可选项 —— 这是这条用例的前提，不是副产品
+    assert panel.city_combo.count() == 1
+    assert panel.county_combo.currentData().id == "directcounty"
+
+
+def test_county_under_a_province_survives_restart(
+    county_window_factory, preferences
+) -> None:
+    """省直辖县的持久化：存得下、恢复得回、推荐区间按县级算。"""
+    first = county_window_factory()
+    assert first.download_panel.set_region_id("directcounty")
+    first._save_preferences()
+
+    stored = preferences.region_selection
+    assert stored.county_id == "directcounty"
+    # 中间没有市：city_id 必须是空的，不能硬塞一个不存在的市
+    assert stored.city_id is None
+    assert stored.province_id == "directland"
+
+    panel = county_window_factory().download_panel
+    assert panel.current_region_id() == "directcounty"
+    recommendation = panel.current_zoom_recommendation()
+    assert recommendation is not None
+    assert (recommendation.min_zoom, recommendation.max_zoom) == (14, 18)
