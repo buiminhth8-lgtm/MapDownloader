@@ -646,7 +646,15 @@ def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
             settings.UI_TEXT_ESTIMATED_MAP_TYPE.format(
                 map_type=describe_map_type(map_type, True)
             ),
-            f"输出文件：{build_output_path(data['output_dir'], data['map_name'])}",
+            "输出文件："
+            + str(
+                build_output_path(
+                    data["output_dir"],
+                    data["map_name"],
+                    map_type=data["map_type"],
+                    with_labels=bool(data["with_labels"]),
+                )
+            ),
         ]
     )
     assert window._status_values["tile_total"].text() == f"{expected_count:,}"
@@ -1029,7 +1037,12 @@ def _fill_small_region(
 
 def _expected_output_path(window: MainWindow) -> Path:
     data = window.download_panel.get_form_data()
-    return build_output_path(data["output_dir"], data["map_name"])
+    return build_output_path(
+        data["output_dir"],
+        data["map_name"],
+        map_type=data["map_type"],
+        with_labels=bool(data["with_labels"]),
+    )
 
 
 def _expected_tile_count(window: MainWindow) -> int:
@@ -1344,7 +1357,10 @@ def test_download_with_empty_map_name_is_auto_filled(
     assert error_dialogs == []
 
     _wait_for_download(window, qapp)
-    assert (work_dir / f"{expected_name}.mbtiles").exists()
+    path = _expected_output_path(window)
+    assert path.exists() is True
+    # 自动名只是"名称"，后缀（类型 + 注记）由命名规则统一补上
+    assert path.name == f"{expected_name}_vec_cn.mbtiles"
 
 
 def test_output_path_preview_follows_map_name(
@@ -1354,14 +1370,14 @@ def test_output_path_preview_follows_map_name(
     _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_CALCULATE].click()
     total_text = window.download_panel.result_label.text().splitlines()[0]
-    assert f"输出文件：{work_dir / 'beijing.mbtiles'}" in (
+    assert f"输出文件：{_expected_output_path(window)}" in (
         window.download_panel.result_label.text()
     )
 
     window.download_panel.map_name_edit.setText("shanghai")
 
     text = window.download_panel.result_label.text()
-    assert f"输出文件：{work_dir / 'shanghai.mbtiles'}" in text
+    assert f"输出文件：{_expected_output_path(window)}" in text
     # 瓦片数没有被重新计算（只是重绘了路径行）
     assert text.splitlines()[0] == total_text
 
@@ -1379,7 +1395,7 @@ def test_map_name_is_sanitized_into_filename(
     prepared = window._prepare_download()
 
     assert prepared is not None
-    assert prepared.output_path.name == "北京_2024_地图.mbtiles"
+    assert prepared.output_path.name == "北京_2024_地图_vec_cn.mbtiles"
     assert prepared.output_path.parent == work_dir
 
 
@@ -1624,7 +1640,7 @@ def test_closing_window_cancels_running_download(
     assert worker.isRunning() is False  # 线程已回收，不会留下孤儿
     assert window._download_worker is None
     # 取消不删除文件：磁盘上留一个可用的（不完整的）mbtiles
-    output = work_dir / "beijing.mbtiles"
+    output = _expected_output_path(window)
     assert output.exists()
     with MBTilesReader(output) as reader:
         assert reader.get_tile_count() > 0
@@ -1710,7 +1726,7 @@ def test_cancelled_download_keeps_partial_mbtiles(
     worker.cancel()
     _wait_for_download(window, qapp)
 
-    output = work_dir / "beijing.mbtiles"
+    output = _expected_output_path(window)
     assert output.exists()
     assert sorted(item.name for item in work_dir.iterdir()) == [output.name]
 
@@ -1922,7 +1938,12 @@ def _seed_existing_map(window: MainWindow, tiles: int = 3) -> Path:
     """
     data = window.download_panel.get_form_data()
     bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
-    path = build_output_path(data["output_dir"], data["map_name"])
+    path = build_output_path(
+        data["output_dir"],
+        data["map_name"],
+        map_type=data["map_type"],
+        with_labels=bool(data["with_labels"]),
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     map_type = data["map_type"]
@@ -2210,7 +2231,7 @@ def test_existing_file_restart_backs_up_then_downloads_from_scratch(
     window._restart_dialog.button(QMessageBox.StandardButton.Yes).click()
     qapp.processEvents()
 
-    backups = list(work_dir.glob("beijing.mbtiles.bak-*"))
+    backups = list(work_dir.glob(path.name + ".bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before  # 旧内容一字不差地留着
     assert "已把原文件备份为" in window.log_panel.to_text()
@@ -2495,7 +2516,7 @@ def test_exit_writes_paused_status_to_disk(
     assert reloaded[0].status is DownloadTaskStatus.PAUSED
     assert reloaded[0].completed_tiles > 0  # 已下完的部分记下来了
     # 已写入的瓦片保留在磁盘上
-    assert (work_dir / "beijing.mbtiles").exists() is True
+    assert _expected_output_path(window).exists() is True
 
 
 # --------------------------------------------------------------------------- #

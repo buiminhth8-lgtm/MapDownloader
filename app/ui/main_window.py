@@ -1069,14 +1069,23 @@ class MainWindow(QMainWindow):
         raise ValueError(message)
 
     def _resolve_output_path(self, data: dict) -> Path | None:
-        """由表单里的"输出目录 + 地图名称"得到输出文件路径。
+        """由表单里的"输出目录 + 地图名称 + 地图类型"得到输出文件路径。
 
         地图名称为空时返回 ``None``：此时输出文件还不确定，UI 显示占位提示
         （**不**替用户编一个文件名，免得实际落盘位置与预期不符）。
+
+        类型与注记是 Slice 31 起必传的（见 :func:`build_output_path`）：
+        "输出文件"那行必须显示**真正会写到的名字**，否则用户会在下载完才发现
+        影像包叫 ``_img`` 而自己以为还是原来那个 ``.mbtiles``。
         """
         if not data.get("map_name"):
             return None
-        return build_output_path(data["output_dir"], data["map_name"])
+        return build_output_path(
+            data["output_dir"],
+            data["map_name"],
+            map_type=data["map_type"],
+            with_labels=bool(data.get("with_labels")),
+        )
 
     @Slot()
     def _refresh_output_preview(self) -> None:
@@ -1546,7 +1555,12 @@ class MainWindow(QMainWindow):
                 region, geometry=self.download_panel.region_geometry
             ).estimate(min_zoom, max_zoom)
             total = estimate.selected_tiles
-            output_path = build_output_path(data["output_dir"], data["map_name"])
+            output_path = build_output_path(
+                data["output_dir"],
+                data["map_name"],
+                map_type=map_type,
+                with_labels=with_labels,
+            )
         except (ValueError, GeoJSONError) as exc:
             self._report_download_error(str(exc), dialog_title=UI_TEXT_VALIDATION_TITLE)
             return None

@@ -106,6 +106,7 @@ from app.models.map_layer import (
     MapLayerType,
     MapType,
     composition_for,
+    map_type_file_token,
 )
 
 #: Slice 9 起 :func:`sanitize_map_name` 住在 :mod:`app.models.naming`（见那里的
@@ -138,17 +139,36 @@ LayerArgument = MapLayerType | MapType
 _logger = logging.getLogger(__name__)
 
 
-def build_output_path(output_dir: str | Path, map_name: str) -> Path:
-    """由"输出目录 + 地图名称"得到 ``<目录>/<名称>.mbtiles``。
+def build_output_path(
+    output_dir: str | Path,
+    map_name: str,
+    *,
+    map_type: MapType | MapLayerType | str,
+    with_labels: bool = False,
+) -> Path:
+    """由"输出目录 + 地图名称 + 地图类型"得到 ``<目录>/<名称>_<类型>.mbtiles``。
+
+    Slice 31 起类型是**必填**的，理由是一个真实撞车：同一块地、同一段 Zoom 的
+    矢量与影像，瓦片坐标一模一样（都是 ``z/x/y``），旧命名 ``<名称>.mbtiles``
+    会让两次下载落到同一个文件上 —— 续传校验拒绝、重下把前一份备份走，用户
+    拿不到"矢量一份、影像一份"。类型进名字之后两类天然分开。
 
     Args:
         output_dir: 输出目录（不存在也没关系，写入时会自动创建）。
         map_name: 地图名称，会被 :func:`sanitize_map_name` 规整。
+        map_type: 地图类型（或底图/注记图层标识），决定后缀是 ``_vec`` / ``_img``。
+        with_labels: 是否把中文注记合成进瓦片；``True`` 时后缀再加 ``_cn``
+            —— 底图与"底图 + 注记"的内容互斥，不该共用一个文件名。
 
     Returns:
-        输出文件的完整路径。
+        输出文件的完整路径，形如 ``D:/maps/beijing_img.mbtiles``。
+
+    Raises:
+        ValueError: ``map_type`` 认不出来（宁可炸在这里，也不要悄悄退化成
+            一个可能与别的包同名、覆盖用户几个小时下载成果的路径）。
     """
-    return Path(output_dir) / f"{sanitize_map_name(map_name)}{MBTILES_FILE_SUFFIX}"
+    token = map_type_file_token(map_type, with_labels)
+    return Path(output_dir) / f"{sanitize_map_name(map_name)}_{token}{MBTILES_FILE_SUFFIX}"
 
 
 # --------------------------------------------------------------------------- #

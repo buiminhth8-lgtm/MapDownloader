@@ -40,6 +40,7 @@ __all__ = [
     "DEFAULT_LAYER_COMBO",
     "LAYER_DISPLAY_NAMES",
     "MAP_TYPE_DISPLAY_NAMES",
+    "MAP_TYPE_FILE_TOKENS",
     "MAP_TYPE_LAYERS",
     "MAP_TYPE_SHORT_NAMES",
     "MapLayerType",
@@ -47,6 +48,7 @@ __all__ = [
     "composition_for",
     "describe_map_type",
     "layers_for",
+    "map_type_file_token",
 ]
 
 
@@ -272,6 +274,47 @@ MAP_TYPE_SHORT_NAMES: dict[MapType, str] = {
     MapType.VECTOR: "矢量",
     MapType.IMAGE: "影像",
 }
+
+#: 文件名里的地图类型标记（Slice 31）。
+#:
+#: 用 ASCII 三元组而不是中文短名：输出文件最终要 ``adb push`` 到 Android 设备、
+#: 要被命令行工具和日志 grep，中文路径在那些地方只会添麻烦。
+MAP_TYPE_FILE_TOKENS: dict[MapType, str] = {
+    MapType.VECTOR: "vec",
+    MapType.IMAGE: "img",
+}
+
+
+def map_type_file_token(
+    map_type: MapType | MapLayerType | str, with_labels: bool = False
+) -> str:
+    """文件名中标识"这个包里装的是什么"的那一段（不含扩展名）。
+
+    存在的理由是一个**真实会撞车**的场景：同一块地、同一段 Zoom，矢量和影像
+    的瓦片坐标完全一样（都是 Web 墨卡托的 ``z/x/y``），文件名若只由"区域 +
+    Zoom"决定，两次下载会落到同一个 ``.mbtiles`` 上。而它们的内容互斥 ——
+    续传校验会拒绝、重下会把上一份备份走，用户想"矢量一份、影像一份"根本做不到。
+
+    ``with_labels`` 也编进名字，因为"底图"与"底图 + 中文注记"同样不可混写
+    （见 :func:`composition_for`）：内容不同的两个包不该共用一个名字。
+
+    Args:
+        map_type: 地图类型、底图/注记图层，或它们的字符串标识。
+        with_labels: 是否把中文注记合成进瓦片。
+
+    Returns:
+        ``vec`` / ``vec_cn`` / ``img`` / ``img_cn``。
+
+    Raises:
+        ValueError: 认不出来的图层标识（由 :meth:`MapType.from_layer` 抛出）。
+
+    >>> map_type_file_token(MapType.IMAGE)
+    'img'
+    >>> map_type_file_token("vec_w", True)
+    'vec_cn'
+    """
+    token = MAP_TYPE_FILE_TOKENS[MapType.from_layer(map_type)]
+    return f"{token}_cn" if with_labels else token
 
 #: 图层类型的可读名称（Slice 2 起保留：日志与连接测试里按"单个图层"展示）
 LAYER_DISPLAY_NAMES: dict[MapLayerType, str] = {

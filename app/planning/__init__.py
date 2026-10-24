@@ -78,6 +78,7 @@ from app.planning.download_plan import (
     level_sort_key,
     plan_directory,
     plan_folder_name,
+    plan_map_type,
     planned_output_paths,
 )
 
@@ -185,6 +186,7 @@ __all__ = [
     "PLAN_LEVEL_ORDER",
     "level_sort_key",
     "plan_folder_name",
+    "plan_map_type",
     "plan_directory",
     "item_file_stem",
     "item_output_path",

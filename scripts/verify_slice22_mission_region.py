@@ -253,10 +253,20 @@ def build_fixture_regions(root: Path) -> Path:
 
 
 def use_region_resources(root: Path) -> None:
-    """把行政区资源目录重定向到 ``root``（必须在建窗口之前调用）。"""
+    """把行政区资源目录重定向到 ``root``（必须在建窗口之前调用）。
+
+    两个全局都要指：Slice 26 起主窗口注入的是 ``prefer_generated=True`` 的
+    :class:`RegionService`，它走 ``effective_region_root()``、读的是
+    ``app.config.settings.REGION_DATA_ROOT``（仓库里那份真实导入数据集）。
+    开发机上导入过县级数据之后，只改 ``REGION_RESOURCE_DIR`` 等于没改 ——
+    合成夹具会被那份真数据静默绕过（本脚本的症状是"计划里只剩 china + 任务区"，
+    demandland / northland / rivertown 一个都加不进去）。
+    """
+    from app.config import settings as settings_module
     from app.geo import region as region_module
 
     region_module.REGION_RESOURCE_DIR = root
+    settings_module.REGION_DATA_ROOT = root / "no-generated-dataset"
 
 
 def write_route(path: Path) -> Path:
@@ -628,11 +638,16 @@ def scene_add_to_plan(app, window, dialog, checker: Checker, shots: bool) -> str
         "生成的任务目标张数 == 计划里的选中张数",
         str(mission_task.total_tiles) if mission_task else "没有该任务",
     )
+    # 名字由"区域 id + Zoom + 类型后缀"组成：后缀是 Slice 31 才加的，
+    # 这里只钉"前缀 + 是矢量包"，不把 _cn 这类与注记勾选耦合的部分写死。
+    file_name = mission_task.output_path.name if mission_task else ""
     checker.check(
         mission_task is not None
-        and mission_task.output_path.name == f"{mission_id}_z15_18.mbtiles",
-        "输出文件名是 <任务区id>_z15_18.mbtiles（命名与行政区同源）",
-        mission_task.output_path.name if mission_task else "",
+        and file_name.startswith(f"{mission_id}_z15_18_")
+        and "_vec" in file_name
+        and file_name.endswith(".mbtiles"),
+        "输出文件名是 <任务区id>_z15_18_<类型>.mbtiles（命名与行政区同源）",
+        file_name,
     )
     checker.check(
         [task.region_id for task in tasks]

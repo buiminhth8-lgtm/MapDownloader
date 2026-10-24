@@ -88,7 +88,10 @@ def test_one_item_generates_one_task(
     assert item.region_name in task.name
     assert item.zoom_text in task.name
     assert task.output_path == plan_service.output_paths()["northland"]
-    assert task.output_path.name == f"northland_z{item.min_zoom}_{item.max_zoom}.mbtiles"
+    assert (
+        task.output_path.name
+        == f"northland_z{item.min_zoom}_{item.max_zoom}_vec.mbtiles"
+    )
     # 与单区域下载同一条路：记录真的落盘了
     assert [row.id for row in task_service.list_tasks()] == [task.id]
 

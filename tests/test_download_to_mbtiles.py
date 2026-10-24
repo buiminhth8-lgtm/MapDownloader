@@ -40,7 +40,7 @@ from app.mbtiles import (
     MBTilesWriter,
     validate_mbtiles,
 )
-from app.models import MapLayerType
+from app.models import MapLayerType, MapType
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services.map_download_service import (
     MapDownloadService,
@@ -644,9 +644,18 @@ def test_sanitize_map_name(raw: str, expected: str) -> None:
 
 
 def test_build_output_path(work_dir: Path) -> None:
-    assert build_output_path(work_dir, "beijing") == work_dir / "beijing.mbtiles"
-    assert build_output_path(work_dir, "a/b") == work_dir / "a_b.mbtiles"
-    assert build_output_path(work_dir, "") == work_dir / "offline_map.mbtiles"
+    assert (
+        build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
+        == work_dir / "beijing_vec.mbtiles"
+    )
+    assert (
+        build_output_path(work_dir, "a/b", map_type=MapType.IMAGE)
+        == work_dir / "a_b_img.mbtiles"
+    )
+    assert (
+        build_output_path(work_dir, "", map_type=MapType.VECTOR)
+        == work_dir / "offline_map_vec.mbtiles"
+    )
 
 
 def test_service_control_methods_are_safe_without_task(work_dir: Path) -> None:

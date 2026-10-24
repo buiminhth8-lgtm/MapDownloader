@@ -169,7 +169,12 @@ def _seed_existing(window, tiles: int = 3) -> Path:
 
     data = window.download_panel.get_form_data()
     bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
-    path = build_output_path(data["output_dir"], data["map_name"])
+    path = build_output_path(
+        data["output_dir"],
+        data["map_name"],
+        map_type=data["map_type"],
+        with_labels=bool(data["with_labels"]),
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     labels = bool(data["with_labels"])
     writer = MBTilesWriter(path, batch_size=7)
@@ -484,7 +489,15 @@ def scene_d_download(app, window, checker: Checker, work_dir: Path, shots: bool)
             window._complete_dialog.close()
         _pump(app)
 
-    output = work_dir / "scene_d.mbtiles"
+    # 产物名带类型后缀（Slice 31）：别在这里手拼，用生产那个唯一的命名函数
+    from app.services import build_output_path
+
+    output = build_output_path(
+        data["output_dir"],
+        data["map_name"],
+        map_type=data["map_type"],
+        with_labels=bool(data["with_labels"]),
+    )
     checker.check(output.exists(), "磁盘上真的有产物", str(output))
     if window.task_panel.task_count:
         cells = window.task_panel.row_cells(0)

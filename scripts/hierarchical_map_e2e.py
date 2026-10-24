@@ -879,10 +879,15 @@ class Runner:
         from app.mbtiles import MBTilesReader
 
         if not self.outputs:
-            # runner 没回写路径时，按计划的产物命名规则去 output 目录找。
-            self.outputs = {
-                path.stem: path for path in sorted(self.output_dir.glob("*.mbtiles"))
-            }
+            # runner 没回写路径时，直接按**包里记着的 region_id**认领文件 ——
+            # 不再拿 ``path.stem`` 当 key：Slice 31 起文件名多了类型后缀
+            # （``<区域>_z4_10_vec``），拿它去对计划条目会一个都对不上。
+            found: dict[str, Path] = {}
+            for path in sorted(self.output_dir.glob("*.mbtiles")):
+                with MBTilesReader(path) as reader:
+                    region_id = (reader.get_metadata().get("region_id") or "").strip()
+                found[region_id or path.stem] = path
+            self.outputs = found
         ok = True
         ok &= self.check(len(self.outputs) == 4, "四个 MBTiles 都产出了",
                          f"实际 {sorted(self.outputs)}")

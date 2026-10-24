@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from app.config.settings import DEFAULT_PLAN_NAME
+from app.models import MapType
 from app.planning.download_plan import (
     PLAN_LEVEL_ORDER,
     DownloadPlan,
@@ -30,6 +31,7 @@ from app.planning.download_plan import (
     new_plan_id,
     plan_directory,
     plan_folder_name,
+    plan_map_type,
     planned_output_paths,
 )
 from app.planning.plan_store import (
@@ -363,24 +365,105 @@ def test_plan_directory_prefers_the_explicit_output_dir() -> None:
 
 
 def test_file_stem_matches_the_spec_examples() -> None:
-    """Spec §15 给的例子：``china_z4_10.mbtiles``。"""
-    assert item_file_stem(make_item("china", min_zoom=4, max_zoom=10)) == "china_z4_10"
-    assert item_file_stem(make_item("zhejiang", min_zoom=9, max_zoom=13)) == "zhejiang_z9_13"
-    assert item_file_stem(make_item("hangzhou", min_zoom=12, max_zoom=16)) == "hangzhou_z12_16"
+    """Spec §15 的例子，加上 Slice 31 的类型后缀：``china_z4_10_vec.mbtiles``。"""
+    assert (
+        item_file_stem(
+            make_item("china", min_zoom=4, max_zoom=10), map_type=MapType.VECTOR
+        )
+        == "china_z4_10_vec"
+    )
+    assert (
+        item_file_stem(
+            make_item("zhejiang", min_zoom=9, max_zoom=13), map_type=MapType.VECTOR
+        )
+        == "zhejiang_z9_13_vec"
+    )
+    assert (
+        item_file_stem(
+            make_item("hangzhou", min_zoom=12, max_zoom=16), map_type=MapType.IMAGE
+        )
+        == "hangzhou_z12_16_img"
+    )
+
+
+def test_file_stem_marks_type_and_labels() -> None:
+    """矢量与影像、底图与"底图 + 注记"共四种组合，名字两两不同（Slice 31）。"""
+    item = make_item("china", min_zoom=4, max_zoom=10)
+    names = {
+        item_file_stem(item, map_type=MapType.VECTOR),
+        item_file_stem(item, map_type=MapType.VECTOR, with_labels=True),
+        item_file_stem(item, map_type=MapType.IMAGE),
+        item_file_stem(item, map_type=MapType.IMAGE, with_labels=True),
+    }
+    assert names == {
+        "china_z4_10_vec",
+        "china_z4_10_vec_cn",
+        "china_z4_10_img",
+        "china_z4_10_img_cn",
+    }
 
 
 def test_file_stem_is_sanitized_for_windows() -> None:
-    stem = item_file_stem(make_item("a/b:c"))
-    assert stem == "a_b_c_z4_10"
+    stem = item_file_stem(make_item("a/b:c"), map_type=MapType.VECTOR)
+    assert stem == "a_b_c_z4_10_vec"
 
 
 def test_file_stem_dedupes_against_taken_names() -> None:
     """同名时安全处理（Spec §15）：**不覆盖**前一个。"""
     item = make_item("china", min_zoom=4, max_zoom=10)
-    assert item_file_stem(item, taken=["china_z4_10"]) == "china_z4_10-2"
     assert (
-        item_file_stem(item, taken=["china_z4_10", "china_z4_10-2"]) == "china_z4_10-3"
+        item_file_stem(item, map_type=MapType.VECTOR, taken=["china_z4_10_vec"])
+        == "china_z4_10_vec-2"
     )
+    assert (
+        item_file_stem(
+            item,
+            map_type=MapType.VECTOR,
+            taken=["china_z4_10_vec", "china_z4_10_vec-2"],
+        )
+        == "china_z4_10_vec-3"
+    )
+
+
+def test_vector_and_image_plans_of_the_same_name_do_not_collide() -> None:
+    """Slice 31：计划名相同、区域相同、Zoom 相同，**只有地图类型不同** → 产物分开。
+
+    真实场景：无人机基底要影像，路网要矢量，于是"同一块地建两个计划"。两个
+    计划默认都叫 ``offline_plan``，输出目录也共享 —— 旧命名（``<区域>_z4_10``）
+    会让第二个计划写进第一个计划的文件里，而两者内容互斥（续传校验会拒绝、
+    重下会把前一份备份走）。
+    """
+    vector_plan = DownloadPlan(name="offline_plan", output_dir="D:/out", map_layer="vec_w")
+    image_plan = DownloadPlan(name="offline_plan", output_dir="D:/out", map_layer="img_w")
+    for plan in (vector_plan, image_plan):
+        plan.add_item(make_item("china", selected_tiles=1, candidate_tiles=1))
+
+    vector_path = planned_output_paths(vector_plan)["china"]
+    image_path = planned_output_paths(image_plan)["china"]
+
+    # 目录相同（计划名就是目录名），但文件名必须不同
+    assert vector_path.parent == image_path.parent
+    assert vector_path.name == "china_z4_10_vec.mbtiles"
+    assert image_path.name == "china_z4_10_img.mbtiles"
+
+
+def test_plan_keeps_the_type_suffix_in_sync_with_its_labels() -> None:
+    """计划的 ``with_labels`` 也进文件名：底图与"底图 + 注记"不可混写。"""
+    plain = DownloadPlan(name="p", output_dir="D:/out", map_layer="img_w")
+    labeled = DownloadPlan(
+        name="p", output_dir="D:/out", map_layer="img_w", with_labels=True
+    )
+    for plan in (plain, labeled):
+        plan.add_item(make_item("china", selected_tiles=1, candidate_tiles=1))
+
+    assert planned_output_paths(plain)["china"].name == "china_z4_10_img.mbtiles"
+    assert planned_output_paths(labeled)["china"].name == "china_z4_10_img_cn.mbtiles"
+
+
+def test_plan_map_type_defaults_to_vector_for_legacy_plans() -> None:
+    """Slice ≤30 存下的计划没有 ``map_layer``，那时只有矢量一条链路。"""
+    assert plan_map_type(DownloadPlan(name="p")) is MapType.VECTOR
+    assert plan_map_type(DownloadPlan(name="p", map_layer="img_w")) is MapType.IMAGE
 
 
 def test_planned_output_paths_only_covers_enabled_in_order() -> None:
@@ -392,8 +475,8 @@ def test_planned_output_paths_only_covers_enabled_in_order() -> None:
 
     paths = planned_output_paths(plan)
     assert list(paths) == ["china", "hangzhou"]
-    assert paths["china"] == Path("D:/out/计划/china_z4_10.mbtiles")
-    assert paths["hangzhou"] == Path("D:/out/计划/hangzhou_z4_10.mbtiles")
+    assert paths["china"] == Path("D:/out/计划/china_z4_10_vec.mbtiles")
+    assert paths["hangzhou"] == Path("D:/out/计划/hangzhou_z4_10_vec.mbtiles")
     # 缺省输出目录时落到 DEFAULT_OUTPUT_DIR（不在这里创建任何目录）
     assert plan_directory(DownloadPlan(name="p")).name == "p"
 

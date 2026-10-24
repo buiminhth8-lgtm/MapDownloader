@@ -10,7 +10,7 @@
 > | A. 制作 | A1 – A7 | Windows |
 > | B. 传输 | B8 – B11 | Windows（`adb`） |
 > | C. 导入与使用 | C12 – C20 | Android 设备 |
-> | D. 分级体系（全国/省/市/县/任务区） | D21 – D25 | 两端都跑 |
+> | D. 分级体系（全国/省/市/县/任务区） | D21 – D27 | 两端都跑 |
 > | E. 县级专项 | E26 – E31 | 两端都跑 |
 >
 > A~C 验的是**一个矩形包**的整条链路；D 验的是**层级**（五级区域各自的 Zoom 区间
@@ -504,6 +504,24 @@ print(json.dumps(m.region.to_dict(), ensure_ascii=False))
 > `test_switching_modes_never_carries_bounds_across` 等 6 条里，
 > 真窗口版在 `scripts/verify_slice16_polygon.py` 的场景 A / B / C。
 
+### D27 ★ 同一块地的矢量与影像各存一份（Slice 31）
+
+无人机基底要影像、路网要矢量，两块**瓦片坐标完全重合**。旧命名里没有类型，
+第二个包会撞在第一个包的 `.mbtiles` 上。
+
+| 操作 | 期望 |
+| --- | --- |
+| 选一块范围，地图类型「矢量地图」，名称填 `beijing`，取消勾选中文注记 | 「输出文件」显示 `<输出目录>/beijing_vec.mbtiles` |
+| 下完，把地图类型切成「影像地图」（名称不动） | 「输出文件」**跟着变成** `beijing_img.mbtiles`；点「开始下载」**不该**弹「已有文件」 |
+| 下完影像 | 目录里同时有 `beijing_vec.mbtiles` 与 `beijing_img.mbtiles`，任务列表两条 |
+| 勾上「下载中文注记图层」再下一次影像 | 第三个文件 `beijing_img_cn.mbtiles`，前两个原样不动 |
+| 用 Inspector 分别打开三个包 | 「地图类型」分别为 `vector` / `image` / `image`；后者的合成方式是 `merged` |
+| 在任务列表里对 `beijing_vec` 那条点「继续下载」 | 续传校验通过（已有张数 = 任务张数，无新增）；**不会**因为存在 `_img` 包而报「地图类型不一致」 |
+| 建两个计划：同名 `offline_plan`，一个矢量一个影像，加同一块地 | 计划页显示的产物分别是 `offline_plan/<region>_z…_vec.mbtiles` 与 `…_img.mbtiles`，两个计划互不覆盖 |
+
+> 判据是**两个文件真的同时存在**且各自能被 Inspector 认出类型。只看到"文件名不一样"
+> 不够 —— 曾经的问题正是"第二个包把第一个挤走 / 被续传校验拒之门外"。
+
 ---
 
 ## E. 县级专项（E26 – E31）
@@ -916,6 +934,7 @@ manifest 里没有、也不打算有多边形（包体积与解析成本都不�
 | D23 计划顺序 | | 合计张数： |
 | D24 manifest.region 的 level | | 行政区 level: / 县级 level: / 任务区 level: |
 | D25 按 Zoom 选等级 | | Z7/11/13/15/17/19 → |
+| D27 矢量/影像各一份 | | 矢量 → `_vec.mbtiles` / 影像 → `_img.mbtiles` / 三个包并存： |
 | E26 县级目录可选 | | 2882 / 155 / 鼓楼区 4 条： |
 | E27 县级 manifest 与 metadata | | level= / metadata region_level= |
 | E28 等级被认出 | | logcat reason= / 状态行第一行： |
@@ -941,6 +960,7 @@ Android 运行时 ______ / 设备 ______ / Android 版本 ______
 | `scripts/verify_slice13_offline_management.py` | C18–C19（删除、多地图） |
 | `scripts/verify_slice14_offline_stability.py` | 稳定性（长时间切换、压力） |
 | `scripts/verify_slice24_auto_selection.py` | **D25 的自动化版本**：真机上的 AUTO 阶梯与迟滞 |
+| `scripts/verify_slice31_type_naming.py`（Windows） | **D27 的自动化版本**：真窗口里矢量下一遍、切影像再下一遍，断言「输出文件」跟着变、**不弹「已有文件」**、两个 `.mbtiles` 并存且各自 `metadata.map_type` 正确；再验同名两个计划（一矢量一影像）产物不互撞。20 项检查，网络走 MockTransport |
 | `scripts/verify_slice28_county_selection.py` | **E28 的日志判据 + E29 的阶梯 + E30/E31 的共存与删除回退**：真机上验"县级赢市级、让位任务区"、`reason=COUNTY_MATCH`、同名县两个目录、删当前县级包的回退。夹具自造（5 档 + 第 2 个县），跑完自删 |
 
 跑法：

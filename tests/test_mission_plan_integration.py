@@ -568,7 +568,7 @@ def test_a_mission_item_generates_one_ordinary_download_task(
     assert task.region_id == "mission-001"
     assert task.total_tiles == item.selected_tiles
     assert (task.min_zoom, task.max_zoom) == (15, 18)
-    assert task.output_path.name == "mission-001_z15_18.mbtiles"
+    assert task.output_path.name == "mission-001_z15_18_vec.mbtiles"
     assert [row.id for row in task_service.list_tasks()] == [task.id]
 
 

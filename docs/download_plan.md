@@ -99,14 +99,20 @@ DownloadTask × N        现有的任务记录模型（Slice 5），形状与单
 ### 文件命名只有一处实现
 
 ```text
-<输出目录>/<计划名>/<region_id>_z<下界>_<上界>.mbtiles
-        D:/out/计划A/demoland_z4_10.mbtiles
+<输出目录>/<计划名>/<region_id>_z<下界>_<上界>_<类型>.mbtiles
+        D:/out/计划A/demoland_z4_10_vec.mbtiles
+        D:/out/计划A/demoland_z4_10_img.mbtiles
 ```
 
 规则在 `app/planning/download_plan.py` 的 `planned_output_paths()` 里，
 界面显示、校验"是不是已经存在"、生成任务三处**共用同一个函数**。
-各写一遍的后果是：用户在界面上看到 `a_z4_10.mbtiles`，实际写进了
-`a_z4_10-2.mbtiles` —— 而那是他自己磁盘上的东西，没有比这更让人不信任的体验。
+各写一遍的后果是：用户在界面上看到 `a_z4_10_vec.mbtiles`，实际写进了
+`a_z4_10_vec-2.mbtiles` —— 而那是他自己磁盘上的东西，没有比这更让人不信任的体验。
+
+**类型后缀**（`vec` / `img`，带中文注记时再加 `_cn`）是 Slice 31 补的：
+同一区域、同一段 Zoom 的矢量与影像瓦片坐标完全重合，只按"区域 + Zoom"命名
+会让"矢量一个计划、影像一个计划"写进同一批文件。而两个计划默认都叫
+`offline_plan`（目录名也相同），这个坑是必然会踩到的。
 
 计划名会先过 `sanitize_map_name()`：Windows 非法字符（`\ / : * ? " < > |`）会被
 换成 `_`，保留名（`CON` / `LPT1`）会加后缀，空名字落到 `offline_plan`。

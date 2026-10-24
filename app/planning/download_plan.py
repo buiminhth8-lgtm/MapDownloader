@@ -62,6 +62,7 @@ from app.config.settings import (
     MBTILES_FILE_SUFFIX,
 )
 from app.geo.tile_math import format_size, validate_zoom
+from app.models.map_layer import MapLayerType, MapType, map_type_file_token
 from app.models.naming import sanitize_map_name
 from app.planning.region_level import RegionLevel
 
@@ -85,6 +86,7 @@ __all__ = [
     "new_plan_id",
     "plan_directory",
     "plan_folder_name",
+    "plan_map_type",
     "planned_output_paths",
 ]
 
@@ -595,24 +597,54 @@ def plan_directory(plan: DownloadPlan, *, output_dir: object = None) -> Path:
     return Path(str(base or DEFAULT_OUTPUT_DIR)) / plan_folder_name(plan)
 
 
-def item_file_stem(item: DownloadPlanItem, *, taken: Iterable[str] = ()) -> str:
-    """一个条目的文件名主体（不含扩展名），如 ``china_z4_10``（Spec §15）。
+def plan_map_type(plan: DownloadPlan) -> MapType:
+    """计划的地图类型（Slice 31）。
 
-    形如 ``<区域 id>_z<下界>_<上界>``：区域 id 而不是展示名，因为 id 是
+    计划里存的是**底图图层标识**（``vec_w`` / ``img_w``，见
+    :attr:`DownloadPlan.map_layer`）；空字符串是 Slice ≤30 写下的老计划，
+    那时只有矢量一条链路，所以按 :data:`MapType.VECTOR` 解读。
+
+    Raises:
+        ValueError: 存着一个认不出来的图层标识（文件被手工改过）。
+    """
+    return MapType.parse(plan.map_layer) or MapType.VECTOR
+
+
+def item_file_stem(
+    item: DownloadPlanItem,
+    *,
+    map_type: MapType | MapLayerType | str,
+    with_labels: bool = False,
+    taken: Iterable[str] = (),
+) -> str:
+    """一个条目的文件名主体（不含扩展名），如 ``china_z4_10_vec``（Spec §15）。
+
+    形如 ``<区域 id>_z<下界>_<上界>_<类型>``：区域 id 而不是展示名，因为 id 是
     稳定且跨平台的（中文名字在命令行、外部工具、日志 grep 里都更难处理），
     而"这块地下的是哪段 Zoom"必须一眼看得出来 —— 那正是同一个区域在计划里
     可能出现多次唯一的区别。
 
+    **类型后缀是 Slice 31 补上的**，理由与 :func:`build_output_path` 相同：
+    同一个区域、同一段 Zoom 的矢量与影像瓦片坐标完全重合，只靠区域 + Zoom
+    命名会让第二个计划写进第一个计划的文件 —— 而两份内容互斥（续传会被拒、
+    重下会把前一份备份走）。带上类型之后"矢量一个计划、影像一个计划"能并存。
+
     Args:
         item: 计划条目。
+        map_type: 计划的地图类型（通常传 :func:`plan_map_type` 的结果）。
+        with_labels: 计划是否把中文注记合成进瓦片（``True`` 时后缀为 ``_vec_cn``）。
         taken: 已经用掉的名字集合。命中时追加 ``-2`` / ``-3`` ……
 
     Spec §5 已经保证同一个计划里不会有两个同名条目，因此正常的计划走不到
     去重分支；留着它是为了"文件被手工编辑过"或"将来允许同一区域两种 Zoom"
     时不会静默覆盖 —— 覆盖的是用户上一次下载的成果，那是不可逆的。
+
+    Raises:
+        ValueError: ``map_type`` 认不出来。
     """
+    token = map_type_file_token(map_type, with_labels)
     stem = sanitize_map_name(
-        f"{item.region_id}_z{item.min_zoom}_{item.max_zoom}"
+        f"{item.region_id}_z{item.min_zoom}_{item.max_zoom}_{token}"
     )
     used = {str(name) for name in taken}
     if stem not in used:
@@ -635,10 +667,13 @@ def item_output_path(
     让"某一项会写到哪"这个问法不必先把整份映射算出来。
     """
     paths = planned_output_paths(plan, output_dir=output_dir)
+    fallback = item_file_stem(
+        item, map_type=plan_map_type(plan), with_labels=plan.with_labels
+    )
     return paths.get(
         item.region_id,
         plan_directory(plan, output_dir=output_dir)
-        / f"{item_file_stem(item)}{MBTILES_FILE_SUFFIX}",
+        / f"{fallback}{MBTILES_FILE_SUFFIX}",
     )
 
 
@@ -659,10 +694,13 @@ def planned_output_paths(
     去重按表格顺序累积（见 :func:`item_file_stem` 的 ``taken``）。
     """
     directory = plan_directory(plan, output_dir=output_dir)
+    map_type = plan_map_type(plan)
     paths: dict[str, Path] = {}
     taken: list[str] = []
     for item in plan.ordered_enabled_items():
-        stem = item_file_stem(item, taken=taken)
+        stem = item_file_stem(
+            item, map_type=map_type, with_labels=plan.with_labels, taken=taken
+        )
         taken.append(stem)
         paths[item.region_id] = directory / f"{stem}{MBTILES_FILE_SUFFIX}"
     return paths

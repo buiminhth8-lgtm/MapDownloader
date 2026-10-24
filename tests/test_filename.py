@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from app.config import settings
+from app.models import MapType
 from app.services import build_output_path, sanitize_map_name
 
 
@@ -132,23 +133,56 @@ def test_non_string_input_is_coerced() -> None:
 #: ``pytest-of-<user>`` 根目录会被沙箱拦在 ``PermissionError: [WinError 5]`` 上
 #: （见 conftest.py 里的说明）。
 def test_build_output_path_joins_dir_and_sanitized_name(work_dir: Path) -> None:
-    path = build_output_path(work_dir, "北京/2024")
-    assert path == work_dir / "北京_2024.mbtiles"
+    path = build_output_path(work_dir, "北京/2024", map_type=MapType.IMAGE)
+    assert path == work_dir / "北京_2024_img.mbtiles"
     assert path.parent == work_dir
 
 
 def test_build_output_path_uses_the_mbtiles_suffix(work_dir: Path) -> None:
-    assert build_output_path(work_dir, "beijing").suffix == ".mbtiles"
+    assert (
+        build_output_path(work_dir, "beijing", map_type=MapType.VECTOR).suffix
+        == ".mbtiles"
+    )
 
 
 def test_build_output_path_accepts_str_dir() -> None:
-    path = build_output_path("D:/maps", "beijing")
-    assert path == Path("D:/maps") / "beijing.mbtiles"
+    path = build_output_path("D:/maps", "beijing", map_type=MapType.VECTOR)
+    assert path == Path("D:/maps") / "beijing_vec.mbtiles"
     assert isinstance(path, Path)
+
+
+def test_build_output_path_marks_the_map_type(work_dir: Path) -> None:
+    """Slice 31：矢量与影像**不许落到同一个文件**。
+
+    同一块地、同一段 Zoom 的两类瓦片坐标完全重合（都是 ``z/x/y``），旧命名
+    只按"名称"取，于是"先下矢量再下影像"会撞在同一个 ``.mbtiles`` 上 ——
+    续传校验拒绝、重下把前一份备份走，用户拿不到两份。
+    """
+    vector = build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
+    image = build_output_path(work_dir, "beijing", map_type=MapType.IMAGE)
+    assert vector != image
+    assert vector.name == "beijing_vec.mbtiles"
+    assert image.name == "beijing_img.mbtiles"
+
+
+def test_build_output_path_marks_whether_labels_are_merged(work_dir: Path) -> None:
+    """底图与"底图 + 中文注记"同样不可混写，名字也得分开。"""
+    plain = build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
+    labeled = build_output_path(
+        work_dir, "beijing", map_type=MapType.VECTOR, with_labels=True
+    )
+    assert plain.name == "beijing_vec.mbtiles"
+    assert labeled.name == "beijing_vec_cn.mbtiles"
+
+
+def test_build_output_path_rejects_an_unknown_map_type(work_dir: Path) -> None:
+    """认不出来就炸，不猜 —— 猜错等于给别人准备好一个会覆盖同名文件的路径。"""
+    with pytest.raises(ValueError):
+        build_output_path(work_dir, "beijing", map_type="img_wrong")
 
 
 def test_build_output_path_is_stable(work_dir: Path) -> None:
     """同样的输入永远得到同样的路径——"已有文件"的确认框依赖这一点。"""
-    assert build_output_path(work_dir, "beijing") == build_output_path(
-        work_dir, "beijing"
-    )
+    assert build_output_path(
+        work_dir, "beijing", map_type=MapType.VECTOR
+    ) == build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
