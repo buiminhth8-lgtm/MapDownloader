@@ -323,6 +323,15 @@ class MapPackageValidator:
         MBTiles 不写 ``labels`` / ``composition`` 是常态，不能因此把包判死。
         """
         metadata = dict(diagnostics.metadata)
+        if metadata.get("region_type") == "coverage" or (manifest.region and manifest.region.region_type == "coverage"):
+            from app.geo.zoom_coverage import coverage_region, coverage_summary
+            try:
+                expected = coverage_summary(coverage_region(metadata.get("coverage_data", ""),
+                                                            expected_fingerprint=metadata.get("boundary_version", "")))
+                if manifest.region is None or manifest.region.region_type != "coverage" or manifest.region.coverage != expected:
+                    result.errors.append("manifest 多级覆盖规则与 MBTiles 策略不一致")
+            except ValueError as exc:
+                result.errors.append(f"多级覆盖策略损坏：{exc}")
 
         # --- 关键项 ---
         # SIM102：不合并成一条 `and`。合并后那行会变成 4 层缩进、跨行的巨型条件，

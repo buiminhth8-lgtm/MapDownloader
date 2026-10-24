@@ -583,7 +583,7 @@ def test_existing_remote_package_asks_first(work_dir: Path) -> None:
 
 
 def test_overwrite_after_confirmation(work_dir: Path) -> None:
-    """用户选了覆盖 → 删旧包再重传（Spec §24）。"""
+    """用户选了覆盖 → 校验新包后替换旧包。"""
     package = _make_package(work_dir)
     remote_dir = _remote_dir(package)
 

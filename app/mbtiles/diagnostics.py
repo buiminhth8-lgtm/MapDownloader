@@ -57,7 +57,6 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path
 
 from app.config.settings import (
@@ -746,7 +745,7 @@ def check_empty_tiles(reader: MBTilesReader, result: MBTilesDiagnosticsResult) -
 
 
 def probe_image(data: bytes) -> ImageProbe:
-    """探测一张瓦片的内容：magic bytes + Pillow 解码。
+    """探测一张瓦片的内容：magic bytes + Pillow 容器校验与像素解码。
 
     两级判断，缺一不可：
 
@@ -768,18 +767,14 @@ def probe_image(data: bytes) -> ImageProbe:
         return ImageProbe(ok=False, error="magic bytes 既不是 PNG 也不是 JPEG")
 
     try:
-        from PIL import Image  # noqa: PLC0415 - 延迟导入：下载链路不需要 Pillow
-    except ImportError:  # pragma: no cover - requirements 里已声明
+        from app.providers.image_validation import verify_tile_image
+        detected, width, height = verify_tile_image(data)
+    except ImportError:  # pragma: no cover - 独立诊断保留无 Pillow 的兼容行为
         return ImageProbe(ok=True, format=magic)
-
-    try:
-        with Image.open(BytesIO(data)) as image:
-            width, height = image.size
-            detected = image.format or magic
-            image.verify()
-    except Exception as exc:  # noqa: BLE001 - 诊断工具：任何解码异常都算"损坏"
+    except Exception as exc:  # noqa: BLE001
         return ImageProbe(ok=False, format=magic, error=_describe_probe_error(exc))
     return ImageProbe(ok=True, format=detected, width=width, height=height)
+
 
 
 #: Pillow 的异常文本 → 给用户看的一句话。
@@ -1070,6 +1065,15 @@ def _resolve_coverage_region(
     而那个包很可能是**完整**的。误报比不知道更糟 —— 用户会去重下几万张。
     """
     region_type = str(result.metadata.get("region_type") or "").strip().lower()
+    if RegionType.parse(region_type) is RegionType.COVERAGE:
+        from app.geo.zoom_coverage import coverage_region
+        try:
+            region = coverage_region(result.metadata.get("coverage_data", ""),
+                                     expected_fingerprint=result.metadata.get("boundary_version", ""))
+            return region, build_region_filter(region), ""
+        except ValueError as exc:
+            result.errors.append(f"多级覆盖策略损坏：{exc}")
+            return None, None, str(exc)
     if RegionType.parse(region_type) is RegionType.RECTANGLE:
         return None, None, ""
 
@@ -1119,20 +1123,16 @@ def _polygon_zoom_coverage(
         if region_filter.intersects_tile_xyz(z, x, y):
             present.add((x, y))
 
-    tile_range = calculate_tile_range(bounds, zoom)
     expected = 0
     actual = 0
     details: list[str] = []
-    for y in range(tile_range.min_y, tile_range.max_y + 1):
-        for x in range(tile_range.min_x, tile_range.max_x + 1):
-            if not region_filter.intersects_tile_xyz(zoom, x, y):
-                continue
-            expected += 1
-            if (x, y) in present:
-                actual += 1
-                continue
-            if len(details) < detail_limit:
-                details.append(f"{zoom}/{x}/{y}")
+    for x, y in region_filter.iter_selected_tiles(bounds, zoom):
+        expected += 1
+        if (x, y) in present:
+            actual += 1
+            continue
+        if len(details) < detail_limit:
+            details.append(f"{zoom}/{x}/{y}")
     return expected, actual, details
 
 
@@ -1226,7 +1226,7 @@ def deep_scan_tiles(
         batch_size: 每次从 SQLite 取多少行。
         progress_callback: 进度回调，收 :class:`InspectionProgress`。
         total: 总张数（进度分母）。
-        should_stop: 可选中止条件；每读完一批检查一次。用户关掉对话框时，
+        should_stop: 可选中止条件；扫描开始、每 256 张及每读完一批检查一次。用户关掉对话框时，
             一个几十万张的深度扫描不该把进程一起拖住（Spec §11 的扫描是
             分钟级操作，必须能被放弃）。
     """
@@ -1240,6 +1240,17 @@ def deep_scan_tiles(
     tiles = reader.iter_tiles(batch_size)
     try:
         for zoom, x, y_xyz, data in tiles:
+            if scanned % 256 == 0 and should_stop is not None and should_stop():
+                result.deep_scan = True
+                result.deep_scan_complete = False
+                result.deep_scanned_tiles = scanned
+                result.corrupt_tiles = corrupt
+                result.empty_tiles = max(result.empty_tiles, empty)
+                result.warnings.append(
+                    f"深度检查被中止（已扫描 {scanned:,} / {total:,} 张），"
+                    "损坏张数只是已扫描部分的结论"
+                )
+                return
             scanned += 1
             if not data:
                 empty += 1

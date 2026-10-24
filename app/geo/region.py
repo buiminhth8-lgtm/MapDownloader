@@ -118,6 +118,7 @@ class RegionType(Enum):
 
     RECTANGLE = "rectangle"
     POLYGON = "polygon"
+    COVERAGE = "coverage"
 
     @classmethod
     def parse(cls, value: object) -> RegionType:
@@ -424,6 +425,8 @@ class DownloadRegion:
     geojson_path: str | None = None
     region_level: RegionLevel = RegionLevel.CUSTOM
     buffer_meters: float | None = None
+    coverage_data: str = ""
+    coverage_path: str = ""
 
     def __post_init__(self) -> None:
         region_type = RegionType.parse(self.region_type)
@@ -433,6 +436,8 @@ class DownloadRegion:
             raise ValueError("DownloadRegion.name 不能为空")
         object.__setattr__(self, "region_level", RegionLevel.parse(self.region_level))
 
+        if region_type is RegionType.COVERAGE and not self.coverage_data:
+            raise ValueError("多级覆盖区域缺少策略快照，不能退化为矩形")
         path = (self.geojson_path or "").strip()
         if region_type is RegionType.POLYGON and not path:
             raise ValueError(
@@ -505,7 +510,7 @@ class DownloadRegion:
     @property
     def is_polygon(self) -> bool:
         """是否需要走几何过滤。"""
-        return self.region_type is RegionType.POLYGON
+        return self.region_type in (RegionType.POLYGON, RegionType.COVERAGE)
 
     @property
     def is_mission(self) -> bool:
@@ -524,6 +529,8 @@ class DownloadRegion:
 
     def describe(self) -> str:
         """一行展示文案，如 ``中国（行政区域）`` / ``自定义矩形`` / ``某航线（任务区，5.00 km）``。"""
+        if self.region_type is RegionType.COVERAGE:
+            return f"{self.name}（多级 Zoom 区域覆盖）"
         if not self.is_polygon:
             return "自定义矩形"
         if self.is_mission:
@@ -579,6 +586,8 @@ class DownloadRegion:
         **``buffer_meters`` 仍然只给任务区写**：走廊半径只对航线有意义（Spec §20）。
         """
         rows = {"region_type": self.region_type.value}
+        if self.coverage_data:
+            rows["coverage_data"] = self.coverage_data
         if self.region_id:
             rows["region_id"] = self.region_id
         if self.boundary_version:
@@ -717,6 +726,9 @@ def region_from_task(task: object) -> DownloadRegion | None:
     bounds = GeoBounds(west=west, south=south, east=east, north=north)
 
     region_type = RegionType.parse(getattr(task, "region_type", ""))
+    if region_type is RegionType.COVERAGE:
+        from app.geo.zoom_coverage import coverage_from_task
+        return coverage_from_task(task)
     if region_type is RegionType.RECTANGLE:
         return DownloadRegion.rectangle(str(getattr(task, "name", "") or ""), bounds)
 

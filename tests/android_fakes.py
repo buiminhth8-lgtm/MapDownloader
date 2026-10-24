@@ -435,6 +435,20 @@ class FakeAdbClient:
             source, target = argv[-2], argv[-1]
             if self._fail_move:
                 return fake_result(False, stderr="mv: Permission denied", error="Permission denied")
+            if source in device.dirs:
+                # 与 adb mv 一样移动整棵目录；目标必须不存在。
+                if target in device.dirs or target in device.files:
+                    return fake_result(False, error="target exists")
+                device.files = {
+                    (target + key[len(source):] if key.startswith(source + "/") else key): value
+                    for key, value in device.files.items()
+                }
+                device.dirs = {
+                    target + key[len(source):]
+                    if key == source or key.startswith(source + "/") else key
+                    for key in device.dirs
+                }
+                return fake_result()
             data = device.files.pop(source, None)
             if data is None:
                 return fake_result(

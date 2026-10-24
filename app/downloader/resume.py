@@ -47,9 +47,8 @@ from app.config.settings import (
 )
 from app.downloader.models import SkipPredicate, TileCoordinate
 
-# 复用 Slice 2 的 magic bytes 判定：判断"这是不是一张合法瓦片"的规则
-# 必须全链路一致，否则会出现"下载时判合法、续传校验时判非法"的诡异现象。
-from app.providers import is_valid_tile_response
+# 显式内容校验使用与诊断器一致的完整图片解码，不能只看文件头。
+from app.providers.image_validation import is_decodable_tile
 
 __all__ = [
     "ExistingTileIndex",
@@ -73,7 +72,7 @@ class ResumePolicy:
         enabled: ``False`` 表示完全不做跳过——每张瓦片都重新下载。
             用于"我怀疑这个库是坏的，全部重来"的场景。
         verify_existing_tile: 命中已有瓦片时，是否连内容一起校验
-            （读 BLOB + 判 magic bytes）。**默认关闭**：开启后每张已有瓦片
+            （读 BLOB + 完整解码 PNG/JPEG）。**默认关闭**：开启后每张已有瓦片
             都要读一次 BLOB，恢复一个几十万张的库会变成分钟级磁盘 IO。
         redownload_invalid_tile: 仅在 ``verify_existing_tile=True`` 时有意义。
             校验发现内容为空/损坏时，``True`` 重新下载覆盖，``False`` 沿用旧数据。
@@ -87,6 +86,11 @@ class ResumePolicy:
     def disabled(cls) -> ResumePolicy:
         """返回"不做任何跳过"的策略（全量重下）。"""
         return cls(enabled=False)
+
+    @classmethod
+    def repair(cls) -> ResumePolicy:
+        """校验已有、重下损坏与缺失瓦片，并在落盘后全量复检。"""
+        return cls(verify_existing_tile=True, redownload_invalid_tile=True)
 
     @property
     def skips_existing(self) -> bool:
@@ -306,7 +310,7 @@ class ExistingTileIndex:
         # 显式要求校验：这里才允许读 BLOB
         self.stats.blobs_read += 1
         data = self._probe.read_tile(tile.z, tile.x, tile.y)
-        if data and is_valid_tile_response(data):
+        if is_decodable_tile(data):
             return True
 
         self.stats.invalid += 1

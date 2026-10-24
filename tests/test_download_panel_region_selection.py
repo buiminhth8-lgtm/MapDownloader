@@ -467,7 +467,7 @@ def test_inverted_custom_range_shows_a_message_instead_of_raising(
 # --------------------------------------------------------------------------- #
 # 边界与计算（Spec §8 / §9）
 # --------------------------------------------------------------------------- #
-def test_polygon_estimate_uses_the_selected_tiles(window_factory) -> None:
+def test_polygon_estimate_uses_the_selected_tiles(window_factory, qapp) -> None:
     """行政区域点「计算」走的是 Slice 16 的多边形链路，且结果区写明级别。
 
     "点一下按钮"必须装配主窗口：面板自己只发信号，真正算瓦片的是 MainWindow。
@@ -476,11 +476,14 @@ def test_polygon_estimate_uses_the_selected_tiles(window_factory) -> None:
     """
     from app.ui.download_panel import ACTION_CALCULATE
 
-    panel = window_factory().download_panel
+    window = window_factory()
+    panel = window.download_panel
     panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
     panel.set_zoom_range(10, 10)
     panel.action_buttons[ACTION_CALCULATE].click()
+    from tests.test_ui_smoke import _wait_until
+    assert _wait_until(qapp, lambda: window._estimate_worker is None)
 
     text = panel.result_label.text()
     assert text.splitlines()[0] == "区域：示例河市"

@@ -383,6 +383,7 @@ class PackageDialog(QDialog):
     """
 
     #: 想写进主窗口日志区的一行，参数为 ``(文本, 级别)``
+    package_ready = Signal(str)
     log_message = Signal(str, str)
 
     def __init__(
@@ -852,6 +853,8 @@ class PackageDialog(QDialog):
         self._set_status(
             f"{UI_TEXT_PACKAGE_COMPLETE_TITLE}：{result.package_dir}", "INFO"
         )
+        if result.success and result.package_dir:
+            self.package_ready.emit(str(result.package_dir))
 
     @Slot(str)
     def _on_build_failed(self, message: str) -> None:

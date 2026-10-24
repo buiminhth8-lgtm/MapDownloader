@@ -240,8 +240,14 @@ def _region_from_metadata(metadata: dict[str, str]) -> PackageRegion | None:
     level = str(metadata.get("region_level") or "").strip().lower()
     if not (region_type or region_id or version or level):
         return None
+    coverage = None
+    if region_type == "coverage":
+        from app.geo.zoom_coverage import coverage_region, coverage_summary
+        coverage = coverage_summary(coverage_region(metadata.get("coverage_data", ""),
+                                                    expected_fingerprint=version))
     return PackageRegion(
         region_type=region_type or "rectangle",
+        coverage=coverage,
         region_id=region_id or None,
         boundary_version=version or None,
         level=level or None,

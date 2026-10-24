@@ -84,6 +84,7 @@ from app.downloader.models import (
     TileDownloadResult,
     TileFailureKind,
 )
+from app.downloader.rate_limiter import RateLimitExceeded
 from app.downloader.tile_downloader import TileDownloader
 from app.geo import GeoBounds, calculate_tile_ranges
 from app.models.map_layer import MapLayerType, MapType
@@ -265,6 +266,7 @@ class DownloadManager:
         self._logged_failures = 0
         self._paused = False
         self._cancelled = False
+        self._stop_reason = ""
         self._running = False
         #: 本次 download() 传入的进度回调，供 worker 在 _record 里复用
         self._progress_callback: ProgressCallback | None = None
@@ -457,6 +459,9 @@ class DownloadManager:
         self._reset_state(total)
         self._loop = asyncio.get_running_loop()
         self._running = True
+        control = getattr(self._downloader, "set_request_control", None)
+        if control is not None:
+            control(self._gate, self._cancel_event)
         try:
             return await self._run(
                 bounds,
@@ -473,6 +478,8 @@ class DownloadManager:
         finally:
             # 无论正常结束、取消还是异常，都必须把运行时状态清干净，
             # 否则下一次 download() 会被 is_running 误判为"还在跑"。
+            if control is not None:
+                control(None, None)
             self._running = False
             self._loop = None
             self._task = None
@@ -521,7 +528,11 @@ class DownloadManager:
         producer = asyncio.create_task(
             self._produce(
                 queue,
-                iter_tile_coordinates(bounds, min_zoom, max_zoom),
+                (TileCoordinate(z, x, y)
+                 for z in range(min_zoom, max_zoom + 1)
+                 for x, y in region_filter.iter_candidate_tiles(bounds, z))
+                if region_filter is not None and hasattr(region_filter, "iter_candidate_tiles")
+                else iter_tile_coordinates(bounds, min_zoom, max_zoom),
                 should_skip_tile,
                 region_filter,
             ),
@@ -581,7 +592,10 @@ class DownloadManager:
         gate = self._gate
         cancel_event = self._cancel_event
 
-        for tile in tiles:
+        for tile_index, tile in enumerate(tiles):
+            # 连续跳过已有瓦片时没有 HTTP await；让线程安全的取消指令得到执行。
+            if tile_index % 256 == 0:
+                await asyncio.sleep(0)
             if cancel_event.is_set():
                 return
             # 暂停时停在这里：不生产新任务，队列里的残留项仍会被 worker 消费完。
@@ -660,6 +674,16 @@ class DownloadManager:
 
             try:
                 result = await self._downloader.download_tile(tile, layer)
+            except RateLimitExceeded as exc:
+                self._stop_reason = str(exc)
+                cancel_event.set()
+                gate.set()
+                self._logger.warning(self._stop_reason)
+                continue
+            except asyncio.CancelledError:
+                if cancel_event.is_set():
+                    continue
+                raise
             except Exception as exc:  # noqa: BLE001 - 单张瓦片的问题不能掀翻整个任务
                 result = TileDownloadResult(
                     tile=tile,
@@ -793,6 +817,7 @@ class DownloadManager:
         self._logged_failures = 0
         self._paused = False
         self._cancelled = False
+        self._stop_reason = ""
         self._progress_callback = None
 
     def _finalize_unprocessed(self) -> None:
@@ -806,7 +831,7 @@ class DownloadManager:
 
         混在一起会让"续传了 6 万张"和"取消了剩 6 万张"在界面上长得一模一样。
         """
-        if not self._cancelled:
+        if not self._cancelled and not self._stop_reason:
             self._counters.unprocessed = 0
             return
         self._counters.unprocessed = max(
@@ -828,12 +853,15 @@ class DownloadManager:
             duration_seconds=duration,
             average_tiles_per_second=(completed / duration) if duration > 0 else 0.0,
             cancelled=cancelled,
+            stop_reason=self._stop_reason,
             failures_by_reason=dict(counters.failure_reasons),
         )
 
     def _log_summary(self, summary: DownloadSummary) -> None:
         """按 Spec 要求的格式输出收尾日志，并附上失败原因（若失败）。"""
-        if summary.cancelled:
+        if summary.stop_reason:
+            self._logger.warning("Download stopped: %s; unprocessed=%d", summary.stop_reason, summary.unprocessed)
+        elif summary.cancelled:
             self._logger.info(
                 "Download cancelled success=%d failed=%d skipped=%d unprocessed=%d "
                 "duration=%.2fs",

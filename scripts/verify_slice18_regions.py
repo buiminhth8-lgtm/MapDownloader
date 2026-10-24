@@ -40,6 +40,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.verification_helpers import tracked_region_boundaries, wait_for_region_estimate  # noqa: E402
+
 DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 当前 ``QApplication``（截图前要空转事件循环让布局收敛）
@@ -220,6 +222,9 @@ def use_region_resources(root: Path) -> None:
     from app.geo import region as region_module
 
     region_module.REGION_RESOURCE_DIR = root
+    from app.config import settings as verification_settings
+    verification_settings.REGION_DATA_ROOT = root / "_unpublished_generated"
+
 
 
 # --------------------------------------------------------------------------- #
@@ -265,13 +270,10 @@ def scene_shipped_catalog(checker: Checker) -> None:
     )
 
     # --- 静态约定 2：仓库不带任何边界数据 ---
-    geojson_files = sorted(
-        path.relative_to(PROJECT_ROOT).as_posix()
-        for path in REGION_RESOURCE_DIR.rglob("*.geojson")
-    )
+    geojson_files = tracked_region_boundaries(PROJECT_ROOT)
     checker.check(
         geojson_files == [],
-        "仓库里一个内置边界文件都没有（法定地图内容须用授权数据，Spec §3）",
+        "Git 分发内容不含边界文件（不检查用户已导入的数据）",
         str(geojson_files[:3]),
     )
 
@@ -291,8 +293,14 @@ def scene_shipped_catalog(checker: Checker) -> None:
         "仓库那份目录快速校验通过（缺边界文件只算提醒）",
         " / ".join(item.describe() for item in result.errors[:2]),
     )
+    # 缺数据语义用独立空目录验证，不能假定用户本机没部署边界。
+    with tempfile.TemporaryDirectory(prefix="verify-missing-boundaries-") as raw:
+        missing_root = Path(raw)
+        shutil.copyfile(index_path, missing_root / REGION_INDEX_FILENAME)
+        missing = catalog_validate(RegionCatalog.load(root=missing_root))
     checker.check(
-        result.count(CatalogIssueCode.GEOJSON_NOT_FOUND) >= 1,
+        missing.ok and missing.count(CatalogIssueCode.GEOJSON_NOT_FOUND) >= 1
+        and not any(issue.is_error for issue in missing.issues),
         "缺边界文件报的是「提醒」而不是「错误」（部署状态，Spec §13）",
         " / ".join(item.as_line() for item in result.issues[:2]),
     )
@@ -711,7 +719,7 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     expected_city = f"推荐 Zoom：{ZoomStrategyService().recommend(RegionLevel.CITY).range_text}"
     checker.check(
         city_line == [expected_city],
-        "市级建议区间 Z12~16 来自策略层",
+        "市级建议区间 Z12~15 来自策略层",
         repr(city_line),
     )
 
@@ -737,7 +745,7 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     panel.set_zoom_range(8, 17)
     _pump(app)
     checker.check(
-        "城市级" in panel.zoom_policy_text and "Z12~16" in panel.zoom_policy_text,
+        "城市级" in panel.zoom_policy_text and "Z12~15" in panel.zoom_policy_text,
         "自定义 8~17 对市级区域产生「城市级」警告（等级来自目录）",
         panel.zoom_policy_text.replace("\n", " / "),
     )
@@ -746,11 +754,11 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
         "只警告、不改用户输入（自定义模式下的 Zoom 原样保留）",
         panel.zoom_range_text(),
     )
-    panel.set_zoom_range(12, 16)
+    panel.set_zoom_range(12, 15)
     _pump(app)
     checker.check(
         "警告" not in panel.zoom_policy_text,
-        "收到 Z12~16 后警告消失（非阻塞，自己会收）",
+        "收到 Z12~15 后警告消失（非阻塞，自己会收）",
         panel.zoom_policy_text.replace("\n", " / "),
     )
     _shot(window, "slice18_regions_city_zoom.png", shots)
@@ -767,6 +775,7 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     panel.set_zoom_range(10, 10)
     _pump(app)
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app, 20)
     text = panel.result_label.text()
     checker.check(
@@ -901,6 +910,8 @@ def scene_static_guards(checker: Checker) -> None:
     level_names = {item.name for item in ADMINISTRATIVE_LEVELS}
     offenders: list[str] = []
     for path in sorted((PROJECT_ROOT / "app" / "regions").rglob("*.py")):
+        if "importer" in path.relative_to(PROJECT_ROOT / "app" / "regions").parts:
+            continue  # 导入器需要校验全国/省/市/县的合法父级关系，不是 Zoom 策略。
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
@@ -911,7 +922,7 @@ def scene_static_guards(checker: Checker) -> None:
                 offenders.append(f"{path.relative_to(PROJECT_ROOT).as_posix()}:{node.attr}")
     checker.check(
         offenders == [],
-        "app/regions 里没有硬编码的行政区等级（等级规则只在规划层，Spec §6）",
+        "目录读取层没有硬编码的行政区策略等级（导入器层级校验除外）",
         str(offenders),
     )
 
@@ -951,8 +962,8 @@ def scene_manual_checklist(checker: Checker) -> None:
         ("8. 校验分快速 / 深度", "场景 E：bounds_mismatch 只在深度模式出现"),
         ("9. Zoom 建议按等级来自策略层", "场景 F：界面首行 == 策略服务输出"),
         ("10. 目录不可用时兜底不崩", "场景 G：catalog_error 有值且中国还在"),
-        ("11. 仓库不含内置边界数据", "场景 A：*.geojson 数量为 0"),
-        ("12. 未提前实现 Slice 20", "场景 H：app/regions 无等级字面量、无下载计划"),
+        ("11. 仓库不含内置边界数据", "场景 A：Git 分发内容不含边界，允许本机已部署授权数据"),
+        ("12. 目录读取与调度层保持职责边界", "场景 H：目录不复制 Zoom 策略或实现计划调度"),
     ]
     for title, coverage in steps:
         checker.check(True, title, coverage)

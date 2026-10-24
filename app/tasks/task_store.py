@@ -84,6 +84,7 @@ _TASK_FIELDS: tuple[str, ...] = (
     "region_type",
     "region_id",
     "boundary_version",
+    "coverage_path",
     "west",
     "south",
     "east",
@@ -130,6 +131,7 @@ def task_to_payload(task: DownloadTask) -> dict[str, Any]:
         "region_type": str(getattr(task, "region_type", "") or ""),
         "region_id": str(getattr(task, "region_id", "") or ""),
         "boundary_version": str(getattr(task, "boundary_version", "") or ""),
+        **({"coverage_path": str(task.coverage_path)} if task.coverage_path else {}),
         "west": float(task.west),
         "south": float(task.south),
         "east": float(task.east),
@@ -186,6 +188,7 @@ def task_from_payload(payload: dict[str, Any]) -> DownloadTask:
     task.region_type = str(payload.get("region_type") or "").strip().lower()
     task.region_id = str(payload.get("region_id") or "").strip()
     task.boundary_version = str(payload.get("boundary_version") or "").strip()
+    task.coverage_path = str(payload.get("coverage_path") or "").strip()
 
     task.west = _as_float(payload.get("west"), "west", task_id)
     task.south = _as_float(payload.get("south"), "south", task_id)

@@ -92,8 +92,18 @@ def error_dialogs(monkeypatch, window: MainWindow) -> list[tuple[str, str]]:
 
 
 def _flush(qapp, rounds: int = 4) -> None:
+    import time
+
+    from app.ui.storage_budget_dialog import StorageBudgetDialog
+
     for _ in range(rounds):
         qapp.processEvents()
+    deadline = time.monotonic() + 5
+    while any(isinstance(w, StorageBudgetDialog) and w.is_running for w in qapp.topLevelWidgets()):
+        assert time.monotonic() < deadline, "容量预测没有及时结束"
+        qapp.processEvents()
+        time.sleep(0.002)
+    qapp.processEvents()
 
 
 def _fill_small_rectangle(window: MainWindow, work_dir: Path) -> None:
@@ -533,6 +543,9 @@ def test_a_real_strict_policy_reaches_the_strong_confirmation(
 
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
+    # Slice 37 的容量校准在后台先完成，再进入风险强确认。
+    from tests.test_storage_budget_ui import until
+    until(qapp, lambda: window._dangerous_dialog is not None)
 
     assert isinstance(window._dangerous_dialog, DangerousTaskConfirmDialog)
     assert window._dangerous_dialog.report.level is RiskLevel.DANGEROUS

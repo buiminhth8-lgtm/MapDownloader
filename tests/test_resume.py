@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from app.config import settings
 from app.downloader import (
@@ -29,10 +31,11 @@ from app.downloader import (
     describe_existing_tiles,
     make_skip_predicate,
 )
-from app.providers import PNG_SIGNATURE
 
-#: 一张合法的"瓦片"（只要 magic bytes 对就算合法）
-VALID_TILE = PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + b"payload" * 16
+#: 完整校验需要真正可解码的图片。
+_buffer = BytesIO()
+Image.new("RGB", (16, 16), (20, 30, 40)).save(_buffer, format="PNG")
+VALID_TILE = _buffer.getvalue()
 
 #: 一张损坏的"瓦片"（HTML 错误页）
 BROKEN_TILE = b"<html><body>404</body></html>"

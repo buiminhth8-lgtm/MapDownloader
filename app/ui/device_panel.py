@@ -174,6 +174,7 @@ class DevicePanel(QWidget):
     #: 用户点击 [验证地图包]
     validate_requested = Signal()
     #: 用户点击 [选择地图包]
+    choose_package_directory_requested = Signal()
     choose_package_requested = Signal()
     #: 下拉框换了设备（携带序列号；没有设备时是空串）
     device_changed = Signal(str)
@@ -256,6 +257,11 @@ class DevicePanel(QWidget):
         apply_secondary_text(self._package_status)
 
         self._choose_package_button = QPushButton(UI_TEXT_DEVICE_BUTTON_CHOOSE_PACKAGE, self)
+        self.choose_package_directory_button = QPushButton("选择包目录", self)
+        self.choose_package_directory_button.clicked.connect(
+            self.choose_package_directory_requested.emit
+        )
+        self._choose_package_button.setToolTip("选择已下载的 .mbtiles，或成品包内的 manifest.json")
         self._validate_button = QPushButton(UI_TEXT_DEVICE_BUTTON_VALIDATE, self)
 
         self._remote_label = WrappingLabel(_remote_line(""), self)
@@ -267,6 +273,7 @@ class DevicePanel(QWidget):
         button_row = QHBoxLayout()
         button_row.addStretch(1)
         button_row.addWidget(self._choose_package_button)
+        button_row.addWidget(self.choose_package_directory_button)
         button_row.addWidget(self._validate_button)
 
         layout = QVBoxLayout()
@@ -639,6 +646,7 @@ class DevicePanel(QWidget):
         # 装配时 ``_adb_available`` 是 ``False``，按钮就永远是灰的。
         self._refresh_button.setEnabled(not self._busy)
         self._choose_package_button.setEnabled(not self._busy)
+        self.choose_package_directory_button.setEnabled(not self._busy)
         self._validate_button.setEnabled(bool(self._package_dir) and not self._busy)
         self._transfer_button.setEnabled(ready and bool(self._package_dir) and not self._busy)
         self._cancel_button.setEnabled(self._cancellable)

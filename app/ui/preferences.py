@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 
@@ -60,6 +61,7 @@ _KEY_CITY_ID = f"{_DOWNLOAD_GROUP}/city_id"
 _KEY_COUNTY_ID = f"{_DOWNLOAD_GROUP}/county_id"
 _KEY_ZOOM_MODE = f"{_DOWNLOAD_GROUP}/zoom_mode"
 _KEY_GEOMETRY = f"{_WINDOW_GROUP}/geometry"
+_KEY_STORAGE_BUDGET = f"{_DOWNLOAD_GROUP}/storage_budget"
 
 #: Slice ≤18 用的键名。**只读不写**（Slice 19，Spec §14 把"用户的 Zoom"
 #: 明确成了 ``custom_*``）。留着这一对是为了让老配置里的缩放区间不至于
@@ -80,6 +82,7 @@ _MANAGED_KEYS: tuple[str, ...] = (
     _KEY_COUNTY_ID,
     _KEY_ZOOM_MODE,
     _KEY_GEOMETRY,
+    _KEY_STORAGE_BUDGET,
 )
 
 #: 只需要**读**（清理与迁移时要一并处理，但不该被当成"我们写的键"）
@@ -164,6 +167,19 @@ class UiPreferences:
             if self._settings.contains(key):
                 keys.add(key)
         return tuple(sorted(keys))
+
+    @property
+    def storage_budget(self):
+        from app.planning.storage_budget import BudgetSettings
+        try:
+            raw = self._read_text(_KEY_STORAGE_BUDGET)
+            return BudgetSettings(**json.loads(raw)) if raw else BudgetSettings()
+        except (ValueError, TypeError):
+            return BudgetSettings()
+
+    def set_storage_budget(self, value):
+        from dataclasses import asdict
+        self._write_text(_KEY_STORAGE_BUDGET, json.dumps(asdict(value)))
 
     # ------------------------------------------------------------------ #
     # 下载配置

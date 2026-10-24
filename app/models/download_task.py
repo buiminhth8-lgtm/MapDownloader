@@ -163,6 +163,7 @@ class DownloadTask:
     #: 塞进 ``tasks.json`` 会让每次进度落盘都变成一次大写入。恢复时按
     #: ``region_id`` 回到预设表找边界文件即可。
     boundary_version: str = ""
+    coverage_path: str = ""
 
     #: 进度计数器（Slice 5 起是持久化的权威来源，Spec §7）
     total_tiles: int = 0

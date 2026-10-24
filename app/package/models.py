@@ -148,6 +148,7 @@ MANIFEST_REGION_FIELDS: tuple[str, ...] = (
     "level",
     "bufferMeters",
     "geometryVersion",
+    "coverage",
 )
 
 #: ``bounds`` 子对象的字段顺序（west, south, east, north —— 与 MBTiles 的
@@ -221,6 +222,7 @@ class PackageRegion:
     level: str | None = None
     buffer_meters: float | None = None
     geometry_version: str | None = None
+    coverage: dict | None = None
 
     def __post_init__(self) -> None:
         # 空串 / 空白都落回 rectangle：连 ``{"region": {}}`` 这种残缺写法
@@ -257,6 +259,10 @@ class PackageRegion:
         老包（Slice ≤21）里 ``level`` 不会出现，读到时按"没有等级信息"处理。
         """
         data: dict[str, Any] = {"type": self.region_type}
+        if self.coverage is not None:
+            if not isinstance(self.coverage, dict):
+                raise ManifestError("manifest.region.coverage 必须是对象")
+            data["coverage"] = self.coverage
         if self.region_id:
             data["id"] = self.region_id
         if self.boundary_version:
@@ -287,6 +293,7 @@ class PackageRegion:
             level=data.get("level"),
             buffer_meters=data.get("bufferMeters"),
             geometry_version=data.get("geometryVersion"),
+            coverage=data.get("coverage"),
         )
 
     @classmethod

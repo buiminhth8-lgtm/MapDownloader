@@ -41,6 +41,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 from app.android.adb_client import ERROR_CANCELLED, ERROR_DEVICE_DISCONNECTED, AdbClient
 from app.android.device_manager import DeviceManager
@@ -78,7 +79,6 @@ from app.config.settings import (
     TRANSFER_ERROR_PACKAGE_DIR_MISSING,
     TRANSFER_ERROR_PUSH_MANIFEST,
     TRANSFER_ERROR_PUSH_MBTILES,
-    TRANSFER_ERROR_REMOTE_DELETE,
     TRANSFER_ERROR_REMOTE_ROOT,
     TRANSFER_ERROR_RENAME,
     TRANSFER_ERROR_SHA256_MISMATCH,
@@ -444,30 +444,91 @@ class MapPackageTransfer:
         if not self._ensure_device_ready(serial, result):
             return
 
-        # ---- 2b. 远端已有同名包？（Spec §24）---------------------------
-        if self.remote_has_package(serial, remote_dir):
-            if not overwrite:
-                result.needs_confirmation = True
-                result.confirmation_reason = "remote_exists"
-                return
-            removed = self._client.remove(serial, remote_dir)
-            if not removed.success:
-                result.errors.append(
-                    TRANSFER_ERROR_REMOTE_DELETE.format(
-                        remote=remote_dir, error=removed.error or "unknown"
-                    )
-                )
-                return
-            result.overwritten = True
-
-        # ---- 2c. 清理上次残留的 .part（Spec §20 / §35）-----------------
-        self._cleanup_stale_parts(serial, remote_dir, mbtiles_size, result)
-
-        # ---- 3. 空间（Spec §17）---------------------------------------
+        # 旧包保持可用，先确认覆盖并检查额外空间，再上传到独立暂存目录。
+        replacing = self.remote_has_package(serial, remote_dir)
+        if replacing and not overwrite:
+            result.needs_confirmation = True
+            result.confirmation_reason = "remote_exists"
+            return
         reporter.stage_start("space", message="正在检查设备存储空间…")
         if not self._check_space(serial, remote_root, total_bytes, result):
             return
+        if cancel_event is not None and cancel_event.is_set():
+            result.cancelled = True
+            result.errors.append(TRANSFER_ERROR_CANCELLED)
+            return
 
+        upload_dir = remote_dir
+        backup_dir = ""
+        if replacing:
+            nonce = uuid4().hex
+            safe_id = remote_dir.rsplit("/", 1)[-1]
+            upload_dir = f"{remote_root.rstrip('/')}/.{safe_id}.upload-{nonce}"
+            backup_dir = f"{remote_root.rstrip('/')}/.{safe_id}.backup-{nonce}"
+        else:
+            self._cleanup_stale_parts(serial, remote_dir, mbtiles_size, result)
+        try:
+            self._upload_package(
+                serial,
+                upload_dir,
+                manifest,
+                mbtiles_path,
+                manifest_path,
+                mbtiles_size,
+                manifest_size,
+                reporter,
+                cancel_event,
+                result,
+            )
+            if not result.success:
+                return
+            result.success = False
+            if cancel_event is not None and cancel_event.is_set():
+                result.cancelled = True
+                result.errors.append(TRANSFER_ERROR_CANCELLED)
+                return
+            if replacing:
+                reporter.stage_start("verify", message="校验通过，正在替换旧地图包…")
+                saved = self._client.move(serial, remote_dir, backup_dir)
+                if not saved.success:
+                    result.errors.append(f"无法备份旧地图包，旧包已保留：{saved.error}")
+                    return
+                published = False
+                try:
+                    moved = self._client.move(serial, upload_dir, remote_dir)
+                    if not moved.success:
+                        result.errors.append(f"替换地图包失败：{moved.error}")
+                        return
+                    published = True
+                finally:
+                    if not published:
+                        restored = self._client.move(serial, backup_dir, remote_dir)
+                        if not restored.success:
+                            result.errors.append(
+                                f"自动恢复旧包失败，旧包仍保留在 {backup_dir}：{restored.error}"
+                            )
+                result.overwritten = True
+                self._remove_quietly(serial, backup_dir, result)
+            result.success = True
+            reporter.stage_start("done", current_file=None, done=total_bytes)
+        finally:
+            if replacing:
+                self._remove_quietly(serial, upload_dir, result)
+
+    def _upload_package(
+        self,
+        serial,
+        remote_dir,
+        manifest,
+        mbtiles_path,
+        manifest_path,
+        mbtiles_size,
+        manifest_size,
+        reporter,
+        cancel_event,
+        result,
+    ) -> None:
+        """上传并验证新包；覆盖时此方法只接触暂存目录。"""
         # ---- 4. 建目录（Spec §16）-------------------------------------
         reporter.stage_start("mkdir", message="正在创建远端目录…")
         mkdir = self._client.mkdir(serial, remote_dir)
@@ -502,9 +563,7 @@ class MapPackageTransfer:
             return
         if pushed is None:
             return
-        reporter.advance(
-            0, stage_total=0, absolute_done=mbtiles_size, current_file=remote_part
-        )
+        reporter.advance(0, stage_total=0, absolute_done=mbtiles_size, current_file=remote_part)
 
         # ---- 6. 改名（Spec §20）--------------------------------------
         reporter.stage_start("rename", current_file=PACKAGE_MBTILES_FILENAME)
@@ -514,9 +573,7 @@ class MapPackageTransfer:
             return
 
         # ---- 7. push manifest.json（Spec §19：最后传）-----------------
-        reporter.stage_start(
-            "manifest", current_file=PACKAGE_MANIFEST_FILENAME, done=mbtiles_size
-        )
+        reporter.stage_start("manifest", current_file=PACKAGE_MANIFEST_FILENAME, done=mbtiles_size)
         pushed_manifest = self._push(
             serial,
             manifest_path,
@@ -531,9 +588,7 @@ class MapPackageTransfer:
         if result.cancelled:
             # manifest 是最后一步：取消时把它删掉，大文件保持已改名的完整形态。
             # 与 mbtiles 同理，取消判断要排在 ``pushed_manifest is None`` 前面。
-            self._remove_quietly(
-                serial, f"{remote_dir}/{PACKAGE_MANIFEST_FILENAME}", result
-            )
+            self._remove_quietly(serial, f"{remote_dir}/{PACKAGE_MANIFEST_FILENAME}", result)
             return
         if pushed_manifest is None:
             return
@@ -551,8 +606,7 @@ class MapPackageTransfer:
         if result.errors:
             return
 
-        reporter.stage_start("done", current_file=None, done=total_bytes)
-        result.bytes_transferred = total_bytes
+        result.bytes_transferred = mbtiles_size + manifest_size
         result.success = True
 
     # ------------------------------------------------------------------ #
@@ -847,7 +901,10 @@ class MapPackageTransfer:
         """
         removed = self._client.remove(serial, remote_path)
         if not removed.success:
-            result.warnings.append(TRANSFER_WARNING_PART_LEFT.format(path=remote_path))
+            if remote_path.endswith(".part"):
+                result.warnings.append(TRANSFER_WARNING_PART_LEFT.format(path=remote_path))
+            else:
+                result.warnings.append(f"远端临时目录或备份未能清理，请手动检查：{remote_path}")
 
 
 def _size_of(path: Path) -> int:

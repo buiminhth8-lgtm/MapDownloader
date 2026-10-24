@@ -333,7 +333,7 @@ def test_cancelling_stops_before_the_next_item(
 
     def should_cancel() -> bool:
         calls["n"] += 1
-        return calls["n"] > 1  # 第一项放行，第二项之前喊停
+        return bool(seen)  # 第一项完成后取消；同一条目内也会检查取消。
 
     with pytest.raises(PlanEstimateCancelled):
         estimator.estimate(plan, should_cancel=should_cancel, progress=seen.append)
@@ -401,7 +401,7 @@ def test_cancellation_is_checked_before_every_item(
 
     estimator.estimate(plan, should_cancel=never)
 
-    assert calls["n"] == 3
+    assert calls["n"] >= 3  # 每项开始前和候选瓦片遍历期间均检查取消。
 
 
 def test_progress_percent_handles_the_empty_case() -> None:

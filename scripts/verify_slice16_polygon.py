@@ -46,6 +46,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.verification_helpers import tracked_region_boundaries, wait_for_region_estimate  # noqa: E402
+
 DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 假 Token（**禁止**替换为真实密钥）
@@ -217,6 +219,9 @@ def use_temp_region_resources(regions_dir: Path) -> None:
 
     regions_dir.mkdir(parents=True, exist_ok=True)
     region_module.REGION_RESOURCE_DIR = regions_dir
+    from app.config import settings as verification_settings
+    verification_settings.REGION_DATA_ROOT = regions_dir / "_unpublished_generated"
+
     region_module.REGION_PRESETS = (CHINA_REGION_PRESET,)
     shutil.copyfile(SHIPPED_REGIONS_DIR / INDEX_FILENAME, regions_dir / INDEX_FILENAME)
 
@@ -303,6 +308,7 @@ def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
     )
 
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app)
 
     cached = window._last_calculation
@@ -435,6 +441,7 @@ def scene_polygon_missing_boundary(
 
     # --- 再点一次「计算」：必须给出人话错误，且仍然没有数字 ---
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app)
     failure_text = panel.result_label.text()
     checker.check("计算失败" in failure_text, "「计算」给出明确失败")
@@ -481,6 +488,7 @@ def scene_polygon_ready(app, window, checker: Checker, shots: bool) -> object:
     )
 
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app)
 
     cached = window._last_calculation
@@ -742,8 +750,8 @@ def scene_static(checker: Checker) -> None:
     regions_dir = PROJECT_ROOT / "resources" / "regions"
     shipped_boundary = regions_dir / china_relative_path()
     checker.check(
-        not shipped_boundary.exists(),
-        "仓库里**没有**内置中国国界数据（Spec §3：法定地图内容必须用授权数据）",
+        shipped_boundary.relative_to(PROJECT_ROOT).as_posix() not in tracked_region_boundaries(PROJECT_ROOT),
+        "Git 分发内容不含中国边界（本机导入数据不影响此项）",
         str(shipped_boundary),
     )
     checker.check(

@@ -208,6 +208,7 @@ from app.ui.mission_region_dialog import MissionRegionDialog
 from app.ui.package_dialog import PackageDialog, PackageValidateDialog
 from app.ui.preferences import RegionSelection, UiPreferences
 from app.ui.region_data_import_dialog import RegionDataImportDialog
+from app.ui.region_estimate_worker import RegionEstimateWorker
 from app.ui.region_selection import ZoomMode
 from app.ui.risk_details_dialog import DangerousTaskConfirmDialog, RiskDetailsDialog
 from app.ui.task_actions import UiTaskState
@@ -309,6 +310,7 @@ def _about_html() -> str:
         "<b>数据</b>：授权的行政区 GeoJSON 可导入为区域目录。"
     )
 
+
 #: 各动作对应的说明（下载相关动作在 Slice 3 已实现，Slice 4 起落盘为 MBTiles，
 #: Slice 5 起支持断点续传与任务恢复，Slice 7 起补上取消与完整的按钮状态机）
 _ACTION_HINTS: dict[str, str] = {
@@ -373,11 +375,12 @@ class _DownloadPlan:
     requests: int = 0
     region: DownloadRegion | None = None
     estimate: RegionTileEstimate | None = None
+    budget_checked: bool = False
 
     @property
     def is_polygon(self) -> bool:
         """本次是否按行政区域（多边形）裁剪。"""
-        return self.region is not None and self.region.region_type is RegionType.POLYGON
+        return self.region is not None and self.region.is_polygon
 
     @property
     def region_text(self) -> str:
@@ -462,6 +465,8 @@ class MainWindow(QMainWindow):
         self.task_service = task_service or TaskService()
         #: 界面偏好（Slice 7，Spec §22）。**不存 Token。**
         self.preferences = preferences or UiPreferences()
+        self._storage_budget_dialog = None
+        self._storage_budget_context = None
         #: Android 传输编排层（Slice 10）。界面不直接碰 adb。
         self.android_service = android_service or AndroidTransferService()
         #: 多级下载计划编排层（Slice 20，Spec §10）。**没有计划文件也能起**
@@ -505,9 +510,7 @@ class MainWindow(QMainWindow):
         #: 界面级联下拉与规划层（计划 / 续传 / Inspector）同时看到新数据，
         #: 不需要重启程序（Spec §17）。``prefer_generated`` 的语义与默认关闭
         #: 的理由见 :class:`~app.regions.service.RegionService`。
-        self.region_catalog_service = RegionService(
-            strategy=self.strategy, prefer_generated=True
-        )
+        self.region_catalog_service = RegionService(strategy=self.strategy, prefer_generated=True)
         #: Slice 26：行政区数据导入服务。发布目录默认
         #: ``resources/regions/generated/``（``settings.REGION_DATA_ROOT``），
         #: 与上面那个目录服务是"写"与"读"的两半 —— 导入窗口只认它，
@@ -531,16 +534,12 @@ class MainWindow(QMainWindow):
         )
         #: 计划执行记录（Slice 21，Spec §19）。与 ``plans.json`` 同一目录，
         #: 理由与上面那段完全一样（测试注入临时 ``tasks.json`` 时不该写进用户主目录）。
-        self.execution_store = PlanExecutionStore(
-            data_dir / PLAN_EXECUTIONS_FILE_NAME
-        )
+        self.execution_store = PlanExecutionStore(data_dir / PLAN_EXECUTIONS_FILE_NAME)
 
         # 四大面板 + 当前任务进度区
         #: 下载面板共用上面那个行政区目录服务（Slice 26）：导入发布后
         #: reload + ``reload_region_cascade()`` 两步，级联下拉立刻换数据。
-        self.download_panel = DownloadPanel(
-            self, region_service=self.region_catalog_service
-        )
+        self.download_panel = DownloadPanel(self, region_service=self.region_catalog_service)
         #: 当前任务进度面板（Slice 7，Spec §5）。
         self.task_progress = TaskProgressPanel(self)
         self.device_panel = DevicePanel(self)
@@ -556,6 +555,10 @@ class MainWindow(QMainWindow):
         self._download_worker: DownloadWorker | None = None
         #: 后台已有瓦片扫描线程（Slice 7；同一时刻最多一个）
         self._scan_worker: ExistingTileScanWorker | None = None
+        self._estimate_worker: RegionEstimateWorker | None = None
+        self._estimate_context = None
+        self._estimate_result = None
+        self._estimate_error = ""
         #: 正在进行的任务记录（用于收尾时写状态、关窗时写 PAUSED）
         self._current_task: DownloadTask | None = None
         #: 等待用户确认的下载计划（大任务确认 / 已有文件选择 / 取消，都是非模态）
@@ -580,6 +583,7 @@ class MainWindow(QMainWindow):
         #: MBTiles 检查窗口（Slice 8）。刻意**不**用 ``WA_DeleteOnClose``：
         #: 后台线程还在读瓦片时销毁它，Qt 会中止整个进程。
         self._inspector_dialog: MBTilesInspectorDialog | None = None
+        self._repair_view_path: Path | None = None
         #: Slice 9：离线地图包的两个窗口。同样由主窗口持有、**不带
         #: WA_DeleteOnClose**（打包线程跑着时销毁 QThread 会中止进程），
         #: 关掉之后再打开时复用同一个实例。
@@ -679,6 +683,10 @@ class MainWindow(QMainWindow):
         #: Slice 9：把 .mbtiles 打包成离线地图包 / 校验一个已有的包。
         #: 两个都是独立工具，因此与检查一样放在「文件」菜单里（§17 / §21），
         #: 下载任务面板上另有 [生成地图包] 按钮（选中任务时可用）。
+        self.storage_budget_action = QAction("下载容量预算与预测…", self)
+        self.storage_budget_action.triggered.connect(self.open_storage_budget)
+        file_menu.addAction(self.storage_budget_action)
+
         self.package_action = QAction(f"{UI_TEXT_PACKAGE_BUTTON}(&P)…", self)
         self.package_action.setToolTip(UI_TEXT_PACKAGE_BUTTON_HINT)
         self.package_action.triggered.connect(lambda: self.open_package_dialog())
@@ -795,12 +803,16 @@ class MainWindow(QMainWindow):
         # 这一条是**必备**的：行政区域模式下边界文件不可用时，界面上如果还留着
         # 上一个矩形算出来的张数，用户看到的就是一个"静默退化成矩形"的结论。
         self.download_panel.region_changed.connect(self._on_region_changed)
+        self.download_panel.storage_budget_button.clicked.connect(self.open_storage_budget)
         self.device_panel.refresh_requested.connect(self._on_refresh_devices)
         # Slice 10：名字沿用 Slice 0 的 import_requested，语义变成"传输到设备"
         self.device_panel.import_requested.connect(self._on_transfer_to_android)
         self.device_panel.cancel_requested.connect(self._on_cancel_transfer)
         self.device_panel.validate_requested.connect(self._on_validate_android_package)
         self.device_panel.choose_package_requested.connect(self._on_choose_android_package)
+        self.device_panel.choose_package_directory_requested.connect(
+            self._on_choose_android_package_directory
+        )
         self.device_panel.device_changed.connect(self._on_device_changed)
         # Slice 5：任务列表
         self.task_panel.resume_requested.connect(self._on_task_resume_requested)
@@ -892,6 +904,8 @@ class MainWindow(QMainWindow):
         所以这里做三件事：清缓存、清结果区、把「总瓦片」退回占位。日志留一行，
         免得用户以为界面是自己抖了一下。
         """
+        if self._estimate_worker is not None:
+            self._cancel_region_estimate()
         had_result = self._last_calculation is not None
         self._last_calculation = None
         self._last_risk = None
@@ -903,36 +917,100 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _run_tile_math(self) -> None:
-        """把当前表单交给 ``app.geo`` 计算瓦片数量与预估容量。
-
-        本方法只做"读表单 → 调 geo → 展示"，不复制任何瓦片公式。
-
-        Spec §17：行政区域模式下展示的必须是**区域内**张数（``selected``）；
-        "候选"只是给用户看的对照（"不裁剪的话会是多少"），**不参与任何下游计算**
-        —— 进度条分母、大任务阈值、容量预估全都取 ``selected``。
-        """
+        """矩形直接计算；多边形在后台精确估算。"""
+        if self.download_channel_busy():
+            return
         data = self.download_panel.get_form_data()
         try:
-            bounds = GeoBounds(
-                west=data["west"],
-                south=data["south"],
-                east=data["east"],
-                north=data["north"],
-            )
             region = self._require_region()
-            estimate = RegionTileEstimator(
-                region, geometry=self.download_panel.region_geometry
-            ).estimate(int(data["min_zoom"]), int(data["max_zoom"]))
+            if region.is_polygon:
+                self._begin_region_estimate(
+                    region,
+                    data,
+                    lambda estimate: self._show_tile_estimate(data, region.bounds, estimate),
+                    geometry=self.download_panel.region_geometry,
+                )
+                return
+            estimate = RegionTileEstimator(region).estimate(data["min_zoom"], data["max_zoom"])
         except (ValueError, GeoJSONError) as exc:
             self._report_calculation_error(str(exc))
             return
+        self._show_tile_estimate(data, region.bounds, estimate)
 
+    def _begin_region_estimate(self, region, data, on_done, *, geometry=None, check_form=True):
+        """保留表单快照；线程退出后才接续下载，避免结果与新表单混用。"""
+        worker = RegionEstimateWorker(
+            region, int(data["min_zoom"]), int(data["max_zoom"]), self, geometry=geometry
+        )
+        self._estimate_worker = worker
+        self._estimate_context = (dict(data), on_done, check_form)
+        self._estimate_result = None
+        self._estimate_error = ""
+        worker.estimated.connect(self._on_region_estimated)
+        worker.failed.connect(self._on_region_estimate_failed)
+        worker.progressed.connect(self._on_region_estimate_progress)
+        worker.finished.connect(self._on_region_estimate_finished)
+        self._refresh_action_state("正在估算区域瓦片，可取消")
+        self.statusBar().showMessage("正在后台估算区域瓦片…")
+        worker.start()
+
+    @Slot(object)
+    def _on_region_estimated(self, estimate):
+        if self.sender() is self._estimate_worker:
+            self._estimate_result = estimate
+
+    @Slot(str)
+    def _on_region_estimate_failed(self, message):
+        if self.sender() is self._estimate_worker:
+            self._estimate_error = message
+
+    @Slot(object)
+    def _on_region_estimate_progress(self, progress):
+        if self.sender() is self._estimate_worker and self._estimate_context is not None:
+            zoom, done, total = progress
+            self.statusBar().showMessage(f"正在估算 Z{zoom}：{done:,} / {total:,} 个候选瓦片")
+
+    @Slot()
+    def _on_region_estimate_finished(self):
+        worker = self.sender()
+        if worker is not self._estimate_worker:
+            if worker is not None:
+                worker.deleteLater()
+            return
+        context = self._estimate_context
+        estimate, error = self._estimate_result, self._estimate_error
+        self._estimate_worker = None
+        self._estimate_context = None
+        self._estimate_result = None
+        self._estimate_error = ""
+        self._refresh_action_state()
+        if worker is not None:
+            worker.deleteLater()
+        if context is None or worker is None or worker.cancel_requested:
+            self.statusBar().showMessage("估算已取消", 5000)
+            return
+        data, on_done, check_form = context
+        if check_form and data != self.download_panel.get_form_data():
+            self.statusBar().showMessage("参数已变更，请重新计算或开始下载", 8000)
+            return
+        if error:
+            self._report_calculation_error(error)
+        elif estimate is not None:
+            on_done(estimate)
+
+    def _cancel_region_estimate(self):
+        worker = self._estimate_worker
+        if worker is not None:
+            worker.cancel()
+            self._estimate_context = None
+            self.statusBar().showMessage("正在取消估算…")
+
+    def _show_tile_estimate(self, data, bounds, estimate):
+        """只在主线程展示完整估算结果。"""
         total = estimate.selected_tiles
         size_text = estimate.size_text
         output_path = self._resolve_output_path(data)
-        self.download_panel.set_calculation_result(
-            total, size_text, output_path, estimate=estimate
-        )
+        self.download_panel.set_calculation_result(total, size_text, output_path, estimate=estimate)
         self._last_calculation = (total, size_text, estimate)
         self._status_values["tile_total"].setText(f"{total:,}")
         # Slice 23：同一份估算立刻过一次风险分析（Spec §5 / §10）。
@@ -1337,7 +1415,28 @@ class MainWindow(QMainWindow):
         scan = self._scan_worker
         if scan is not None and scan.isRunning():
             return scan
+        estimate = self._estimate_worker
+        if estimate is not None:
+            return estimate
+        if self._plan_dialog is not None and self._plan_dialog.is_running_plan():
+            return self._plan_dialog._run_worker
         return None
+
+    def download_channel_busy(self, *, exclude_plan=False) -> bool:
+        """所有下载入口共用的闸门，确认和准备阶段也占用通道。"""
+        budget = self._storage_budget_dialog
+        if budget is not None and (budget.is_running or budget.guarding):
+            return True
+        if self._pending_plan is not None or self._estimate_worker is not None:
+            return True
+        for worker in (self._download_worker, self._scan_worker):
+            if worker is not None and worker.isRunning():
+                return True
+        return bool(
+            not exclude_plan
+            and self._plan_dialog is not None
+            and self._plan_dialog.is_running_plan()
+        )
 
     @Slot()
     def _start_download(self) -> None:
@@ -1353,7 +1452,7 @@ class MainWindow(QMainWindow):
 
         本方法不含任何瓦片公式、URL 拼接、并发或 SQLite 逻辑。
         """
-        if self._busy_worker() is not None:
+        if self.download_channel_busy():
             self.log_panel.append_log("上一次任务尚未结束，已忽略本次请求", "WARNING")
             self.statusBar().showMessage("当前有任务正在进行，无法同时开始另一个", 5000)
             return
@@ -1361,7 +1460,28 @@ class MainWindow(QMainWindow):
         # Spec §2.7：名称为空先补一个，用户才不会在"输出文件"里看到陌生文件名
         self._fill_auto_map_name()
 
-        plan = self._prepare_download()
+        data = self.download_panel.get_form_data()
+        validation = validate_form(data)
+        if not validation.ok:
+            self._report_validation_error(validation)
+            return
+        try:
+            region = self._require_region()
+        except (ValueError, GeoJSONError) as exc:
+            self._report_download_error(str(exc), dialog_title=UI_TEXT_VALIDATION_TITLE)
+            return
+        if region.is_polygon:
+            self._begin_region_estimate(
+                region,
+                data,
+                lambda estimate: self._start_prepared_download(data, estimate),
+                geometry=self.download_panel.region_geometry,
+            )
+            return
+        self._start_prepared_download(data)
+
+    def _start_prepared_download(self, data, estimate=None):
+        plan = self._prepare_download(data=data, estimate=estimate)
         if plan is None:
             return
 
@@ -1374,11 +1494,9 @@ class MainWindow(QMainWindow):
         self._continue_plan(plan)
 
     def _on_prepare_scan_done(self, plan: _DownloadPlan, scan: ExistingTileScan) -> None:
-        """"要开始下载时发现文件已存在"这条路径的扫描回调。"""
+        """ "要开始下载时发现文件已存在"这条路径的扫描回调。"""
         plan = self._apply_scan(plan, scan)
-        self.log_panel.append_log(
-            f"已有文件：{plan.output_path}（{plan.existing_tiles:,} 张瓦片）"
-        )
+        self.log_panel.append_log(f"已有文件：{plan.output_path}（{plan.existing_tiles:,} 张瓦片）")
         self._ask_existing_file(plan)
 
     def _plan_risk(self, plan: _DownloadPlan) -> DownloadRiskReport | None:
@@ -1414,7 +1532,13 @@ class MainWindow(QMainWindow):
             return None
 
     def _continue_plan(self, plan: _DownloadPlan) -> None:
-        """"已有文件"这一关过了之后：先看风险等级，再决定要不要请用户确认。
+        if not plan.budget_checked and self.preferences.storage_budget.enabled:
+            self._check_download_storage_budget(plan, proceed=self._continue_plan_after_budget)
+            return
+        self._continue_plan_after_budget(plan)
+
+    def _continue_plan_after_budget(self, plan: _DownloadPlan) -> None:
+        """ "已有文件"这一关过了之后：先看风险等级，再决定要不要请用户确认。
 
         两道闸门，**每个任务只过一道**（否则一个 20 万张的任务会被连问两次）：
 
@@ -1509,7 +1633,7 @@ class MainWindow(QMainWindow):
             requests=effective * map_type.request_count_per_tile(plan.with_labels),
         )
 
-    def _prepare_download(self) -> _DownloadPlan | None:
+    def _prepare_download(self, *, data=None, estimate=None) -> _DownloadPlan | None:
         """读表单 + 统一校验 + 算总量与输出路径 + 建任务记录。
 
         失败时统一走 :meth:`_report_validation_error` /
@@ -1526,7 +1650,7 @@ class MainWindow(QMainWindow):
         区域外被过滤掉的瓦片既不会出现在任务数里，也不会污染"失败 / 跳过"计数
         —— 用户看到的每个数字都只描述"真正要下的那批"。
         """
-        data = self.download_panel.get_form_data()
+        data = data if data is not None else self.download_panel.get_form_data()
 
         # Spec §20：一个统一的校验入口，一次报出全部问题
         validation = validate_form(data)
@@ -1551,9 +1675,10 @@ class MainWindow(QMainWindow):
             max_zoom = int(data["max_zoom"])
             # 先算总量——不能"跑起来才发现是几十万张"
             region = self._require_region()
-            estimate = RegionTileEstimator(
-                region, geometry=self.download_panel.region_geometry
-            ).estimate(min_zoom, max_zoom)
+            if estimate is None:
+                if region.is_polygon:
+                    raise ValueError("多边形任务需要先完成后台估算")
+                estimate = RegionTileEstimator(region).estimate(min_zoom, max_zoom)
             total = estimate.selected_tiles
             output_path = build_output_path(
                 data["output_dir"],
@@ -1592,9 +1717,7 @@ class MainWindow(QMainWindow):
             layer=layer,
             output_path=output_path,
             map_name=data["map_name"],
-            description=_describe_plan(
-                map_type, with_labels, min_zoom, max_zoom, bounds
-            ),
+            description=_describe_plan(map_type, with_labels, min_zoom, max_zoom, bounds),
             total=total,
             size_text=estimate.size_text,
             task=task,
@@ -1926,7 +2049,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已取消下载", 5000)
 
     def _confirm_restart(self, plan: _DownloadPlan) -> None:
-        """"重新下载"的二次确认：先告诉用户旧文件会被挪到哪儿。"""
+        """ "重新下载"的二次确认：先告诉用户旧文件会被挪到哪儿。"""
         self._pending_plan = plan
         self._refresh_action_state()
         backup = _backup_path(plan.output_path)
@@ -1953,7 +2076,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_restart_answered(self, result: int) -> None:
-        """"重新下载"二次确认的答复。"""
+        """ "重新下载"二次确认的答复。"""
         plan = self._pending_plan
         self._pending_plan = None
         self._restart_dialog = None
@@ -1990,12 +2113,15 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _launch_download(self, plan: _DownloadPlan) -> None:
+    def _launch_download(self, plan: _DownloadPlan, *, budget_checked=False) -> None:
         """各确认框都已答复后真正起线程。
 
         全新下载、复用已有文件、从任务列表恢复——三种入口在这里合流：
         差别只是"要不要传 ``resume_task`` / ``resume_policy``"。
         """
+        if not budget_checked and not plan.budget_checked and self.preferences.storage_budget.enabled:
+            self._check_download_storage_budget(plan)
+            return
         task = plan.resume_task or plan.task
         if task is None:  # pragma: no cover - 防御性分支
             self._report_download_error(
@@ -2005,6 +2131,13 @@ class MainWindow(QMainWindow):
 
         # 续传模式下服务的参数以**任务记录**为准，界面只补充 Token
         resume_task = task if plan.skips_existing else None
+
+        if plan.resume_policy is not None and plan.resume_policy.verify_existing_tile:
+            self._repair_view_path = plan.output_path
+            dialog = self._inspector_dialog
+            if dialog is not None and Path(dialog.path).resolve() == plan.output_path.resolve():
+                dialog.set_repair_running()
+            self.log_panel.append_log("校验并修复：仅下载损坏或缺失瓦片，结束后进行全量复检")
 
         self.download_panel.clear_download_result()
         self._current_task = task
@@ -2090,6 +2223,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         worker.progress_changed.connect(self._on_download_progress)
+        worker.validation_progress.connect(self._on_download_validation_progress)
         worker.completed.connect(self._on_download_finished)
         worker.failed.connect(self._on_download_failed)
         self._download_worker = worker
@@ -2138,13 +2272,14 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_download_finished(self, outcome: MapDownloadOutcome) -> None:
         """任务结束：先把任务状态落盘，再展示实测结果（Spec §15 / §16 / §17）。"""
+        self._finish_repair_view(outcome)
         self._download_worker = None
         self._pause_pending = False
         task = self._current_task
         self._current_task = None
         self._finalize_task(task, outcome)
 
-        if not outcome.cancelled:
+        if not outcome.cancelled and not outcome.summary.stop_reason:
             self.task_progress.set_percent(100)
         # 按钮与状态文案统一由状态机算：此刻没有 worker 了，选中任务的状态
         # 刚被 _finalize_task 写成终态，于是按钮正好落在矩阵里该有的那一格。
@@ -2169,7 +2304,8 @@ class MainWindow(QMainWindow):
         summary = outcome.summary
         level = "INFO" if outcome.is_success else "WARNING"
         self.log_panel.append_log(
-            f"下载完成：成功 {summary.succeeded:,} 张，失败 {summary.failed:,} 张，"
+            ("下载停止：" if summary.stop_reason else "下载完成：")
+            + f"成功 {summary.succeeded:,} 张，失败 {summary.failed:,} 张，"
             + (f"已有跳过 {summary.skipped:,} 张，" if summary.skipped else "")
             + f"入库 {outcome.tile_count:,} 张（{outcome.size_text}），"
             f"耗时 {summary.duration_seconds:.2f}s，"
@@ -2256,10 +2392,22 @@ class MainWindow(QMainWindow):
             succeeded=outcome.summary.succeeded,
             failed=outcome.summary.failed,
         ))
-        resume_button = box.addButton("继续补齐", QMessageBox.ButtonRole.ActionRole)
+        needs_repair = getattr(outcome, "repair_mode", False) or (
+            outcome.diagnostics is not None and (
+                outcome.diagnostics.corrupt_tiles > 0 or outcome.diagnostics.empty_tiles > 0
+            )
+        )
+        resume_button = box.addButton(
+            "校验并修复" if needs_repair else "继续补齐", QMessageBox.ButtonRole.ActionRole
+        )
         close_button = box.addButton(QMessageBox.StandardButton.Close)
         close_button.setText(UI_TEXT_BUTTON_CLOSE)
-        resume_button.clicked.connect(self._on_failed_dialog_resume)
+        if needs_repair:
+            resume_button.clicked.connect(
+                lambda: self._on_repair_requested(str(outcome.output_path))
+            )
+        else:
+            resume_button.clicked.connect(self._on_failed_dialog_resume)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._failed_dialog = box
         self._forget_dialog_on_destroy("_failed_dialog", box)
@@ -2287,20 +2435,333 @@ class MainWindow(QMainWindow):
             # （见该模块的模块级说明）。关掉之后再点「检查」复用同一个实例。
             dialog = MBTilesInspectorDialog(self)
             dialog.log_message.connect(self.log_panel.append_log)
+            dialog.repair_requested.connect(self._on_repair_requested)
             self._inspector_dialog = dialog
 
         target = (path or "").strip()
         if target:
             dialog.set_path(target)
 
+        if self._repair_view_path is not None and (
+            Path(dialog.path).resolve() == self._repair_view_path.resolve()
+        ):
+            dialog.set_repair_running()
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
         self.statusBar().showMessage("MBTiles 检查工具", 3000)
 
+    @Slot(str)
+    def _on_repair_requested(self, path: str) -> None:
+        if self.download_channel_busy():
+            self.statusBar().showMessage("当前有任务正在准备或下载，请结束后再修复", 8000)
+            return
+        dialog = self._inspector_dialog
+        if dialog is not None and dialog.is_running:
+            self.statusBar().showMessage("请等待当前检查结束后再修复", 8000)
+            return
+        target = Path(path).resolve()
+        tasks = [task for task in self.task_service.list_tasks()
+                 if Path(task.output_path).resolve() == target]
+        if not tasks:
+            self._report_download_error(
+                "未找到该文件的原下载任务，无法安全还原来源与下载范围。"
+                "请修复原任务输出文件；地图包内的副本应重新打包生成。",
+                dialog_title="无法修复瓦片",
+            )
+            return
+        self._on_task_resume_requested(tasks[0].id, repair=True)
+
+    def _finish_repair_view(self, outcome=None):
+        target = self._repair_view_path
+        self._repair_view_path = None
+        dialog = self._inspector_dialog
+        if target is not None and dialog is not None and Path(dialog.path).resolve() == target.resolve():
+            dialog.finish_repair(outcome.diagnostics if outcome is not None else None)
+
+    @Slot(str)
+    def _on_download_validation_progress(self, message: str):
+        if self._download_worker is not None:
+            self.task_progress.set_status(message)
+            self.statusBar().showMessage(message)
+
     # ------------------------------------------------------------------ #
     # 离线地图包（Slice 9）
     # ------------------------------------------------------------------ #
+    def _ensure_storage_budget_dialog(self):
+        from app.ui.storage_budget_dialog import StorageBudgetDialog
+        dialog = self._storage_budget_dialog
+        if dialog is None:
+            dialog = StorageBudgetDialog(self.preferences, self)
+            dialog.approved.connect(self._storage_budget_approved)
+            dialog.cancelled.connect(self._storage_budget_cancelled)
+            dialog.adjustment_requested.connect(self._storage_budget_adjusted)
+            dialog.activity_changed.connect(self._refresh_action_state)
+            dialog.report_ready.connect(self._storage_budget_reported)
+            self._storage_budget_dialog = dialog
+        return dialog
+
+    def _begin_storage_budget(self, factory, *, signature, current_signature,
+                              proceed=None, cancel=None, adjust=None, guard=False, auto_continue=True):
+        if self.download_channel_busy():
+            self.log_panel.append_log("当前有任务正在准备或下载，请结束后再预测容量", "WARNING")
+            return
+        dialog = self._ensure_storage_budget_dialog()
+        self._storage_budget_context = {
+            "signature": signature, "current": current_signature,
+            "proceed": proceed, "cancel": cancel, "adjust": adjust,
+        }
+        dialog.allow_adjust = adjust is not None
+        dialog.begin(factory, guard=guard, auto_continue=guard and auto_continue)
+        if not guard or not auto_continue:
+            dialog.show()
+
+    def _storage_budget_reported(self, report):
+        for line in report.as_lines()[:7]:
+            self.log_panel.append_log(f"容量预算 · {line}")
+
+    def _take_storage_budget_context(self):
+        context, self._storage_budget_context = self._storage_budget_context, None
+        return context
+
+    def _storage_budget_context_valid(self, context):
+        if context is None:
+            return False
+        if context["signature"] != context["current"]():
+            self.log_panel.append_log("配置已变化，容量预测已失效，请重新预测", "WARNING")
+            if context["cancel"] is not None:
+                context["cancel"]()
+            return False
+        return True
+
+    def _storage_budget_approved(self, report):
+        context = self._take_storage_budget_context()
+        if not self._storage_budget_context_valid(context):
+            return
+        if self.download_channel_busy():
+            self.log_panel.append_log("另一个任务已经取得下载通道，本次启动已取消", "WARNING")
+            if context["cancel"] is not None:
+                context["cancel"]()
+            return
+        if report.over_budget:
+            self.log_panel.append_log("用户明确选择超预算继续下载", "WARNING")
+        if context["proceed"] is not None:
+            context["proceed"](report)
+
+    def _storage_budget_cancelled(self):
+        context = self._take_storage_budget_context()
+        if context is not None and context["cancel"] is not None:
+            context["cancel"]()
+
+    def _storage_budget_adjusted(self, suggestion):
+        context = self._take_storage_budget_context()
+        if not self._storage_budget_context_valid(context):
+            return
+        if self.download_channel_busy():
+            self.log_panel.append_log("请结束当前任务后再调整下载范围", "WARNING")
+            return
+        if context["cancel"] is not None:
+            context["cancel"]()
+        if context["adjust"] is not None:
+            context["adjust"](suggestion)
+
+    def _apply_single_budget_suggestion(self, suggestion):
+        data = self.download_panel.get_form_data()
+        self.download_panel.set_zoom_range(int(data["min_zoom"]), suggestion.max_zoom)
+        # 缩减后是新任务，不改历史任务，也不向范围不一致的旧文件续写。
+        self.download_panel.set_map_name(
+            f"{data['map_name'] or 'offline_map'}_z{data['min_zoom']}_{suggestion.max_zoom}"
+        )
+        self.log_panel.append_log("已回填新的 Zoom 和地图名称，请重新计算；已有文件保持保留")
+
+    def open_storage_budget(self):
+        from app.planning.storage_budget import BudgetInput
+        if self.download_channel_busy():
+            self.log_panel.append_log("请等待当前任务结束后再预测容量", "WARNING")
+            return
+        try:
+            data = self.download_panel.get_form_data()
+            region = self._require_region()
+            path = self._resolve_output_path(data)
+            request = BudgetInput("current", data["map_name"] or "当前地图", region,
+                                  int(data["min_zoom"]), int(data["max_zoom"]), path,
+                                  data["map_type"], bool(data["with_labels"]))
+        except (ValueError, GeoJSONError) as exc:
+            self._report_calculation_error(str(exc))
+            return
+        self._begin_storage_budget(
+            lambda: (request,), signature=data,
+            current_signature=self.download_panel.get_form_data,
+            adjust=self._apply_single_budget_suggestion,
+        )
+
+    def _check_download_storage_budget(self, plan, *, proceed=None):
+        from app.planning.storage_budget import BudgetInput
+        region = plan.region or DownloadRegion.rectangle(plan.map_name, plan.bounds)
+        request = BudgetInput(
+            "current", plan.map_name, region, plan.min_zoom, plan.max_zoom, plan.output_path,
+            plan.map_type or MapType.from_layer(plan.layer), plan.with_labels,
+            plan.estimate.per_zoom if plan.estimate is not None else (), plan.skips_existing,
+        )
+        signature = self.download_panel.get_form_data()
+
+        next_step = proceed
+
+        def approved(report):
+            item = report.items[0]
+            estimate = replace(plan.estimate, estimated_size_bytes=item.final_bytes) if plan.estimate else None
+            prepared = replace(plan, size_text=format_size(item.final_bytes), estimate=estimate,
+                               budget_checked=True)
+            self.download_panel.set_calculation_result(plan.total, prepared.size_text, plan.output_path,
+                                                       estimate=estimate)
+            if next_step is None:
+                self._launch_download(prepared, budget_checked=True)
+            else:
+                next_step(prepared)
+
+        self._begin_storage_budget(
+            lambda: (request,), signature=signature,
+            current_signature=self.download_panel.get_form_data, guard=True,
+            proceed=approved, cancel=lambda: self._discard_plan(plan),
+            adjust=self._apply_single_budget_suggestion,
+        )
+
+    def start_plan_coverage(self):
+        """Preview the union of enabled plan rows, then download one immutable sparse map."""
+        from app.geo.zoom_coverage import CoverageRule, build_coverage, coverage_zoom_range
+        from app.models.map_layer import map_type_file_token
+        from app.models.naming import sanitize_map_name
+        from app.planning.download_plan import plan_directory, plan_map_type
+        from app.planning.storage_budget import BudgetInput
+        if self.download_channel_busy():
+            self.log_panel.append_log("请等待当前准备或下载结束后再生成单包覆盖", "WARNING")
+            return
+        dialog = self._plan_dialog
+        if dialog is not None and dialog.is_estimating():
+            self.log_panel.append_log("请先等待计划估算结束", "WARNING")
+            return
+        plan = self.plan_service.plan
+        if not plan.enabled_items:
+            self.log_panel.append_log("请先在下载计划中加入并启用区域", "WARNING")
+            return
+        try:
+            data = self.download_panel.get_form_data()
+            TiandituProvider(data['token'])
+            mode, labels = plan_map_type(plan), bool(plan.with_labels)
+        except ValueError as exc:
+            self._report_download_error(str(exc), dialog_title="无法生成单包覆盖")
+            return
+        entries = tuple((i.region_id, i.min_zoom, i.max_zoom) for i in plan.enabled_items)
+        name = (plan.name or 'offline_map') + ' 多级覆盖'
+        directory = plan_directory(plan)
+        stem = sanitize_map_name(plan.name or 'offline_map')
+        service = self.plan_service.region_service
+        def signature():
+            return self._plan_storage_signature(), self.download_panel.get_form_data()
+        def factory():
+            region = build_coverage(name, tuple(CoverageRule(service.get_download_region(rid), low, high)
+                                                 for rid, low, high in entries))
+            low, high = coverage_zoom_range(region)
+            path = directory / f'{stem}_coverage_{region.boundary_version[:16]}_{map_type_file_token(mode, labels)}.mbtiles'
+            return (BudgetInput('coverage', name, region, low, high, path, mode, labels),)
+        self.log_panel.append_log("单包覆盖：正在后台合并各 Zoom 区域；重叠坐标只计一次，原计划分包文件保留")
+        self._begin_storage_budget(factory, signature=signature(), current_signature=signature,
+                                   proceed=self._start_coverage_after_budget, guard=True, auto_continue=False)
+
+    def _start_coverage_after_budget(self, report):
+        from app.geo.region_estimator import ZoomRegionStats
+        from app.geo.zoom_coverage import save_coverage_snapshot
+        item = report.items[0]
+        request = item.request
+        try:
+            region = save_coverage_snapshot(request.region, request.output_path)
+            task = self.task_service.create_task(
+                name=request.name, bounds=region.bounds, min_zoom=request.min_zoom, max_zoom=request.max_zoom,
+                map_layer=request.map_type.base_layer, output_path=request.output_path,
+                total_tiles=sum(z.total for z in item.zooms), with_labels=request.with_labels, region=region,
+            )
+            total = task.total_tiles
+            estimate = RegionTileEstimate(
+                region_name=region.name, region_type=region.region_type, candidate_tiles=total,
+                selected_tiles=total, filtered_tiles=0, filtered_percent=0,
+                estimated_size_bytes=item.final_bytes,
+                per_zoom=tuple(ZoomRegionStats(z.zoom, z.total, z.total, 0) for z in item.zooms),
+            )
+            existing = sum(z.existing for z in item.zooms)
+            prepared = _DownloadPlan(
+                provider=TiandituProvider(self.download_panel.get_form_data()['token']), bounds=region.bounds,
+                min_zoom=request.min_zoom, max_zoom=request.max_zoom, layer=request.map_type.base_layer,
+                output_path=request.output_path, map_name=request.name, description=region.describe(),
+                total=total, size_text=format_size(item.final_bytes), task=task,
+                resume_policy=ResumePolicy(), resume_existing=request.output_path.is_file(),
+                existing_tiles=existing, effective_tiles=item.missing_tiles,
+                map_type=request.map_type, with_labels=request.with_labels, requests=report.requests,
+                region=region, estimate=estimate, budget_checked=True,
+            )
+        except (OSError, ValueError, TaskStoreError) as exc:
+            self._report_download_error(f"创建单包覆盖失败：{exc}", dialog_title="无法开始下载")
+            return
+        self.log_panel.append_log(f"单包覆盖目标：{total:,} 张唯一瓦片；文件 {request.output_path}")
+        self._continue_plan_after_budget(prepared)
+
+    def _plan_storage_signature(self):
+        plan = self.plan_service.plan
+        return (plan.id, plan.name, plan.output_dir, plan.map_layer, plan.with_labels,
+                tuple((i.id, i.region_id, i.min_zoom, i.max_zoom, i.enabled) for i in plan.items))
+
+    def _begin_plan_storage_budget(self, proceed=None):
+        from app.planning.download_plan import plan_map_type
+        from app.planning.storage_budget import BudgetInput
+        plan = self.plan_service.plan
+        if not plan.enabled_items:
+            self.log_panel.append_log("计划没有启用项，无法预测容量", "WARNING")
+            return
+        paths = self.plan_service.output_paths()
+        mode, labels = plan_map_type(plan), bool(plan.with_labels)
+        entries = tuple((i.region_id, i.region_name, i.min_zoom, i.max_zoom, i.per_zoom)
+                        for i in plan.enabled_items)
+        service = self.plan_service.region_service
+
+        def factory():
+            return tuple(BudgetInput(region_id, name, service.get_download_region(region_id),
+                                     low, high, paths[region_id], mode, labels, counts)
+                         for region_id, name, low, high, counts in entries)
+
+        def adjust(suggestion):
+            dialog = self._plan_dialog
+            execution = dialog._execution if dialog is not None else None
+            if execution is not None and not execution.status.is_terminal:
+                self.log_panel.append_log("计划有未结束的执行记录，请先处理该记录再修改 Zoom", "WARNING")
+                return
+            item = next((i for i in self.plan_service.plan.items if i.region_id == suggestion.item_id), None)
+            if item is not None:
+                self.plan_service.set_zoom(item.region_id, item.min_zoom, suggestion.max_zoom)
+                self._refresh_plan_dialog()
+                self.log_panel.append_log("已按所选建议调整计划，请重新估算；已有地图文件保留")
+
+        def approved(report):
+            for predicted in report.items:
+                item = next((i for i in plan.items if i.region_id == predicted.request.id), None)
+                if item is not None:
+                    item.estimated_bytes = predicted.final_bytes
+            plan.recalculate_totals()
+            self._refresh_plan_dialog()
+            proceed()
+
+        self._begin_storage_budget(
+            factory, signature=self._plan_storage_signature(), current_signature=self._plan_storage_signature,
+            proceed=approved if proceed is not None else None, adjust=adjust, guard=proceed is not None,
+        )
+
+    def open_plan_storage_budget(self):
+        self._begin_plan_storage_budget()
+
+    def check_plan_storage_budget(self, proceed):
+        if not self.preferences.storage_budget.enabled:
+            proceed()
+        else:
+            self._begin_plan_storage_budget(proceed)
+
     @Slot()
     @Slot(str)
     def open_package_dialog(self, path: str = "") -> None:
@@ -2319,11 +2780,15 @@ class MainWindow(QMainWindow):
         if dialog is None:
             dialog = PackageDialog(self)
             dialog.log_message.connect(self.log_panel.append_log)
+            dialog.package_ready.connect(self._on_android_package_ready)
             self._package_dialog = dialog
 
         target = (path or "").strip()
         if target and target != dialog.path:
-            dialog.set_source(target)
+            if dialog.is_running:
+                self.log_panel.append_log("地图包窗口正在处理文件，请等待完成后再选择其他地图", "WARNING")
+            else:
+                dialog.set_source(target)
 
         dialog.show()
         dialog.raise_()
@@ -2452,6 +2917,7 @@ class MainWindow(QMainWindow):
         已有数据已保留 / 可以继续"一次说完。这里的"继续"按钮直接指向补齐
         缺失瓦片——失败几乎总是缺了一部分瓦片。
         """
+        self._finish_repair_view()
         self._download_worker = None
         self._pause_pending = False
         self.download_panel.set_download_result_error(message)
@@ -2549,6 +3015,13 @@ class MainWindow(QMainWindow):
 
         无论如何都**不删** ``.mbtiles``：那是用户已经花掉的配额与时间。
         """
+        budget = self._storage_budget_dialog
+        if budget is not None and (budget.is_running or budget.guarding):
+            budget.reject()
+            return
+        if self._estimate_worker is not None:
+            self._cancel_region_estimate()
+            return
         worker = self._download_worker
         running = worker is not None and worker.isRunning()
         scan = self._scan_worker
@@ -2633,7 +3106,18 @@ class MainWindow(QMainWindow):
                 暂停瞬间要显示"正在暂停"而不是"已暂停"，所以留了这个出口。
         """
         download = self._download_worker
-        if download is not None and download.isRunning():
+        plan_running = self._plan_dialog is not None and self._plan_dialog.is_running_plan()
+        budget = self._storage_budget_dialog
+        if budget is not None and (budget.is_running or budget.guarding):
+            state = UiTaskState.SCANNING
+            status_text = "正在预测容量或等待预算确认，可取消"
+        elif plan_running:
+            state = UiTaskState.SCANNING
+            status_text = "计划执行中，请在下载计划窗口控制"
+        elif self._estimate_worker is not None:
+            state = UiTaskState.SCANNING
+            status_text = "正在估算区域瓦片，可取消"
+        elif download is not None and download.isRunning():
             if self._pause_pending:
                 state = UiTaskState.PAUSING
             elif download.pause_requested:
@@ -2651,7 +3135,12 @@ class MainWindow(QMainWindow):
 
         self._task_state = state
         self.download_panel.apply_task_state(state)
+        if plan_running:
+            for button in self.download_panel.action_buttons.values():
+                button.setEnabled(False)
         self.task_progress.set_status(status_text or state.display_name)
+        if self._plan_dialog is not None:
+            self._plan_dialog._apply_run_state(self._plan_dialog.execution())
 
     @Slot(str)
     def _on_task_selection_changed(self, task_id: str) -> None:
@@ -2729,7 +3218,7 @@ class MainWindow(QMainWindow):
             self.task_panel.select_task(select_id)
 
     @Slot(str)
-    def _on_task_resume_requested(self, task_id: str) -> None:
+    def _on_task_resume_requested(self, task_id: str, estimate=None, *, repair=False) -> None:
         """任务列表里的「继续」：以**任务记录**为准重建计划并启动续传。
 
         参数只来自任务记录（Spec §16）：表单里的范围 / 缩放不参与——否则用户
@@ -2739,7 +3228,7 @@ class MainWindow(QMainWindow):
         Slice 7 起，"数一数已有多少张"这一步走后台（Spec §11 要求先显示
         "正在扫描已有瓦片…"，而不是让界面僵在原地）。
         """
-        if self._busy_worker() is not None:
+        if self.download_channel_busy():
             self.log_panel.append_log("上一次任务尚未结束，已忽略本次请求", "WARNING")
             self.statusBar().showMessage("当前有任务正在进行，无法同时继续另一个任务", 5000)
             return
@@ -2750,7 +3239,7 @@ class MainWindow(QMainWindow):
             self._refresh_task_list()
             return
 
-        if task.status is DownloadTaskStatus.COMPLETED:
+        if task.status is DownloadTaskStatus.COMPLETED and not repair:
             self.log_panel.append_log(f"任务已完成，无需继续：{task.name}", "WARNING")
             self.statusBar().showMessage("该任务已完成", 5000)
             return
@@ -2809,8 +3298,18 @@ class MainWindow(QMainWindow):
         path = Path(task.output_path)
         # Spec §12：多边形任务的分母必须是**区域内**张数。老记录没存 total_tiles 时
         # 现场按区域重算，而不是退回矩形候选数（那会让"还差多少张"永久失真）。
-        total = task.total_tiles or region_target_tiles(
-            region, bounds, int(task.min_zoom), int(task.max_zoom)
+        if not task.total_tiles and region is not None and region.is_polygon and estimate is None:
+            self._begin_region_estimate(
+                region,
+                {"min_zoom": task.min_zoom, "max_zoom": task.max_zoom},
+                lambda result: self._on_task_resume_requested(task_id, result, repair=repair),
+                check_form=False,
+            )
+            return
+        total = task.total_tiles or (
+            estimate.selected_tiles
+            if estimate is not None
+            else region_target_tiles(region, bounds, int(task.min_zoom), int(task.max_zoom))
         )
 
         self.log_panel.append_log(f"Resume task: {task.id}")
@@ -2831,7 +3330,7 @@ class MainWindow(QMainWindow):
             ),
             total=total,
             size_text=format_size(estimate_size_bytes(total)),
-            resume_policy=ResumePolicy(),
+            resume_policy=ResumePolicy.repair() if repair else ResumePolicy(),
             resume_task=task,
             task=task,
             existing_tiles=0,
@@ -2849,7 +3348,7 @@ class MainWindow(QMainWindow):
         self._continue_plan(plan)
 
     def _on_resume_scan_done(self, plan: _DownloadPlan, scan: ExistingTileScan) -> None:
-        """"从任务列表继续"这条路径的扫描回调（Spec §11）。"""
+        """ "从任务列表继续"这条路径的扫描回调（Spec §11）。"""
         plan = self._apply_scan(plan, scan)
         # Spec §11 要求把三件事同时说清楚：已有多少 / 目标多少 / 还要下多少
         self._log_resume_counts(plan.existing_tiles, plan.total)
@@ -2886,6 +3385,10 @@ class MainWindow(QMainWindow):
             self._refresh_task_list()
             return
 
+        if task.region_type == "coverage":
+            self.log_panel.append_log(f"多级覆盖任务「{task.name}」保存了独立策略；请使用任务行「继续」或检查输出文件：{task.output_path}")
+            self.statusBar().showMessage("多级覆盖任务：使用任务列表继续；修改范围请返回下载计划生成新包", 10000)
+            return
         layer_ok = self.download_panel.set_form_data(task)
         self.log_panel.append_log(
             f"已把任务「{task.name}」的参数回填到配置面板"
@@ -2964,7 +3467,49 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_choose_android_package(self) -> None:
-        """[选择地图包]：选一个**包目录**（不是裸 .mbtiles，Spec §12）。"""
+        """下载产物与成品包均可选；裸文件衔接后台检查、打包流程。"""
+        start_dir = (
+            self.device_panel.package_dir
+            or self.download_panel.output_edit.text().strip()
+            or str(DEFAULT_OUTPUT_DIR)
+        )
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "选择已下载地图或地图包清单", start_dir,
+            "离线地图 (*.mbtiles manifest.json);;MBTiles 地图 (*.mbtiles);;地图包清单 (manifest.json)",
+        )
+        if not chosen:
+            return
+        target = Path(chosen)
+        if target.name.lower() == "manifest.json" or (
+            target.name.lower() == "map.mbtiles"
+            and (target.parent / "manifest.json").is_file()
+        ):
+            self._on_android_package_ready(str(target.parent))
+            return
+        if target.suffix.lower() != ".mbtiles" or not target.is_file():
+            self.log_panel.append_log("请选择已有的 .mbtiles 文件或地图包 manifest.json", "WARNING")
+            return
+        if self.download_channel_busy():
+            self.log_panel.append_log("下载或修复正在进行，请完成或暂停后再打包地图", "WARNING")
+            return
+        self.log_panel.append_log(
+            "已选择下载地图，正在打开生成地图包窗口；生成成功后将自动选中并验证地图包"
+        )
+        self.open_package_dialog(str(target))
+
+    @Slot(str)
+    def _on_android_package_ready(self, package_dir: str) -> None:
+        # 校验或传输进行中时，不切换它们所对应的文件。
+        if not self.device_panel.choose_package_button.isEnabled():
+            self.log_panel.append_log(f"地图包已就绪：{package_dir}；当前设备操作完成后可选择包目录", "WARNING")
+            return
+        self.device_panel.set_package_dir(package_dir)
+        self.device_panel.reset_transfer()
+        self._start_android_package_check(package_dir)
+
+    @Slot()
+    def _on_choose_android_package_directory(self) -> None:
+        """兼容已有的成品包目录选择入口。"""
         # 起点目录：上次选的包 → 下载输出目录（用户的地图包一般就在那儿旁边）。
         # 取的是 ``output_edit`` 的文本：``DownloadPanel`` 没有 ``output_dir()``
         # 这个方法，写成 ``self.download_panel.output_dir()`` 会在点击时抛
@@ -2980,11 +3525,7 @@ class MainWindow(QMainWindow):
         )
         if not chosen:
             return
-        self.device_panel.set_package_dir(chosen)
-        self.device_panel.reset_transfer()
-        # Spec §12：选中之后就要校验；不校验通过不许传。校验会算完整的 SHA256，
-        # 因此同样走后台线程。
-        self._start_android_package_check(chosen)
+        self._on_android_package_ready(chosen)
 
     @Slot()
     def _on_validate_android_package(self) -> None:
@@ -3367,6 +3908,8 @@ class MainWindow(QMainWindow):
         图层与注记决定**下的是什么**。只留在界面上，重启后就恢复不出来了 ——
         而用户会以为那些选择跟着计划一起存下来了。
         """
+        if self._plan_dialog is not None and self._plan_dialog.is_running_plan():
+            return
         data = self.download_panel.get_form_data()
         self.plan_service.apply_settings(
             name=data.get("map_name") or None,
@@ -3434,6 +3977,7 @@ class MainWindow(QMainWindow):
                 self,
                 scheduler_factory=self.build_plan_scheduler,
             )
+            dialog.download_activity_changed.connect(self._refresh_action_state)
             dialog.tasks_created.connect(self._on_plan_tasks_created)
             dialog.plan_changed.connect(self._refresh_plan_summary)
             self._plan_dialog = dialog
@@ -3442,9 +3986,7 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
-        self.log_panel.append_log(
-            f"打开下载计划页：{self.plan_service.plan.describe()}"
-        )
+        self.log_panel.append_log(f"打开下载计划页：{self.plan_service.plan.describe()}")
 
     @Slot()
     def _on_mission_region_requested(self) -> None:
@@ -3743,6 +4285,20 @@ class MainWindow(QMainWindow):
         # 还开着的非模态弹窗先关掉，避免它们引用着已销毁的父窗口。
         # 关之前要断开 finished 连接：``close()`` 会发出 Rejected，
         # 不挡掉的话会跑出一堆"已取消下载"的假日志。
+        budget = self._storage_budget_dialog
+        if budget is not None and not budget.shutdown():
+            event.ignore()
+            self.statusBar().showMessage("容量预测正在停止，请稍后关闭", 5000)
+            return
+        estimate_worker = self._estimate_worker
+        if estimate_worker is not None:
+            self._cancel_region_estimate()
+            if not estimate_worker.wait(_DOWNLOAD_CANCEL_WAIT_MS):
+                event.ignore()
+                self.statusBar().showMessage("估算正在停止，请稍后再关闭窗口", 8000)
+                return
+            self._estimate_worker = None
+
         pending = self._pending_plan
         self._pending_plan = None
         self._close_dialogs()
@@ -3826,9 +4382,7 @@ class MainWindow(QMainWindow):
             else:
                 # 极端情况下（网络卡住 / 磁盘极慢）不能再等，否则关窗会一直挂住。
                 # 任务记录仍是 DOWNLOADING，下次启动会被自动降级为 PAUSED。
-                self.log_panel.append_log(
-                    "后台下载线程未能及时结束，已放弃等待", "WARNING"
-                )
+                self.log_panel.append_log("后台下载线程未能及时结束，已放弃等待", "WARNING")
         self._download_worker = None
         self._current_task = None
 

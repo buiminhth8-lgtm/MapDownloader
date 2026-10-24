@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.config.settings import DEFAULT_AVERAGE_TILE_SIZE
@@ -35,11 +36,16 @@ from app.geo.tile_region_filter import (
 )
 
 __all__ = [
+    "RegionEstimateCancelled",
     "RegionTileEstimate",
     "RegionTileEstimator",
     "ZoomRegionStats",
     "estimate_region_tiles",
 ]
+
+
+class RegionEstimateCancelled(RuntimeError):
+    """用户取消区域估算；不返回部分结果。"""
 
 
 @dataclass(frozen=True)
@@ -206,7 +212,14 @@ class RegionTileEstimator:
     # ------------------------------------------------------------------ #
     # 预估
     # ------------------------------------------------------------------ #
-    def estimate(self, min_zoom: int, max_zoom: int) -> RegionTileEstimate:
+    def estimate(
+        self,
+        min_zoom: int,
+        max_zoom: int,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        progress: Callable[[int, int, int], None] | None = None,
+    ) -> RegionTileEstimate:
         """统计 ``min_zoom ~ max_zoom``（含两端）的候选 / 选中瓦片。
 
         矩形区域：``selected == candidate``（**不调用任何几何运算**，
@@ -227,14 +240,42 @@ class RegionTileEstimator:
         candidate_total = 0
         selected_total = 0
 
+        def check_cancel() -> None:
+            if should_cancel is not None and should_cancel():
+                raise RegionEstimateCancelled("区域估算已取消")
+
         for zoom in range(int(min_zoom), int(max_zoom) + 1):
+            check_cancel()
             tile_range = calculate_tile_range(bounds, zoom)
             candidate = tile_range.tile_count
-            if self._filter is None:
+            if self._filter is not None and hasattr(self._filter, "iter_candidate_tiles"):
+                candidate = self._filter.candidate_count(zoom)
+                selected = 0
+                for processed, (x, y) in enumerate(self._filter.iter_candidate_tiles(bounds, zoom)):
+                    if processed % 256 == 0:
+                        check_cancel()
+                    if progress is not None and processed % 1024 == 0:
+                        progress(zoom, processed, candidate)
+                    selected += int(self._filter.intersects_tile_xyz(zoom, x, y))
+            elif self._filter is None:
                 selected = candidate
             else:
-                # 流式逐张判定：不落地任何瓦片列表（Spec §9）
-                selected = sum(1 for _ in self._filter.iter_selected_tiles(bounds, zoom))
+                if should_cancel is None and progress is None:
+                    selected = sum(1 for _ in self._filter.iter_selected_tiles(bounds, zoom))
+                else:
+                    selected = 0
+                    processed = 0
+                    for y in range(tile_range.min_y, tile_range.max_y + 1):
+                        for x in range(tile_range.min_x, tile_range.max_x + 1):
+                            if processed % 256 == 0:
+                                check_cancel()
+                            if progress is not None and processed % 1024 == 0:
+                                progress(zoom, processed, candidate)
+                            selected += int(self._filter.intersects_tile_xyz(zoom, x, y))
+                            processed += 1
+            check_cancel()
+            if progress is not None:
+                progress(zoom, candidate, candidate)
             per_zoom.append(
                 ZoomRegionStats(
                     zoom=zoom,
@@ -246,6 +287,7 @@ class RegionTileEstimator:
             candidate_total += candidate
             selected_total += selected
 
+        check_cancel()
         filtered_total = max(0, candidate_total - selected_total)
         percent = (filtered_total * 100.0 / candidate_total) if candidate_total else 0.0
         return RegionTileEstimate(
@@ -255,9 +297,7 @@ class RegionTileEstimator:
             selected_tiles=selected_total,
             filtered_tiles=filtered_total,
             filtered_percent=percent,
-            estimated_size_bytes=estimate_size_bytes(
-                selected_total, self._average_tile_size
-            ),
+            estimated_size_bytes=estimate_size_bytes(selected_total, self._average_tile_size),
             per_zoom=tuple(per_zoom),
         )
 

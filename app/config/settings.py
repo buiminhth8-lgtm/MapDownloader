@@ -98,7 +98,7 @@ MAX_TILE_RESPONSE_BYTES: int = 4 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT: float = 10.0
 
 #: 默认并发 worker 数
-DEFAULT_DOWNLOAD_CONCURRENCY: int = 6
+DEFAULT_DOWNLOAD_CONCURRENCY: int = 3
 
 #: 并发下限与上限。上限存在的理由是"不要打爆服务端"——
 #: 天地图对未授权/超额的调用会直接拒绝，过高的并发只会换来一片失败。
@@ -113,7 +113,16 @@ DEFAULT_RETRY_BASE_DELAY_SECONDS: float = 0.5
 DEFAULT_RETRY_MAX_DELAY_SECONDS: float = 5.0
 
 #: 默认请求速率上限（每秒请求数）。``<= 0`` 表示关闭限速。
-DEFAULT_REQUESTS_PER_SECOND: float = 8.0
+DEFAULT_REQUESTS_PER_SECOND: float = 4.0
+
+#: 429 共享冷却、自适应最低速率与稳定恢复；服务端 Retry-After 可超过本地上限。
+RATE_LIMIT_MIN_REQUESTS_PER_SECOND: float = 0.5
+RATE_LIMIT_COOLDOWN_BASE_SECONDS: float = 5.0
+RATE_LIMIT_COOLDOWN_MAX_SECONDS: float = 60.0
+RATE_LIMIT_JITTER_RATIO: float = 0.2
+RATE_LIMIT_RECOVERY_SUCCESSES: int = 20
+RATE_LIMIT_RECOVERY_SECONDS: float = 15.0
+RATE_LIMIT_MAX_THROTTLE_EPISODES: int = 5
 
 #: 进度回调的最小间隔（秒）。约 6.7 次/秒，落在"5~10 次/秒"的建议区间内，
 #: 避免高频 Signal 把 PySide6 事件队列压垮。

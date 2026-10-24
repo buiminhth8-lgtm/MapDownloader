@@ -1328,7 +1328,11 @@ class DownloadPanel(QGroupBox):
 
         self._output_form = QFormLayout()
         self._output_form.addRow("输出目录", output_row)
-        self._output_form.addRow("地图名称", self._map_name_edit)
+        self.storage_budget_button = QPushButton("容量预算与预测…", self)
+        name_row = QHBoxLayout()
+        name_row.addWidget(self._map_name_edit, 1)
+        name_row.addWidget(self.storage_budget_button)
+        self._output_form.addRow("地图名称", name_row)
 
         self._browse_button.clicked.connect(self._on_browse_clicked)
         self._output_edit.textChanged.connect(self._on_output_config_changed)

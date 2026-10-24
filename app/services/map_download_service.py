@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -237,6 +238,17 @@ def check_resume_compatibility(
     result = ResumeCompatibility(
         target_tiles=max(0, int(task.total_tiles)),
     )
+    if task.region_type == "coverage" or (metadata is not None and metadata.region_type == "coverage"):
+        from app.geo.zoom_coverage import coverage_region
+        if task.region_type != "coverage" or metadata is None or metadata.region_type != "coverage":
+            result.problems.append("多级覆盖策略类型不一致，无法安全续传")
+            result.compatible = False
+        else:
+            try:
+                coverage_region(metadata.coverage_data, expected_fingerprint=task.boundary_version)
+            except ValueError as exc:
+                result.problems.append(str(exc))
+                result.compatible = False
     if metadata is None:
         return result
 
@@ -510,6 +522,12 @@ def read_existing_metadata(path: str | Path) -> MBTilesMetadata | None:
         "provider": raw.get("provider", ""),
         "source_map_type": raw.get("map_type", ""),
         "composition": raw.get("composition", ""),
+        "region_type": raw.get("region_type", ""),
+        "region_id": raw.get("region_id", ""),
+        "boundary_version": raw.get("boundary_version", ""),
+        "region_level": raw.get("region_level", ""),
+        "buffer_meters": raw.get("buffer_meters", ""),
+        "coverage_data": raw.get("coverage_data", ""),
     }
     labels = _parse_metadata_bool(raw.get("labels"))
     for candidate in (
@@ -591,6 +609,9 @@ class MapDownloadOutcome:
     #: 窄视图（老接口），这里保留完整结论是为了让完成小结能显示
     #: "缺失瓦片 / 抽样损坏"这类 ``MBTilesValidationResult`` 装不下的信息。
     diagnostics: MBTilesDiagnosticsResult | None = None
+    invalid_existing_tiles: int = 0
+    repaired_tiles: int = 0
+    repair_mode: bool = False
 
     @property
     def composition_text(self) -> str:
@@ -621,7 +642,7 @@ class MapDownloadOutcome:
         **数据库有效瓦片数 ≈ 任务目标瓦片数**。少了几张（服务端 404、
         网络抖动重试耗尽）时不能标成已完成，否则用户以为拿到了完整地图。
         """
-        if self.cancelled or not self.validation.valid:
+        if self.cancelled or self.summary.stop_reason or not self.validation.valid:
             return False
         if self.summary.failed:
             return False
@@ -637,6 +658,8 @@ class MapDownloadOutcome:
         """一句话说明"为什么没完成"，用于写进任务记录的 ``error``。"""
         if self.cancelled:
             return "任务已取消"
+        if self.summary.stop_reason:
+            return self.summary.stop_reason
         if not self.validation.valid:
             errors = "；".join(self.validation.errors) or "校验未通过"
             return f"MBTiles 校验未通过：{errors}"
@@ -689,7 +712,7 @@ class MapDownloadOutcome:
         if self.discarded:
             lines.append(f"写库失败丢弃：{self.discarded:,} 张")
         if self.summary.unprocessed:
-            lines.append(f"未处理（取消）：{self.summary.unprocessed:,} 张")
+            lines.append(f"未处理：{self.summary.unprocessed:,} 张")
         lines.extend(self.validation.errors)
         lines.extend(self.extra_lines)
         return lines
@@ -771,6 +794,7 @@ class MapDownloadService:
         progress_interval_seconds: float = PROGRESS_EMIT_INTERVAL_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
         composer: TileComposer | None = None,
+        validation_progress=None,
     ) -> None:
         """
         Args:
@@ -814,6 +838,8 @@ class MapDownloadService:
         self._manager: DownloadManager | None = None
         self._sink: MBTilesTileSink | None = None
         self._tiles_written = 0
+        self._cancel_requested = threading.Event()
+        self._validation_progress = validation_progress
 
     # ------------------------------------------------------------------ #
     # 只读状态
@@ -851,6 +877,7 @@ class MapDownloadService:
 
     def cancel(self) -> None:
         """取消当前任务；**已下载并进队列的瓦片仍会写入 MBTiles**。"""
+        self._cancel_requested.set()
         manager = self._manager
         if manager is not None:
             manager.cancel()
@@ -1129,6 +1156,17 @@ class MapDownloadService:
                 "请改传 MapType.VECTOR / MapType.IMAGE，或把 with_labels 设为 False。"
             )
 
+        self._cancel_requested.clear()
+        policy = resume_policy or ResumePolicy.disabled()
+        if policy.verify_existing_tile:
+            from app.providers.image_validation import require_image_decoder
+            try:
+                require_image_decoder()
+            except ImportError as exc:
+                message = "校验并修复需要 Pillow，请安装 requirements.txt 中的依赖"
+                _mark_task_failed(task, task_service, message)
+                raise MapResumeError(message) from exc
+
         # --- 下载目标解析（Spec §2：从唯一那张映射表里取图层） ---
         map_type = layer if isinstance(layer, MapType) else MapType.from_layer(layer)
         merged = bool(with_labels)
@@ -1193,6 +1231,7 @@ class MapDownloadService:
             ),
         )
 
+        metadata.coverage_data = region.coverage_data if region else ""
         path.parent.mkdir(parents=True, exist_ok=True)
         writer = MBTilesWriter(path, batch_size=self._batch_size)
         try:
@@ -1212,7 +1251,6 @@ class MapDownloadService:
 
         # --- 跳过判定：用 writer 自己的写连接查"库里已有什么" ---
         zooms = list(range(int(min_zoom), int(max_zoom) + 1))
-        policy = resume_policy or ResumePolicy.disabled()
         # total 已在建库前算好（多边形下即"选中瓦片数"），这里**不再重算**。
         # 它有三个身份：进度条分母、ExistingTileIndex 的 expected_total
         # （决定走 CACHED 还是 QUERY 模式）、收尾报告里的"目标张数"。
@@ -1252,7 +1290,7 @@ class MapDownloadService:
         )
         # 合成模式：**同一个** TileDownloader 被用两次（底图 + 注记）。
         # 于是连接复用、限速、重试三件事与单层模式完全一致 ——
-        # "1 万张瓦片 ≈ 2 万次请求"里的每一次都仍然受 8 请求/秒约束。
+        # "1 万张瓦片 ≈ 2 万次请求"里的每一次都仍然受 默认 HTTP 速率上限约束。
         # 生命周期上 CompositeTileDownloader **不拥有**它（谁创建谁关闭），
         # 所以下面 finally 里关的仍然是 downloader 本身。
         worker = (
@@ -1278,6 +1316,24 @@ class MapDownloadService:
         self._tiles_written = 0
         write_error: MBTilesWriteError | None = None
 
+        repaired_tiles = 0
+
+        async def consume_tile(result):
+            nonlocal repaired_tiles
+            repairing_existing = False
+            if policy.verify_existing_tile:
+                from app.providers.image_validation import is_decodable_tile
+                if not is_decodable_tile(result.content):
+                    raise ValueError("下载返回的瓦片无法完整解码，已保留原数据")
+                tile = result.tile
+                if policy.enabled and writer.has_tile(tile.z, tile.x, tile.y):
+                    repairing_existing = not is_decodable_tile(
+                        writer.read_tile(tile.z, tile.x, tile.y)
+                    )
+            await sink.consume(result)
+            if repairing_existing:
+                repaired_tiles += 1
+
         try:
             manager = DownloadManager(
                 worker,
@@ -1290,7 +1346,7 @@ class MapDownloadService:
                 min_zoom,
                 max_zoom,
                 target,
-                on_tile=sink.consume,
+                on_tile=consume_tile,
                 on_progress=self._make_progress_forwarder(
                     manager, on_progress, task=task, task_service=task_service
                 ),
@@ -1330,14 +1386,27 @@ class MapDownloadService:
         tile_count, file_size = self._inspect(path)
         # Spec §22：完成后的校验从"基础校验"升级为"快速诊断"——
         # 结构与统计、metadata、坐标、覆盖完整性、图片抽样全跑一遍，
-        # 但 **deep_scan 保持 False**：每次下载结束都全量解码几十万张图片
-        # 是不可接受的（那是 GUI 上"深度检查"按钮的活儿）。
+        # 普通下载只抽样；显式校验修复必须全量复检，不能用抽样声称全部修好。
         # 抽样张数沿用 Slice 4 的 20 张，落在 Spec 要求的 20~50 区间内。
+        inspection_options = {}
+        if policy.verify_existing_tile:
+            inspection_options = {
+                "deep_scan": True,
+                "should_stop": self._cancel_requested.is_set,
+                "progress_callback": (
+                    (lambda progress: self._validation_progress(progress.message))
+                    if self._validation_progress is not None else None
+                ),
+            }
         diagnostics = self._inspection.inspect(
-            path,
-            sample_size=MBTILES_VALIDATE_SAMPLE_LIMIT,
-            check_coverage=True,
+            path, sample_size=MBTILES_VALIDATE_SAMPLE_LIMIT, check_coverage=True,
+            **inspection_options,
         )
+        if self._cancel_requested.is_set():
+            summary.cancelled = True
+        if policy.verify_existing_tile and not diagnostics.deep_scan_complete:
+            diagnostics.valid = False
+            diagnostics.errors.append("修复后的全量复检尚未完成，不能标记为已完成")
         validation = diagnostics.to_validation()
         _logger.info(
             "Map saved path=%s tiles=%d size=%s zoom=%s valid=%s",
@@ -1352,14 +1421,24 @@ class MapDownloadService:
                 _logger.info(line)
 
         extra_lines: list[str] = []
+        if summary.stop_reason:
+            extra_lines.append(summary.stop_reason)
         if summary.cancelled:
             extra_lines.append(
                 "状态：已取消，已完成瓦片已保留；可在「下载任务」里点「继续」接着下"
             )
-        if policy.verify_existing_tile and index.stats.invalid:
+        if policy.verify_existing_tile:
             extra_lines.append(
-                f"已有瓦片中校验发现 {index.stats.invalid:,} 张损坏"
-                + ("，已重新下载覆盖" if policy.redownload_invalid_tile else "，已沿用")
+                f"已有瓦片中校验发现 {index.stats.invalid:,} 张损坏，"
+                f"成功修复 {repaired_tiles:,} 张；"
+                f"发现但未修复 {max(0, index.stats.invalid - repaired_tiles):,} 张"
+            )
+            extra_lines.append(
+                "修复后全量复检：" + (
+                    f"已完成，扫描 {diagnostics.deep_scanned_tiles:,} 张，"
+                    f"仍有 {diagnostics.corrupt_tiles:,} 张损坏"
+                    if diagnostics.deep_scan_complete else "未完成，请再次「校验并修复」"
+                )
             )
 
         outcome = MapDownloadOutcome(
@@ -1378,6 +1457,9 @@ class MapDownloadService:
             target_tiles=total,
             skip_mode=index.mode if policy.enabled else None,
             diagnostics=diagnostics,
+            invalid_existing_tiles=index.stats.invalid,
+            repaired_tiles=repaired_tiles,
+            repair_mode=policy.verify_existing_tile,
         )
         # 终态在**数据流出这一层**落地：GUI / 脚本 / 测试任何调用方都自动获得
         # 正确的任务状态，不必各自记得"跑完之后别忘了写状态"。

@@ -298,6 +298,8 @@ class DownloadSummary:
     failures_by_reason: dict[str, int] = field(default_factory=dict)
     #: 因取消而完全没被处理的瓦片数（Slice 5 起从 ``skipped`` 里拆出来）
     unprocessed: int = 0
+    #: 持续限流等自动停止的原因，区别于用户取消。
+    stop_reason: str = ""
 
     @property
     def completed(self) -> int:
@@ -311,7 +313,7 @@ class DownloadSummary:
         ``skipped`` 也算"已处理"——一个全部命中已有瓦片的续传任务
         （``skipped=N, succeeded=0``）是**成功**，不是"什么都没干"。
         """
-        return not self.cancelled and self.failed == 0 and self.completed > 0
+        return not self.cancelled and not self.stop_reason and self.unprocessed == 0 and self.failed == 0 and self.completed > 0
 
     def top_failures(
         self, limit: int = MAX_REPORTED_FAILURE_REASONS
@@ -340,6 +342,8 @@ class DownloadSummary:
         lines.append(f"平均速度：{self.average_tiles_per_second:.1f} 瓦片/秒")
         for reason, count in self.top_failures():
             lines.append(f"失败原因：{reason}（{count:,} 张）")
+        if self.stop_reason:
+            lines.append(f"状态：{self.stop_reason}")
         if self.cancelled:
             lines.append("状态：已取消（已完成瓦片已保留，可继续下载）")
         return lines

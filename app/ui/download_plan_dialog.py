@@ -178,6 +178,7 @@ class DownloadPlanDialog(QDialog):
 
     #: 计划内容或结论变了（主窗口据此刷新面板摘要与任务列表）
     plan_changed = Signal()
+    download_activity_changed = Signal()
 
     def __init__(
         self,
@@ -203,7 +204,7 @@ class DownloadPlanDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("下载计划")
-        self.setMinimumWidth(720)
+        self.setMinimumWidth(900)
 
         self._plan_service = plan_service
         self._auto_estimate = bool(auto_estimate)
@@ -347,6 +348,11 @@ class DownloadPlanDialog(QDialog):
             PLAN_ACTION_GENERATE,
         ):
             self._button_row.addWidget(self._buttons[key])
+        self.storage_budget_button = QPushButton("容量预算", self)
+        self.storage_budget_button.clicked.connect(
+            lambda: getattr(self.parent(), "open_plan_storage_budget", lambda: None)()
+        )
+        self._button_row.addWidget(self.storage_budget_button)
         self._button_row.addStretch(1)
         self._button_row.addWidget(self._close_button)
         self._apply_busy(False)
@@ -425,6 +431,12 @@ class DownloadPlanDialog(QDialog):
         box_layout.addWidget(self._run_tiles_label)
         box_layout.addWidget(self._run_log_label)
         box_layout.addLayout(run_buttons_row)
+        self.coverage_download_button = QPushButton("单包覆盖下载…（合并启用区域与各自 Zoom）", self._run_box)
+        self.coverage_download_button.setToolTip("后台计算各 Zoom 的区域并集，预览容量后生成一份 MBTiles；暂停、取消和续传使用主窗口下载控制")
+        self.coverage_download_button.clicked.connect(
+            lambda: getattr(self.parent(), "start_plan_coverage", lambda: None)()
+        )
+        box_layout.addWidget(self.coverage_download_button)
         self._apply_run_state(None)
 
     # ------------------------------------------------------------------ #
@@ -872,8 +884,12 @@ class DownloadPlanDialog(QDialog):
     # ------------------------------------------------------------------ #
     # 计划执行（Slice 21 / Spec §15 ~ §18 / §20 / §25）
     # ------------------------------------------------------------------ #
+    def _other_download_busy(self) -> bool:
+        checker = getattr(self.parent(), "download_channel_busy", None)
+        return bool(callable(checker) and checker(exclude_plan=True))
+
     @Slot()
-    def start_plan(self) -> None:
+    def start_plan(self, *, budget_checked=False) -> None:
         """开始（或接管）执行这份计划（Spec §7 / §15；Slice 23 加风险保护）。
 
         风险闸门放在最前面（Spec §16）：``LARGE`` 起弹一次"继续 / 采用推荐
@@ -881,12 +897,16 @@ class DownloadPlanDialog(QDialog):
         窗口**，只是多出一个必须敲对的确认词输入框。闸门在**起线程之前** ——
         一旦跑起来就不再弹任何框（执行中的计划不该被自己的提示打断）。
         """
-        if self.is_running_plan() or self.is_estimating():
+        if self.is_running_plan() or self.is_estimating() or self._other_download_busy():
             return
         if self.plan.is_empty:
             self._status_label.setText("计划里还没有区域，先「加入下载计划」")
             return
 
+        guard = getattr(self.parent(), "check_plan_storage_budget", None)
+        if not budget_checked and callable(guard):
+            guard(lambda: self.start_plan(budget_checked=True))
+            return
         risk = self._plan_risk_report()
         self._plan_risk = risk
         if risk is not None and risk.requires_confirmation:
@@ -899,6 +919,10 @@ class DownloadPlanDialog(QDialog):
 
     def _do_start_plan(self) -> None:
         """真正起线程（风险确认之后才走到这里）。"""
+        # 风险确认是非模态的，确认期间另一入口可能已经取得通道；必须重查。
+        if self.is_running_plan() or self._other_download_busy():
+            self._status_label.setText("另一个任务正在准备或下载，请结束后再开始计划")
+            return
         scheduler = self._ensure_scheduler()
         if scheduler is None:  # pragma: no cover - 按钮此时是禁用的
             self._status_label.setText("当前无法执行计划（没拿到调度入口）")
@@ -919,6 +943,7 @@ class DownloadPlanDialog(QDialog):
         self._status_label.setText("正在开始计划…")
         self._sync_editable()
         worker.start()
+        self.download_activity_changed.emit()
 
     # ------------------------------------------------------------------ #
     # 计划级风险保护（Slice 23，Spec §16）
@@ -1229,6 +1254,7 @@ class DownloadPlanDialog(QDialog):
         if worker is not None:
             worker.deleteLater()
         self._sync_editable()
+        self.download_activity_changed.emit()
 
     # ------------------------------------------------------------------ #
     # 执行：界面状态
@@ -1243,9 +1269,7 @@ class DownloadPlanDialog(QDialog):
         if not hasattr(self, "_run_buttons"):  # pragma: no cover - 构建期
             return
         status = execution.status if execution is not None else None
-        can_start = self._scheduler_factory is not None and (
-            status is None or status.is_terminal
-        )
+        can_start = self._scheduler_factory is not None and (status is None or status.is_terminal)
         self._start_button.setEnabled(can_start and not self.is_estimating())
         self._pause_button.setEnabled(status is PlanExecutionStatus.RUNNING)
         self._resume_button.setEnabled(status is PlanExecutionStatus.PAUSED)
@@ -1260,6 +1284,14 @@ class DownloadPlanDialog(QDialog):
         )
         self._retry_button.setEnabled(status is PlanExecutionStatus.PARTIAL_FAILED)
         self._skip_button.setEnabled(status is PlanExecutionStatus.PARTIAL_FAILED)
+        if self._other_download_busy():
+            for button in (
+                self._start_button,
+                self._resume_button,
+                self._retry_button,
+                self._skip_button,
+            ):
+                button.setEnabled(False)
         if self._scheduler_factory is None:
             self._start_button.setToolTip("本窗口没有配置下载入口，暂时不能执行计划")
 
@@ -1311,6 +1343,7 @@ class DownloadPlanDialog(QDialog):
             if (busy_estimate or locked)
             else self._edit_tooltips[PLAN_ACTION_GENERATE]
         )
+        self.coverage_download_button.setEnabled(not busy_estimate and not locked and bool(self.plan.enabled_items))
         self._table.setEnabled(not busy_estimate and not locked)
         self._estimate_button.setEnabled(not busy_estimate and not locked)
         self._cancel_estimate_button.setEnabled(busy_estimate)

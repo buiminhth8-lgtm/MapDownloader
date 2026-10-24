@@ -101,11 +101,12 @@ MISSION_BUFFERS: tuple[float, ...] = (500.0, 5000.0, 20000.0)
 #: 第 4 段比 selected_tiles 用的单一 Zoom（任务区推荐区间的下界）。
 MISSION_ZOOM = 15
 
-#: 期望的推荐区间（Spec §3 / §5：唯一权威来源，四个等级各一条）。
+#: 期望的推荐区间（Spec §3 / §5：唯一权威来源，五个等级各一条）。
 EXPECTED_RECOMMENDED: dict[str, tuple[int, int]] = {
-    "country": (4, 10),
+    "country": (5, 10),
     "province": (9, 13),
-    "city": (12, 16),
+    "city": (12, 15),
+    "county": (14, 17),
     "mission": (15, 18),
 }
 
@@ -540,16 +541,16 @@ class Runner:
         analyzer = DownloadRiskAnalyzer(strategy=ZoomStrategyService())
         ok = True
 
-        # ---- 案例 A：全国 Z4~10（真估算，491 张）→ 合理风险 ----
+        # ---- 案例 A：全国 Z5~10（使用当前策略真估算）→ 合理风险 ----
         country_region = self.region_service.get_download_region("democountry")
         estimator = RegionTileEstimator(country_region)
-        case_a_estimate = estimator.estimate(4, 10)
+        case_a_estimate = estimator.estimate(5, 10)
         case_a = analyzer.analyze(
-            RegionLevel.COUNTRY, 4, 10, case_a_estimate
+            RegionLevel.COUNTRY, 5, 10, case_a_estimate
         )
         ok &= self.check(
             case_a.level is RiskLevel.NORMAL,
-            "案例 A：全国 Z4~10（推荐区间）→ NORMAL",
+            "案例 A：全国 Z5~10（推荐区间）→ NORMAL",
             f"实际 {case_a.level.value}（{case_a.total_tiles} 张）",
         )
         ok &= self.check(
@@ -557,8 +558,8 @@ class Runner:
             "案例 A 不要求任何确认（合理规模不该拦人）",
         )
         ok &= self.check(
-            (case_a.recommended_min_zoom, case_a.recommended_max_zoom) == (4, 10),
-            "案例 A 的报告里带着推荐区间 Z4~10",
+            (case_a.recommended_min_zoom, case_a.recommended_max_zoom) == (5, 10),
+            "案例 A 的报告里带着推荐区间 Z5~10",
             f"实际 Z{case_a.recommended_min_zoom}~{case_a.recommended_max_zoom}",
         )
         self.note(

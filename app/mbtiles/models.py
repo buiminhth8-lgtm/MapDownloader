@@ -94,6 +94,7 @@ METADATA_KEY_ORDER: tuple[str, ...] = (
     # Slice 22：只有任务区会写这两项（见 MBTilesMetadata 的字段说明）
     "region_level",
     "buffer_meters",
+    "coverage_data",
 )
 
 #: ``metadata.region_type`` 允许的取值（Spec §19）。
@@ -102,7 +103,7 @@ METADATA_KEY_ORDER: tuple[str, ...] = (
 #: ``app.mbtiles``）的单元测试不该为了一个枚举把 Shapely 拉进来。两者取值必须
 #: 一致这件事由 ``tests/test_mbtiles_region_metadata.py`` 里的同步断言守住 ——
 #: 靠测试发现漂移，比靠"记得同时改两处"可靠。
-SUPPORTED_REGION_TYPES: frozenset[str] = frozenset({"rectangle", "polygon"})
+SUPPORTED_REGION_TYPES: frozenset[str] = frozenset({"rectangle", "polygon", "coverage"})
 
 
 @dataclass
@@ -164,6 +165,7 @@ class MBTilesMetadata:
     #: 它的用处是回答"这个包是按几公里的走廊下的" —— 一个 20 km 的任务区包
     #: 与一个 500 m 的包，Tile 数可能差上百倍，只写 bounds 是解释不清的。
     buffer_meters: str = ""
+    coverage_data: str = ""
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
@@ -321,6 +323,8 @@ class MBTilesMetadata:
             values["labels"] = self.labels_text
         if self.composition:
             values["composition"] = self.composition
+        if self.coverage_data:
+            values["coverage_data"] = self.coverage_data
         if self.region_type:
             values["region_type"] = self.region_type
         if self.region_id:

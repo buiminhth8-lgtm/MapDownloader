@@ -5,7 +5,7 @@
 真的摆进窗口。这个脚本要证明的是**真窗口里**这几件事：
 
 1. 选中中国 Preset 后，「Zoom 建议」那一行真的出现了，而且第一行就是
-   ``推荐 Zoom：Z4~10``；
+   ``推荐 Zoom：Z5~10``；
 2. 把 Max Zoom 拉到 18，警告**当下**就出现（不用等点「计算」）；
 3. 警告出现之后，用户设置的 8 与 18 **一个字符都没被改**，点「计算」照样按
    8~18 走 —— 这一条是 Spec §10 / §16 的核心：策略层只提醒，不替用户拍板；
@@ -40,6 +40,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.verification_helpers import wait_for_region_estimate  # noqa: E402
 
 DOCS = PROJECT_ROOT / "docs" / "images"
 
@@ -195,6 +197,9 @@ def use_temp_region_resources(regions_dir: Path) -> None:
 
     regions_dir.mkdir(parents=True, exist_ok=True)
     region_module.REGION_RESOURCE_DIR = regions_dir
+    from app.config import settings as verification_settings
+    verification_settings.REGION_DATA_ROOT = regions_dir / "_unpublished_generated"
+
     region_module.REGION_PRESETS = (CHINA_REGION_PRESET,)
     shutil.copyfile(SHIPPED_REGIONS_DIR / INDEX_FILENAME, regions_dir / INDEX_FILENAME)
 
@@ -246,6 +251,7 @@ def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
     # 老行为：矩形模式下点「计算」照旧
     panel.set_zoom_range(8, 17)
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app)
     form = panel.get_form_data()
     checker.check(
@@ -285,18 +291,18 @@ def scene_country_hint(app, window, checker: Checker, shots: bool) -> None:
     )
     lines = panel.zoom_policy_text.splitlines()
     checker.check(
-        bool(lines) and lines[0] == "推荐 Zoom：Z4~10",
-        "第一行是「推荐 Zoom：Z4~10」",
+        bool(lines) and lines[0] == "推荐 Zoom：Z5~10",
+        "第一行是「推荐 Zoom：Z5~10」",
         repr(lines[:1]),
     )
 
-    # --- Z4~10：安静 ---
-    panel.set_zoom_range(4, 10)
+    # --- Z5~10：安静 ---
+    panel.set_zoom_range(5, 10)
     _pump(app)
     text = panel.zoom_policy_text
-    checker.check("警告" not in text, "Z4~10 不产生警告", text.replace("\n", " / "))
+    checker.check("警告" not in text, "Z5~10 不产生警告", text.replace("\n", " / "))
     checker.check(
-        "当前 Zoom：Z4~10" in text,
+        "当前 Zoom：Z5~10" in text,
         "提示里同时写明「当前用的是多少」",
         text.replace("\n", " / "),
     )
@@ -313,7 +319,7 @@ def scene_country_hint(app, window, checker: Checker, shots: bool) -> None:
         text.replace("\n", " / "),
     )
     checker.check(
-        "Z4~10" in text and "Z8~18" in text,
+        "Z5~10" in text and "Z8~18" in text,
         "警告里同时给出推荐区间与当前区间",
         text.replace("\n", " / "),
     )
@@ -329,6 +335,7 @@ def scene_country_hint(app, window, checker: Checker, shots: bool) -> None:
 
     # --- 点计算：仍然走用户的 8~18 ---
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app)
     form = panel.get_form_data()
     checker.check(
@@ -368,9 +375,9 @@ def scene_strategy_core(checker: Checker) -> None:
 
     service = ZoomStrategyService()
     expected = {
-        RegionLevel.COUNTRY: "Z4~10",
+        RegionLevel.COUNTRY: "Z5~10",
         RegionLevel.PROVINCE: "Z9~13",
-        RegionLevel.CITY: "Z12~16",
+        RegionLevel.CITY: "Z12~15",
         RegionLevel.MISSION: "Z15~18",
     }
     for level, text in expected.items():
@@ -381,10 +388,10 @@ def scene_strategy_core(checker: Checker) -> None:
             recommendation.range_text,
         )
 
-    within = service.evaluate(RegionLevel.COUNTRY, 4, 10)
+    within = service.evaluate(RegionLevel.COUNTRY, 5, 10)
     checker.check(
         within.warning is False and within.exceeds_recommendation is False,
-        "COUNTRY 4~10 → 无警告",
+        "COUNTRY 5~10 → 无警告",
     )
 
     beyond = service.evaluate(RegionLevel.COUNTRY, 8, 18)
@@ -392,13 +399,13 @@ def scene_strategy_core(checker: Checker) -> None:
     checker.check(
         beyond.exceeds_recommendation is True
         and (beyond.requested_min_zoom, beyond.requested_max_zoom) == (8, 18)
-        and beyond.range_text == "Z4~10",
+        and beyond.range_text == "Z5~10",
         "推荐区间与用户区间分开保存（8~18 没被改写）",
         f"推荐 {beyond.range_text} / 当前 {beyond.requested_range_text}",
     )
     checker.check(
-        "省、市或任务区域" in beyond.warning_text,
-        "警告文案说明了该改用什么做法",
+        bool(beyond.reason) and beyond.reason in beyond.warning_text,
+        "警告包含策略层给出的分区域下载建议",
         beyond.warning_text[:40],
     )
 
@@ -412,7 +419,7 @@ def scene_strategy_core(checker: Checker) -> None:
     for label, call in (
         ("min>max 被拒", lambda: service.evaluate(RegionLevel.CITY, 16, 12)),
         ("zoom 越界被拒", lambda: service.evaluate(RegionLevel.CITY, 23, 23)),
-        ("未知等级被拒", lambda: service.evaluate("china", 4, 10)),
+        ("未知等级被拒", lambda: service.evaluate("china", 5, 10)),
     ):
         try:
             call()
@@ -447,10 +454,10 @@ def scene_estimate(checker: Checker, region, window) -> None:
         return
 
     plan = _plan(region, RegionLevel.COUNTRY)
-    direct = RegionTileEstimator(region).estimate(4, 10)
+    direct = RegionTileEstimator(region).estimate(5, 10)
     checker.check(
-        (plan.estimated_min_zoom, plan.estimated_max_zoom) == (4, 10),
-        "不给用户 Zoom 时，按推荐区间 Z4~10 预估",
+        (plan.estimated_min_zoom, plan.estimated_max_zoom) == (5, 10),
+        "不给用户 Zoom 时，按推荐区间 Z5~10 预估",
         f"{plan.estimated_min_zoom}~{plan.estimated_max_zoom}",
     )
     checker.check(
@@ -478,7 +485,7 @@ def scene_estimate(checker: Checker, region, window) -> None:
 
     lines = plan.as_lines()
     checker.check(
-        lines[0] == "推荐 Zoom：Z4~10"
+        lines[0] == "推荐 Zoom：Z5~10"
         and any(line.startswith("预计瓦片（区域内）：") for line in lines)
         and any(line.startswith("预计容量：") for line in lines),
         "输出同时含推荐 Zoom / 预计张数 / 预计容量（Spec §9）",
@@ -584,8 +591,8 @@ def scene_manual_checklist(checker: Checker) -> None:
     checker.section("场景 F：Spec §17 手工验收 7 步（本脚本已逐步覆盖）")
     steps = [
         ("1. 选择中国 Preset", "场景 B：region_type=行政区域，level=country"),
-        ("2. 显示推荐 Z4~10", "场景 B：第一行 == 「推荐 Zoom：Z4~10」"),
-        ("3. 设置 Z4~10 无警告", "场景 B：警告未出现"),
+        ("2. 显示推荐 Z5~10", "场景 B：第一行 == 「推荐 Zoom：Z5~10」"),
+        ("3. 设置 Z5~10 无警告", "场景 B：警告未出现"),
         ("4. 设置 Z8~18 显示 Warning", "场景 B：警告出现且带原因"),
         ("5. 用户仍可保留自定义 Zoom", "场景 B：表单仍是 8~18"),
         ("6. 点击计算用实际用户 Zoom", "场景 B：计算后表单仍是 8~18"),

@@ -48,6 +48,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.verification_helpers import wait_for_region_estimate  # noqa: E402
+
 DOCS = PROJECT_ROOT / "docs" / "images"
 
 #: 当前 ``QApplication``（截图前要空转事件循环让布局收敛）
@@ -241,6 +243,9 @@ def use_region_resources(root: Path) -> None:
     from app.geo import region as region_module
 
     region_module.REGION_RESOURCE_DIR = root
+    from app.config import settings as verification_settings
+    verification_settings.REGION_DATA_ROOT = root / "_unpublished_generated"
+
 
 
 # --------------------------------------------------------------------------- #
@@ -468,8 +473,9 @@ def scene_recommended_zoom(app, window, checker: Checker, shots: bool) -> None:
             repr(panel.zoom_policy_text.splitlines()[:1]),
         )
         checker.check(
-            panel.zoom_explain_text == expected.reason and bool(expected.reason),
-            f"{label}级「推荐说明」来自策略层（界面没抄一份文案）",
+            bool(expected.reason) and panel.zoom_explain_text.startswith(expected.reason)
+            and "换算到地面：" in panel.zoom_explain_text,
+            f"{label}级「推荐说明」来自策略层，并包含地面分辨率",
             panel.zoom_explain_text[:60],
         )
 
@@ -548,13 +554,13 @@ def scene_zoom_warning(app, window, checker: Checker, shots: bool) -> None:
     _pump(app)
     panel.province_combo.setCurrentIndex(1)
     _pump(app)
-    panel.city_combo.setCurrentIndex(1)  # 河城 → CITY，建议 Z12~16
+    panel.city_combo.setCurrentIndex(1)  # 河城 → CITY，建议 Z12~15
     _pump(app)
 
     panel.set_zoom_range(8, 17)
     _pump(app)
     checker.check(
-        "城市级" in panel.zoom_policy_text and "Z12~16" in panel.zoom_policy_text,
+        "城市级" in panel.zoom_policy_text and "Z12~15" in panel.zoom_policy_text,
         "自定义 8~17 对市级区域给出「城市级」警告（等级来自目录条目）",
         panel.zoom_policy_text.replace("\n", " / "),
     )
@@ -592,7 +598,7 @@ def scene_zoom_warning(app, window, checker: Checker, shots: bool) -> None:
         panel.zoom_range_text(),
     )
 
-    panel.set_zoom_range(12, 16)
+    panel.set_zoom_range(12, 15)
     _pump(app)
     checker.check(
         "警告" not in panel.zoom_policy_text,
@@ -643,10 +649,11 @@ def scene_polygon_estimate(app, window, checker: Checker, shots: bool) -> None:
     panel.set_zoom_range(12, 13)
     _pump(app)
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app, 24)
     text = panel.result_label.text()
     checker.check(
-        "区域：河城" in text and "级别：城市级" in text and "推荐 Zoom：Z12~16" in text,
+        "区域：河城" in text and "级别：城市级" in text and "推荐 Zoom：Z12~15" in text,
         "结果区写明算的是哪个区域、什么级别、建议区间（都来自控制器/策略层）",
         repr(text.splitlines()[:3]),
     )
@@ -723,6 +730,7 @@ def scene_missing_boundary(app, window, checker: Checker) -> None:
     )
 
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(app, window)
     _pump(app, 16)
     checker.check(
         panel.result_label.text().startswith("计算失败：")
@@ -972,7 +980,7 @@ def scene_manual_checklist(checker: Checker) -> None:
         ("1. 国家 / 省 / 市三级级联能选", "场景 A：三个真下拉 + 联动重填"),
         ("2. 只选国家就得到国家级与 COUNTRY 建议", "场景 A + B：等级与建议都来自目录"),
         ("3. 只选省就得到 PROVINCE 建议", "场景 B：三级各看一次"),
-        ("4. 选到市得到 CITY 建议", "场景 B：Z12~16"),
+        ("4. 选到市得到 CITY 建议", "场景 B：Z12~15"),
         ("5. 推荐模式自动填值且只读", "场景 B：值 == 策略值，isReadOnly"),
         ("6. 自定义模式可编辑、只警告不改值", "场景 C：8~17 保留原值，按钮仍可用"),
         ("7. 范围来自边界文件、经纬度只读", "场景 D：回填值 == 夹具方块"),
@@ -982,7 +990,7 @@ def scene_manual_checklist(checker: Checker) -> None:
         ("11. 脏偏好安全回退（市 → 省 → 国 → 矩形）", "场景 F：ghost 系列"),
         ("12. 老配置的 Zoom 不丢", "场景 G：download/min_zoom 迁移读取"),
         ("13. 矩形模式完全兼容", "场景 A + B：下拉收起、策略不干预"),
-        ("14. 未提前实现 Slice 20", "场景 H：界面层无下载计划 / 等级字面量"),
+        ("14. 级联选择不复制规划策略", "场景 H：规划模型与等级策略由业务层提供"),
     ]
     for title, coverage in steps:
         checker.check(True, title, coverage)

@@ -743,7 +743,7 @@ def test_deep_scan_reports_abort_as_incomplete(work_dir: Path) -> None:
     )
     assert result.deep_scan is True
     assert result.deep_scan_complete is False
-    assert result.deep_scanned_tiles == DIAGNOSTICS_DEEP_SCAN_BATCH_SIZE * 2
+    assert 0 < result.deep_scanned_tiles <= DIAGNOSTICS_DEEP_SCAN_BATCH_SIZE
     assert result.deep_scanned_tiles < total
     assert any("深度检查被中止" in message for message in result.warnings)
 

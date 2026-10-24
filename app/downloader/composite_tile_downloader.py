@@ -45,6 +45,7 @@ import time
 
 from app.composer import TileComposeError, TileComposer
 from app.downloader.models import TileCoordinate, TileDownloadResult, TileFailureKind
+from app.downloader.rate_limiter import RateLimitExceeded
 from app.downloader.tile_downloader import TileDownloader
 from app.models.map_layer import MapLayerType, MapType
 
@@ -109,6 +110,9 @@ class CompositeTileDownloader:
         """图像合成器。"""
         return self._composer
 
+    def set_request_control(self, gate, cancel_event) -> None:
+        self._downloader.set_request_control(gate, cancel_event)
+
     # ------------------------------------------------------------------ #
     # 下载
     # ------------------------------------------------------------------ #
@@ -152,7 +156,7 @@ class CompositeTileDownloader:
         # 并发取两层。注意两者共用同一个 TileDownloader：
         # - 同一个 AsyncClient → 连接复用，不会为每个图层重新握手；
         # - 同一个 RateLimiter → 限速是**全局**的，"最终 1 万张瓦片 ≈ 2 万次
-        #   请求"里的每一次请求都受 8 req/s 的约束，不会因为是合成模式就翻倍
+        #   请求"里的每一次请求都受 统一 HTTP 速率上限 的约束，不会因为是合成模式就翻倍
         #   打服务端。
         # return_exceptions=True：一个图层炸了不能顺手把另一个也取消掉，
         # 否则失败原因会变得含糊（到底是谁先挂的）。
@@ -234,6 +238,8 @@ class CompositeTileDownloader:
         未预期的异常在这里被折叠成失败（单层下载器的重试已经跑完了），
         这样批量调度里不会因为一个图层的意外异常而少统计一张瓦片。
         """
+        if isinstance(value, (asyncio.CancelledError, RateLimitExceeded)):
+            raise value
         if isinstance(value, TileDownloadResult):
             return value
         return TileDownloadResult(

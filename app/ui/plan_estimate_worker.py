@@ -13,7 +13,7 @@
 同一个线程里既跑估算又管取消
 ----------------------------
 
-:meth:`cancel` 只是把 ``threading.Event`` 置位；真正的检查点在估算器**条目之间**
+:meth:`cancel` 只是把 ``threading.Event`` 置位；真正的检查点在估算器的条目之间与单条目遍历期间
 （:meth:`~app.planning.plan_estimator.DownloadPlanEstimator.estimate` 的
 ``should_cancel`` 回调）。这样取消是**立刻**生效的原子操作，不必等一次
 信号槽往返 —— 而往返正是用户"点了取消没反应"的典型来源。

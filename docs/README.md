@@ -19,11 +19,13 @@
 | 一次规划多块地 | [download_plan](download_plan.md) | 一份计划装多个区域 |
 | 让计划自己跑 | [plan_scheduler](plan_scheduler.md) | 串行 / 暂停 / 继续 / 重试 / 跳过 |
 | 沿一条航线下一窄条 | [mission_region](mission_region.md) | 按米缓冲的走廊 |
+| 预测卫星/矢量容量、设置预算 | [storage_budget](storage_budget.md) | 本地抽样、续传扣除、分盘预留和裁剪建议 |
 | 怕下太多把盘塞满 | [download_risk_analysis](download_risk_analysis.md) | 四级风险与强确认 |
 | 把包交给 Android | [map_package_v1](map_package_v1.md) | **跨端契约**（字段、目录、版本） |
 | 搞懂"分级"整条线 | [hierarchical_offline_map](hierarchical_offline_map.md) | 全国→省→市→县→任务区的总纲 |
 | 把授权 GeoJSON 导进目录 | [region_data_pipeline](region_data_pipeline.md) | 导入管线与合规要求 |
 | 验一遍整条链路 | [e2e_acceptance_checklist](e2e_acceptance_checklist.md) | Windows → ADB → Android 逐步验收 |
+| 检查或修复损坏瓦片 | [tile_repair](tile_repair.md) | 定向重下、全量复检与故障验收 |
 | 出问题了 | [troubleshooting](troubleshooting.md) | **按症状**查 |
 
 ---
@@ -65,7 +67,7 @@
 
 ### D. 要验收 / 发布
 
-[e2e_acceptance_checklist](e2e_acceptance_checklist.md) —— 按 A~E 段走。
+[e2e_acceptance_checklist](e2e_acceptance_checklist.md) —— 按 A~F 段走。
 标 ★ 的是回归必跑项。E 段末尾有"已知限制"与"已修缺陷"两张表，
 **别把已知限制当 bug 报，也别把已修缺陷当通过**。
 

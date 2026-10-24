@@ -163,6 +163,7 @@ class TaskService:
             region_type=region.region_type.value if region else "",
             region_id=(region.region_id or "") if region else "",
             boundary_version=(region.boundary_version or "") if region else "",
+            coverage_path=region.coverage_path if region else "",
         )
         self._store.save(task)
         self._mark_saved(task)

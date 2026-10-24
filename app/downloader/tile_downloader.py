@@ -42,7 +42,7 @@ from app.config.settings import (
     TIANDITU_ACCEPT_HEADER,
 )
 from app.downloader.models import TileCoordinate, TileDownloadResult, TileFailureKind
-from app.downloader.rate_limiter import RateLimiter
+from app.downloader.rate_limiter import RateLimiter, parse_retry_after
 from app.downloader.retry_policy import RetryPolicy, should_retry
 from app.models.map_layer import MapLayerType
 from app.providers import (
@@ -148,6 +148,8 @@ class TileDownloader:
         self._policy = retry_policy or RetryPolicy()
         self._rate_limiter = rate_limiter or RateLimiter()
         self._logger = logger or _logger
+        self._request_gate: asyncio.Event | None = None
+        self._request_cancel: asyncio.Event | None = None
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -202,6 +204,43 @@ class TileDownloader:
         """当前限速器。"""
         return self._rate_limiter
 
+    def set_request_control(
+        self, gate: asyncio.Event | None, cancel_event: asyncio.Event | None
+    ) -> None:
+        """让每个 HTTP 尝试（包含重试和冷却）服从批量任务的暂停与取消。"""
+        self._request_gate = gate
+        self._request_cancel = cancel_event
+
+    async def _controlled_wait(self, awaitable):
+        cancel = self._request_cancel
+        if cancel is None:
+            return await awaitable
+        pending = asyncio.ensure_future(awaitable)
+        cancelled = asyncio.create_task(cancel.wait())
+        try:
+            await asyncio.wait((pending, cancelled), return_when=asyncio.FIRST_COMPLETED)
+            if cancel.is_set():
+                raise asyncio.CancelledError
+            return await pending
+        finally:
+            for task in (pending, cancelled):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pending, cancelled, return_exceptions=True)
+
+    async def _wait_to_request(self) -> None:
+        while True:
+            gate = self._request_gate
+            if gate is not None:
+                await self._controlled_wait(gate.wait())
+            await self._controlled_wait(self._rate_limiter.acquire())
+            # 控制等待的收尾也可能让出事件循环：HTTP 真正发出前再复查新冷却。
+            if isinstance(self._rate_limiter, RateLimiter) and self._rate_limiter.requests_blocked:
+                continue
+            # 暂停可能发生在节流等待期间；恢复时重新排队，避免积累名额后突发。
+            if gate is None or gate.is_set():
+                return
+
     # ------------------------------------------------------------------ #
     # 下载
     # ------------------------------------------------------------------ #
@@ -224,6 +263,7 @@ class TileDownloader:
         Raises:
             ValueError: 瓦片坐标或图层参数非法。这类错误重试多少次都是同样
                 结果，因此直接暴露（批量场景由 worker 兜底捕获）。
+            RateLimitExceeded: 持续限流触发保护；批量调度器保留成果并停止本轮。
         """
         if not isinstance(tile, TileCoordinate):
             raise ValueError(
@@ -253,6 +293,9 @@ class TileDownloader:
                     )
                 break
 
+            if outcome.status_code == 429 and isinstance(self._rate_limiter, RateLimiter) and self._rate_limiter.is_enabled:
+                # 429 已更新共享冷却；下一次尝试与所有图层一起等待。
+                continue
             delay = self._policy.delay_after_attempt(attempt)
             self._logger.debug(
                 "瓦片 %s 第 %d 次尝试失败（%s），%.2fs 后重试",
@@ -262,7 +305,7 @@ class TileDownloader:
                 delay,
             )
             if delay > 0:
-                await asyncio.sleep(delay)
+                await self._controlled_wait(asyncio.sleep(delay))
 
         result = outcome.as_result(tile)
         # 总耗时包含退避等待——用户感知的"这一张花了多久"就是它。
@@ -276,8 +319,9 @@ class TileDownloader:
     # 单次尝试
     # ------------------------------------------------------------------ #
     async def _attempt(self, url: str) -> _AttemptResult:
-        """发一次请求并判定响应，把一切异常折叠成结果对象。"""
-        await self._rate_limiter.acquire()
+        """发一次请求并判定响应，把传输异常折叠成结果对象，控制指令与限流停止向上传递。"""
+        await self._wait_to_request()
+        generation = self._rate_limiter.generation if isinstance(self._rate_limiter, RateLimiter) else 0
 
         request_started = time.perf_counter()
         try:
@@ -314,7 +358,25 @@ class TileDownloader:
             )
 
         elapsed_ms = (time.perf_counter() - request_started) * 1000.0
-        return self._judge(response, elapsed_ms)
+        result = self._judge(response, elapsed_ms)
+        limiter = self._rate_limiter
+        if isinstance(limiter, RateLimiter):
+            if response.status_code == 429:
+                previous_generation = limiter.generation
+                delay = limiter.on_throttled(
+                    parse_retry_after(response.headers.get("Retry-After")), generation=generation
+                )
+                if limiter.generation != previous_generation:
+                    self._logger.warning(
+                        "HTTP 429 限流：全部图层共享冷却 %.1f 秒，HTTP 请求速率降至 %.2f 次/秒",
+                        delay, limiter.effective_requests_per_second,
+                    )
+            elif result.success and limiter.on_success(generation=generation):
+                self._logger.info(
+                    "限流后下载已稳定，HTTP 请求速率逐步恢复至 %.2f 次/秒",
+                    limiter.effective_requests_per_second,
+                )
+        return result
 
     @staticmethod
     def _judge(response: httpx.Response, elapsed_ms: float) -> _AttemptResult:

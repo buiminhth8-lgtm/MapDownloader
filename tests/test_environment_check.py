@@ -82,8 +82,11 @@ def test_writable_probe_leaves_no_trace() -> None:
 # --------------------------------------------------------------------------- #
 # ADB：可选项，不是阻塞项（Spec §8 的核心）
 # --------------------------------------------------------------------------- #
-def test_adb_missing_is_optional_not_blocker() -> None:
-    """ADB 不存在时，**能不能做地图**必须是"能"。"""
+def test_adb_missing_is_optional_not_blocker(monkeypatch, work_dir: Path) -> None:
+    """ADB 不存在时，其余条件正常的环境仍然能做地图。"""
+    from app.config import settings
+    # 这里只验证 ADB 可选性；目录仍做真实写入探测，但不依赖用户主目录权限。
+    monkeypatch.setattr(settings, "DEFAULT_OUTPUT_DIR", work_dir / "output")
     report = run_environment_checks(adb_path="D:/no/such/adb.exe")
 
     adb = next(item for item in report.checks if item.name == "ADB")

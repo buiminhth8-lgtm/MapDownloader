@@ -286,6 +286,7 @@ class MBTilesInspectorDialog(QDialog):
 
     #: 想写进主窗口日志区的一行，参数为 ``(文本, 级别)``
     log_message = Signal(str, str)
+    repair_requested = Signal(str)
 
     def __init__(
         self,
@@ -307,6 +308,7 @@ class MBTilesInspectorDialog(QDialog):
 
         self._service = service or MBTilesInspectionService()
         self._worker: MBTilesInspectionWorker | None = None
+        self._repair_running = False
         #: 最近一次检查的结论（没检查过为 ``None``）
         self.result: MBTilesDiagnosticsResult | None = None
         #: 打开文件选择对话框时的起始目录（会话内记住，不落盘）
@@ -362,6 +364,7 @@ class MBTilesInspectorDialog(QDialog):
         self.buttons["quick"].clicked.connect(self.start_quick_check)
         self.buttons["deep"].clicked.connect(self.start_deep_check)
         self.buttons["export"].clicked.connect(self._on_export_report)
+        self.buttons["repair"].clicked.connect(self._on_repair_clicked)
         self.buttons["open_dir"].clicked.connect(self._on_open_directory)
         self.buttons["close"].clicked.connect(self._on_close_clicked)
 
@@ -464,11 +467,15 @@ class MBTilesInspectorDialog(QDialog):
         self.buttons: dict[str, QPushButton] = {
             "quick": QPushButton(UI_TEXT_INSPECT_QUICK, self),
             "deep": QPushButton(UI_TEXT_INSPECT_DEEP, self),
+            "repair": QPushButton("校验并修复", self),
             "export": QPushButton(UI_TEXT_INSPECT_EXPORT, self),
             "open_dir": QPushButton(UI_TEXT_OPEN_DIRECTORY, self),
             "close": QPushButton(UI_TEXT_BUTTON_CLOSE, self),
         }
         # Spec §17 明确要求：深度检查可能耗时较长，界面上必须先说清楚。
+        self.buttons["repair"].setToolTip(
+            "需要原下载任务与 Token；完整校验已有瓦片，只重下损坏或缺失部分，结束后全量复检"
+        )
         self.buttons["deep"].setToolTip(UI_TEXT_INSPECT_DEEP_HINT)
         self.buttons["quick"].setToolTip("统计 + metadata + 抽样 —— 日常用这个")
 
@@ -490,7 +497,7 @@ class MBTilesInspectorDialog(QDialog):
     @property
     def is_running(self) -> bool:
         """是否正在检查。"""
-        return self._worker is not None and self._worker.isRunning()
+        return self._repair_running or (self._worker is not None and self._worker.isRunning())
 
     @property
     def path(self) -> str:
@@ -500,10 +507,32 @@ class MBTilesInspectorDialog(QDialog):
     def set_path(self, path: str | Path) -> None:
         """设置要检查的文件（不清空已有结果 —— 用户可能想对照着看）。"""
         text = str(path)
+        if self._repair_running:
+            return
         self.path_edit.setText(text)
         target = Path(text)
         if target.exists():
             self._last_directory = str(target.parent)
+
+    @Slot()
+    def _on_repair_clicked(self) -> None:
+        if self.path and not self.is_running:
+            self.repair_requested.emit(self.path)
+
+    def set_repair_running(self) -> None:
+        self._repair_running = True
+        self._reset_view()
+        self.set_running(True)
+        self._set_status_line("正在校验并修复，请在主窗口查看进度或取消", "INFO")
+
+    def finish_repair(self, result=None) -> None:
+        self._repair_running = False
+        if result is not None:
+            self._on_completed(result)
+        else:
+            self._reset_view()
+            self.set_running(False)
+            self._set_status_line("修复未完成，请查看主窗口错误后重试", "WARNING")
 
     def start_quick_check(self) -> None:
         """[快速检查]：结构 + metadata + 统计 + 坐标 + 覆盖 + 抽样图片。"""
@@ -784,6 +813,8 @@ class MBTilesInspectorDialog(QDialog):
         关掉对话框必须随时可用（用户有权不等），关的时候会
         :meth:`MBTilesInspectionWorker.abandon` 让后台尽快收手。
         """
+        running = running or self._repair_running
+        self.buttons["repair"].setEnabled(not running)
         self.buttons["quick"].setEnabled(not running)
         self.buttons["deep"].setEnabled(not running)
         self.buttons["export"].setEnabled(not running)

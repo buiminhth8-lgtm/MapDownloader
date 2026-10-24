@@ -64,6 +64,7 @@ class DownloadWorker(QThread):
 
     #: 进度更新（节流后），携带 :class:`~app.downloader.DownloadProgress`
     progress_changed = Signal(object)
+    validation_progress = Signal(str)
     #: 任务结束，携带 :class:`~app.services.MapDownloadOutcome`
     completed = Signal(object)
     #: 任务无法进行或异常终止，携带人话原因
@@ -261,6 +262,7 @@ class DownloadWorker(QThread):
             batch_size=self._batch_size,
             progress_interval_seconds=self._progress_interval,
             transport=self._transport,
+            validation_progress=self.validation_progress.emit,
         )
         self._service = service
         try:

@@ -33,7 +33,7 @@
 可取消（Spec §21）
 ------------------
 
-取消的检查点在**条目之间**：每算完一项看一眼。取消后：
+取消在条目之间及单条目的候选瓦片遍历期间检查。取消后：
 
 - 已经算完的条目保留结果；
 - 没算到的条目保持"尚未估算"；
@@ -53,7 +53,11 @@ from dataclasses import dataclass
 
 from app.config.settings import DEFAULT_AVERAGE_TILE_SIZE
 from app.geo import GeoJSONError, RegionBoundaryMissing
-from app.geo.region_estimator import RegionTileEstimate, RegionTileEstimator
+from app.geo.region_estimator import (
+    RegionEstimateCancelled,
+    RegionTileEstimate,
+    RegionTileEstimator,
+)
 from app.geo.tile_math import format_size
 from app.planning.download_plan import DownloadPlan, DownloadPlanItem
 from app.regions.models import RegionCatalogError
@@ -157,7 +161,7 @@ class DownloadPlanEstimator:
     # 单项
     # ------------------------------------------------------------------ #
     def estimate_item(
-        self, item: DownloadPlanItem, *, geometry=None
+        self, item: DownloadPlanItem, *, geometry=None, should_cancel=None
     ) -> RegionTileEstimate | None:
         """估算一个条目并**就地写回**它。
 
@@ -172,20 +176,20 @@ class DownloadPlanEstimator:
         """
         try:
             entry = self._service.require_region(item.region_id)
-            region = self._service.get_download_region(
-                item.region_id, geometry=geometry
-            )
+            region = self._service.get_download_region(item.region_id, geometry=geometry)
             estimate = RegionTileEstimator(
                 region,
                 average_tile_size=self._average_tile_size,
                 geometry=geometry,
-            ).estimate(item.min_zoom, item.max_zoom)
+            ).estimate(
+                item.min_zoom,
+                item.max_zoom,
+                **({"should_cancel": should_cancel} if should_cancel is not None else {}),
+            )
         except _ITEM_ERRORS as exc:
             item.mark_invalid(str(exc))
             item.error = str(exc)
-            _logger.warning(
-                "计划条目 %s 估算失败，已标记为不可用：%s", item.region_id, exc
-            )
+            _logger.warning("计划条目 %s 估算失败，已标记为不可用：%s", item.region_id, exc)
             return None
 
         # 名称 / 等级以**目录**为准：计划文件里的那份只是缓存，可能已经过期
@@ -216,7 +220,7 @@ class DownloadPlanEstimator:
 
         Args:
             plan: 计划（条目会被就地改写）。
-            should_cancel: 每算完一项问一次"还要继续吗"。
+            should_cancel: 在条目开始前和候选瓦片遍历期间检查是否取消。
             progress: 每算完一项回调一次（后台线程里调用，因此实现必须是
                 跨线程安全的：通常就是往主线程发一个 Qt 信号）。
 
@@ -237,7 +241,12 @@ class DownloadPlanEstimator:
                     f"已取消估算（完成 {index - 1}/{total} 项，计划配置未改动）"
                 )
 
-            estimate = self.estimate_item(item)
+            try:
+                estimate = self.estimate_item(
+                    item, **({"should_cancel": should_cancel} if should_cancel is not None else {})
+                )
+            except RegionEstimateCancelled as exc:
+                raise PlanEstimateCancelled(str(exc)) from exc
             if progress is not None:
                 progress(
                     PlanEstimateProgress(

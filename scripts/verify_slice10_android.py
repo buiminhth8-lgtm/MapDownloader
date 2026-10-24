@@ -1247,7 +1247,7 @@ def _scene_gui(app, checker: Checker, work_dir: Path, adb_path: str, root: Path,
     original = QFileDialog.getExistingDirectory
     QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(package_dir))
     try:
-        panel.choose_package_button.click()
+        panel.choose_package_directory_button.click()
     finally:
         QFileDialog.getExistingDirectory = original
 

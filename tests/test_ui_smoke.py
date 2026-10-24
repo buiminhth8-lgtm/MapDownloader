@@ -114,6 +114,8 @@ def window(qapp, tasks_file: Path, preferences) -> MainWindow:
     ``~/MapDownloader/data/tasks.json`` / ``QSettings(ORG_NAME, APP_NAME)``
     会污染真实用户目录，而且用例之间会互相看到对方留下的任务与窗口形状。
     """
+    from app.planning.storage_budget import BudgetSettings
+    preferences.set_storage_budget(BudgetSettings(enabled=False))
     win = MainWindow(task_service=TaskService(TaskStore(tasks_file)), preferences=preferences)
     yield win
     _shutdown_window(win)
@@ -156,6 +158,8 @@ def android_window_factory(qapp, tasks_file: Path, preferences):
         工厂函数；``**client_kwargs`` 透传给 ``FakeAdbClient``
         （例如 ``adb_available=False`` 造出"没装 adb"）。
     """
+    from app.planning.storage_budget import BudgetSettings
+    preferences.set_storage_budget(BudgetSettings(enabled=False))
     windows: list[MainWindow] = []
 
     def factory(**client_kwargs) -> MainWindow:
@@ -507,7 +511,7 @@ def test_choose_package_slot_sets_the_directory(android_window_factory, qapp, mo
         return "D:/maps/packages/beijing"
 
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(_fake))
-    panel.choose_package_button.click()
+    panel.choose_package_directory_button.click()
 
     assert calls, "[选择地图包] 没有弹出目录选择框"
     assert panel.package_dir == "D:/maps/packages/beijing"
@@ -524,7 +528,7 @@ def test_choose_package_cancelled_changes_nothing(android_window_factory, monkey
     monkeypatch.setattr(
         QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: "")
     )
-    panel.choose_package_button.click()
+    panel.choose_package_directory_button.click()
 
     assert panel.package_dir == "D:/maps/packages/keepme"
 
@@ -3764,3 +3768,98 @@ def test_picking_a_city_uses_the_city_zoom_policy(
 
     # 目录里没有的 id 仍然落回矩形（Slice 16 的既定行为，没有被这次改动破坏）
     assert panel.set_region_id("hangzhou") is False
+
+
+def test_choose_downloaded_map_builds_and_selects_package(
+    android_window_factory, work_dir, qapp, monkeypatch
+) -> None:
+    window = android_window_factory()
+    source = _make_complete_map(work_dir / "downloaded.mbtiles")
+    window.download_panel.output_edit.setText(str(work_dir))
+    calls = []
+
+    def choose(*args):
+        calls.append(args)
+        return str(source), ""
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(choose))
+    window.device_panel.choose_package_button.click()
+    assert calls[0][2] == str(work_dir)
+    assert "*.mbtiles" in calls[0][3] and "manifest.json" in calls[0][3]
+    assert window.device_panel.package_dir == ""  # 裸文件不能直接传输
+    dialog = window._package_dialog
+    assert dialog is not None and dialog.path == str(source)
+    _wait_for_source_check(dialog, qapp)
+    dialog.set_output_dir(work_dir / "packages")
+    dialog.start_build()
+    _wait_for_build_result(dialog, qapp)
+    assert dialog.result.success
+    assert window.device_panel.package_dir == dialog.result.package_dir
+    assert _wait_until(
+        qapp, lambda: window._package_check_worker is not None
+        and not window._package_check_worker.isRunning()
+        and window.device_panel.choose_package_button.isEnabled()
+    )
+    assert "PASS" in window.device_panel._package_status.text()
+    assert source.is_file()
+
+
+@pytest.mark.parametrize("filename", ["manifest.json", "map.mbtiles"])
+def test_choose_package_file_uses_its_directory(
+    android_window_factory, work_dir, monkeypatch, filename
+) -> None:
+    window = android_window_factory()
+    package_dir = work_dir / "existing-package"
+    package_dir.mkdir()
+    (package_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (package_dir / "map.mbtiles").write_bytes(b"placeholder")
+    checks = []
+    monkeypatch.setattr(window, "_start_android_package_check", checks.append)
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        staticmethod(lambda *a: (str(package_dir / filename), "")),
+    )
+    window.device_panel.choose_package_button.click()
+    assert checks == [str(package_dir)]
+    assert window.device_panel.package_dir == str(package_dir)
+    assert window._package_dialog is None
+
+
+def test_choose_map_file_cancel_preserves_selected_package(
+    android_window_factory, monkeypatch
+) -> None:
+    window = android_window_factory()
+    window.device_panel.set_package_dir("D:/maps/keep")
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a: ("", ""))
+    )
+    window.device_panel.choose_package_button.click()
+    assert window.device_panel.package_dir == "D:/maps/keep"
+    assert window._package_dialog is None
+
+
+def test_choose_downloading_map_does_not_start_packaging(
+    android_window_factory, work_dir, monkeypatch
+) -> None:
+    window = android_window_factory()
+    source = _make_complete_map(work_dir / "active.mbtiles")
+    monkeypatch.setattr(window, "download_channel_busy", lambda: True)
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a: (str(source), ""))
+    )
+    window.device_panel.choose_package_button.click()
+    assert window._package_dialog is None
+    assert "完成或暂停" in window.log_panel.to_text()
+
+
+def test_package_ready_during_transfer_keeps_current_package(
+    android_window_factory, monkeypatch
+) -> None:
+    window = android_window_factory()
+    window.device_panel.set_package_dir("D:/maps/current")
+    window.device_panel.set_busy(True)
+    checks = []
+    monkeypatch.setattr(window, "_start_android_package_check", checks.append)
+    window._on_android_package_ready("D:/maps/new")
+    assert window.device_panel.package_dir == "D:/maps/current"
+    assert checks == []

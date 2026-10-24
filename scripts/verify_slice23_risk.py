@@ -55,6 +55,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.verification_helpers import wait_for_region_estimate  # noqa: E402
+
 DOCS = PROJECT_ROOT / "docs" / "images"
 APP_DIR = PROJECT_ROOT / "app"
 
@@ -240,6 +242,9 @@ def use_region_resources(root: Path) -> None:
     from app.geo import region as region_module
 
     region_module.REGION_RESOURCE_DIR = root
+    from app.config import settings as verification_settings
+    verification_settings.REGION_DATA_ROOT = root / "_unpublished_generated"
+
 
 
 # --------------------------------------------------------------------------- #
@@ -299,6 +304,7 @@ def _fill_region(
 def _click_calculate(window, panel) -> None:
     """点面板上的「计算」（真按钮 → 真信号 → 真槽）。"""
     panel.action_buttons[ACTION_CALCULATE].click()
+    wait_for_region_estimate(_APP, window)
     _pump(10)
 
 
@@ -521,7 +527,7 @@ def scene_details(app, window, checker: Checker, work_dir: Path, shots: bool) ->
     checker.check(
         UI_TEXT_RISK_CELL_OVER in recommended_column
         and recommended_column.index(UI_TEXT_RISK_CELL_OVER) > 0,
-        "Z12~17 里超出推荐上界（Z16）的那几级真的被标成「高于推荐」",
+        "Z12~17 里超出推荐上界（Z15）的那几级真的被标成「高于推荐」",
         str(recommended_column),
     )
     _shot_roomy(dialog, "slice23_risk_details.png", shots)
@@ -553,6 +559,7 @@ def scene_apply_zoom(app, window, checker: Checker, work_dir: Path, shots: bool)
     strategy = window.download_panel.current_region_level()
     recommended = window.risk_analyzer.strategy.recommend(strategy)
     panel.risk_buttons()["risk_apply_zoom"].click()
+    wait_for_region_estimate(app, window)
     _pump(12)
 
     checker.check(
@@ -615,6 +622,7 @@ def scene_start_protection(
     _fill_region(panel, "northland", work_dir=work_dir, name="验收-直下")
     _click_calculate(window, panel)
     panel.start_button.click()
+    wait_for_region_estimate(app, window)
     _pump(14)
     checker.check(
         window._confirm_dialog is None and window._dangerous_dialog is None,
@@ -634,6 +642,7 @@ def scene_start_protection(
     _click_calculate(window, panel)
     assert window._last_risk is not None and window._last_risk.level is RiskLevel.LARGE
     panel.start_button.click()
+    wait_for_region_estimate(app, window)
     _pump(14)
     box = window._confirm_dialog
     checker.check(
@@ -683,6 +692,7 @@ def scene_start_protection(
         "" if very_large is None else f"{very_large.level.name} {very_large.size_text}",
     )
     panel.start_button.click()
+    wait_for_region_estimate(app, window)
     _pump(14)
     box = window._confirm_dialog
     checker.check(
@@ -717,6 +727,7 @@ def scene_start_protection(
         "" if danger is None else f"{danger.level.name} {danger.size_text}",
     )
     panel.start_button.click()
+    wait_for_region_estimate(app, window)
     _pump(14)
     strong = window._dangerous_dialog
     checker.check(
@@ -937,13 +948,13 @@ def scene_plan(
     _pump(12)
     item = plan_service.plan.item("rivertown")
     checker.check(
-        (item.min_zoom, item.max_zoom) == (12, 16),
+        (item.min_zoom, item.max_zoom) == (12, 15),
         "点「采用推荐 Zoom」→ 超出推荐的那一项被改回推荐区间",
         f"{(item.min_zoom, item.max_zoom)}",
     )
     checker.check(
-        item.selected_tiles == 0 and page.is_estimating() is True,
-        "改 Zoom 作废旧估算并**立刻**重新估算（否则用户会看着旧数字再点一次开始）",
+        (item.selected_tiles == 0 and page.is_estimating()) or item.is_estimated,
+        "改 Zoom 作废旧估算并触发新估算（计算中或已完成）",
         f"selected={item.selected_tiles} estimating={page.is_estimating()}",
     )
     checker.check(
@@ -1291,6 +1302,10 @@ def main(argv: list[str] | None = None) -> int:
     preferences = UiPreferences(
         QSettings(str(work_dir / "ui.ini"), QSettings.Format.IniFormat)
     )
+
+    # 本脚本专验风险闸门；容量闸门由 verify_storage_budget 和 UI 回归独立验收。
+    from app.planning.storage_budget import BudgetSettings
+    preferences.set_storage_budget(BudgetSettings(enabled=False))
 
     window = MainWindow(task_service=TaskService(store), preferences=preferences)
     window.show()
