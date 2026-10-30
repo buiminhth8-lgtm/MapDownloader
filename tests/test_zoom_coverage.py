@@ -4,14 +4,24 @@ import base64
 import json
 import sqlite3
 import zlib
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from scripts.verify_repair import TileServer, service_for
+from scripts.verify_zoom_coverage import make_strategy, run_checks, seed
 from shapely.geometry import Polygon, mapping
 
 from app.downloader import ResumePolicy
-from app.geo import DownloadRegion, GeoBounds, RegionTileEstimator, RegionType, build_region_filter, region_from_task
+from app.geo import (
+    DownloadRegion,
+    GeoBounds,
+    RegionTileEstimator,
+    RegionType,
+    build_region_filter,
+    region_from_task,
+)
 from app.geo.region_estimator import RegionEstimateCancelled
 from app.geo.zoom_coverage import (
     CoverageRule,
@@ -26,8 +36,6 @@ from app.models import MapType
 from app.planning.storage_budget import BudgetInput, BudgetSettings, assess_budget
 from app.services.map_download_service import MapResumeError
 from app.tasks import TaskService, TaskStore
-from scripts.verify_repair import TileServer, service_for
-from scripts.verify_zoom_coverage import make_strategy, run_checks, seed
 
 
 def rectangle(name='a', bounds=(116.2, 39.7, 116.3, 39.8)):
@@ -180,7 +188,7 @@ async def test_resume_refuses_different_strategy_before_any_http(work_dir):
     tasks,task,server,service,_=await seed(work_dir)
     server.requests.clear()
     other=build_coverage('other',[CoverageRule(rectangle(),12,12)])
-    with sqlite3.connect(task.output_path) as db:
+    with closing(sqlite3.connect(task.output_path)) as db, db:
         db.execute("UPDATE metadata SET value=? WHERE name='coverage_data'",(other.coverage_data,))
     with pytest.raises(MapResumeError,match='指纹'):
         await service.resume_task(task,task_service=tasks)
@@ -233,3 +241,32 @@ async def test_budget_uses_unique_tiles_and_resume_deductions(work_dir):
     fresh=assess_budget([replace(request,output_path=work_dir/'fresh.mbtiles')],disk_probe=lambda p:('disk',2**40))
     assert fresh.requests==2*len(tiles(region,8,12))
     assert fresh.new_bytes>=len(region.coverage_data)
+
+
+@pytest.mark.parametrize('key,value', [('minzoom','9'), ('maxzoom','10'), ('bounds','116,39,117,40'),
+                                      ('boundary_version',''), ('region_id','other')])
+async def test_inspection_rejects_envelope_or_identity_tampering(work_dir, key, value):
+    from app.services.mbtiles_inspection_service import MBTilesInspectionService
+    _,task,_,_,_=await seed(work_dir)
+    with closing(sqlite3.connect(task.output_path)) as db, db:
+        db.execute('UPDATE metadata SET value=? WHERE name=?',(value,key))
+    result=MBTilesInspectionService().inspect(task.output_path)
+    assert not result.valid and not result.coverage_checked
+
+
+def test_snapshot_decompression_is_bounded(monkeypatch):
+    import app.geo.zoom_coverage as module
+    region=make_strategy()
+    monkeypatch.setattr(module,'MAX_SNAPSHOT_BYTES',32)
+    with pytest.raises(ValueError,match='过大'):
+        module.coverage_region(region.coverage_data)
+
+
+@pytest.mark.parametrize('field,value',[('version',2),('minZoom',True),('maxZoom',99)])
+def test_malformed_semantic_snapshot_is_rejected(field,value):
+    payload=decode_coverage(make_strategy().coverage_data)
+    target=payload if field=='version' else payload['rules'][0]
+    target[field]=value
+    data=base64.b64encode(zlib.compress(json.dumps(payload).encode())).decode()
+    with pytest.raises(ValueError):
+        coverage_region(data)

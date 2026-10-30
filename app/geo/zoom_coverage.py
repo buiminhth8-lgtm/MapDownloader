@@ -108,6 +108,26 @@ def build_coverage(name, rules):
     return coverage_region(base64.b64encode(zlib.compress(raw, 6)).decode('ascii'))
 
 
+
+def coverage_from_metadata(metadata):
+    """Validate the declared envelope as well as the portable snapshot identity."""
+    fingerprint = metadata.get('boundary_version', '')
+    if metadata.get('region_type') != 'coverage' or len(fingerprint) != 64:
+        raise ValueError('多级覆盖类型或策略指纹缺失')
+    region = coverage_region(metadata.get('coverage_data', ''), expected_fingerprint=fingerprint)
+    try:
+        bounds = GeoBounds(*(float(v) for v in metadata['bounds'].split(',')))
+        low, high = coverage_zoom_range(region)
+        if (int(metadata['minzoom']), int(metadata['maxzoom'])) != (low, high):
+            raise ValueError('声明的 Zoom 范围与覆盖策略不一致')
+        if any(abs(a-b) > 0.00001 for a,b in zip(bounds.as_tuple(), region.bounds.as_tuple(), strict=True)):
+            raise ValueError('声明的范围与覆盖策略不一致')
+        if metadata.get('region_id') != region.region_id:
+            raise ValueError('声明的区域标识与覆盖策略不一致')
+    except (KeyError, TypeError) as exc:
+        raise ValueError('覆盖策略声明缺少关键字段') from exc
+    return region
+
 def coverage_zoom_range(region):
     rules = decode_coverage(region.coverage_data)['rules']
     return min(r['minZoom'] for r in rules), max(r['maxZoom'] for r in rules)
@@ -139,6 +159,8 @@ def save_coverage_snapshot(region, output_path):
 
 
 def coverage_from_task(task):
+    if len(task.boundary_version) != 64:
+        raise ValueError('任务缺少覆盖策略指纹，无法安全继续')
     path = Path(getattr(task, 'coverage_path', '') or '.')
     try:
         if path.is_file():

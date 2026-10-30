@@ -645,6 +645,9 @@ class DownloadManager:
         先 materialize 再过滤会把内存吃光（Spec §9）。
         """
         count = 0
+        if hasattr(region_filter, "iter_selected_tiles") and hasattr(region_filter, "iter_candidate_tiles"):
+            return sum(1 for z in range(min_zoom, max_zoom + 1)
+                       for _ in region_filter.iter_selected_tiles(bounds, z))
         for tile in iter_tile_coordinates(bounds, min_zoom, max_zoom):
             if region_filter.intersects_tile(tile):
                 count += 1

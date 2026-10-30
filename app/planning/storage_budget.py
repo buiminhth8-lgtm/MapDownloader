@@ -177,6 +177,12 @@ class BudgetReport:
         for item in self.items:
             mode = "卫星" if item.request.map_type is MapType.IMAGE else "矢量"
             lines.append(f"\n{item.request.name} · {mode} · {'合成注记' if item.request.with_labels else '纯底图'}")
+            lines.append(f"输出文件：{item.request.output_path}")
+            if item.request.region.coverage_data:
+                from app.geo.zoom_coverage import coverage_summary
+                for rule in coverage_summary(item.request.region)['rules']:
+                    lines.append(f"覆盖规则 · {rule['name']} · Z{rule['minZoom']}～{rule['maxZoom']}")
+                lines.append("逐级按区域并集合并；未配置的级别和区域不要求全覆盖")
             for z in item.zooms:
                 lines.append(f"  Z{z.zoom}：目标 {z.total:,}，已有 {z.existing:,}，新增 {z.missing:,}；"
                              f"约 {z.mean_bytes / 1024:.1f} KiB/张，{z.source}（样本 {z.sample_count}）")
@@ -346,6 +352,13 @@ def assess_budget(requests, settings=None, *, should_cancel=None, progress=None,
         items.append(item)
         disk, free = disk_probe(request.output_path.parent)
         required = item.upper_bytes + (item.final_upper_bytes if settings.packaging_copy else 0)
+        if request.region.coverage_data:
+            from app.geo.zoom_coverage import decode_coverage
+            snapshot = Path(request.output_path).parent / '.coverage' / f'{request.region.boundary_version}.json'
+            if not snapshot.is_file():
+                # Use a conservative UTF-8 JSON envelope for the once-only sidecar write.
+                import json
+                required += len(json.dumps(decode_coverage(request.region.coverage_data), ensure_ascii=False).encode('utf-8'))
         old_free, old_required = disk_totals.get(disk, (free, 0))
         disk_totals[disk] = (min(old_free, free) if old_free is not None and free is not None else None,
                              old_required + required)

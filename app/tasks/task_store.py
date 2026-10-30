@@ -131,7 +131,7 @@ def task_to_payload(task: DownloadTask) -> dict[str, Any]:
         "region_type": str(getattr(task, "region_type", "") or ""),
         "region_id": str(getattr(task, "region_id", "") or ""),
         "boundary_version": str(getattr(task, "boundary_version", "") or ""),
-        **({"coverage_path": str(task.coverage_path)} if task.coverage_path else {}),
+        "coverage_path": str(task.coverage_path or ""),
         "west": float(task.west),
         "south": float(task.south),
         "east": float(task.east),

@@ -116,7 +116,7 @@ TILE_COUNT_BY_ZOOM_SQL = (
     "SELECT zoom_level, COUNT(*) FROM tiles GROUP BY zoom_level"
 )
 
-_SELECT_TABLES_SQL = "SELECT name FROM sqlite_master WHERE type = 'table'"
+_SELECT_TABLES_SQL = "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
 
 #: 抽样查询。``ORDER BY`` 保证"同一份库每次抽到的是同一批瓦片"——
 #: 校验结论必须可复现，否则"有时 PASS 有时 FAIL"根本没法排查。
@@ -781,13 +781,44 @@ class MBTilesReader:
     # 校验支持（validator 用的只读辅助）
     # ------------------------------------------------------------------ #
     def list_tables(self) -> set[str]:
-        """列出库里的表名。
+        """列出库里的表与视图名（标准 MBTiles tiles 接口允许视图）。
 
         有了它，校验器就能区分"缺 metadata 表"与"表在但没数据"这两种
         完全不同的故障，而不必去匹配 ``sqlite3`` 的报错文本。
         """
         conn = self._require_open()
         return {str(row[0]) for row in conn.execute(_SELECT_TABLES_SQL)}
+
+    def normalized_storage_errors(self) -> list[str]:
+        """Check normalized storage relationships which the tiles JOIN would otherwise hide."""
+        if 'metadata' not in self.list_tables() or not {'name','value'} <= set(self.get_table_columns('metadata')):
+            return []
+        metadata = self.get_metadata()
+        conn = self._require_open()
+        errors = []
+        if metadata.get('export_readonly') == 'true' and 'export_tile_count' in metadata and 'tiles' in self.list_tables():
+            try:
+                expected = int(metadata['export_tile_count'])
+                if expected <= 0 or conn.execute('SELECT COUNT(*) FROM tiles').fetchone()[0] != expected:
+                    errors.append('导出瓦片数与固化计数不一致，请修复原图后重新导出')
+            except ValueError:
+                errors.append('导出瓦片固化计数无效')
+        if metadata.get('storage_layout') != 'normalized-v1':
+            return errors
+        row = conn.execute("SELECT type FROM sqlite_master WHERE name='tiles'").fetchone()
+        if row != ('view',):
+            errors.append('normalized-v1 必须通过 tiles 视图提供读取')
+        if not {'tile_id','tile_data','hash'} <= set(self.get_table_columns('images')):
+            return [*errors, 'images 表缺少内容或哈希字段']
+        if not {'zoom_level','tile_column','tile_row','tile_id'} <= set(self.get_table_columns('map')):
+            return [*errors, 'map 表缺少坐标或图像引用字段']
+        if conn.execute('SELECT 1 FROM map LEFT JOIN images ON map.tile_id=images.tile_id WHERE images.tile_id IS NULL LIMIT 1').fetchone():
+            errors.append('map 存在丢失的图片引用，不能将 JOIN 后的数量误报为完整')
+        if conn.execute('SELECT 1 FROM map GROUP BY zoom_level,tile_column,tile_row HAVING COUNT(*)>1 LIMIT 1').fetchone():
+            errors.append('map 存在重复坐标')
+        if conn.execute('SELECT COUNT(*) FROM map').fetchone()[0] != conn.execute('SELECT COUNT(*) FROM tiles').fetchone()[0]:
+            errors.append('map 与 tiles 视图数量不一致')
+        return errors
 
     def sample_tiles(self, limit: int) -> list[tuple[int, int, int, bytes]]:
         """抽样读取若干张瓦片，返回 ``(z, x, y_xyz, data)``（**XYZ** 语义）。

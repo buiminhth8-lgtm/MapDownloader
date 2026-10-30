@@ -286,6 +286,12 @@ class MBTilesWriter:
         # isolation_level=None -> 关闭 pysqlite 的隐式 BEGIN，事务由本类显式控制
         conn = sqlite3.connect(str(self._path), isolation_level=None)
         try:
+            relation = conn.execute("SELECT type FROM sqlite_master WHERE name='tiles'").fetchone()
+            has_metadata = conn.execute("SELECT 1 FROM sqlite_master WHERE name='metadata'").fetchone()
+            readonly = (conn.execute("SELECT value FROM metadata WHERE name='export_readonly'").fetchone()
+                        if has_metadata else None)
+            if relation == ('view',) or readonly == ('true',):
+                raise MBTilesWriteError('优化/分包产物只读，请续传或修复原地图后重新导出')
             for pragma in _PRAGMAS:
                 conn.execute(pragma)
             conn.execute(_CREATE_METADATA_SQL)

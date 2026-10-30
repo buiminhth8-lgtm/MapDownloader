@@ -8,12 +8,16 @@ import os
 import sqlite3
 import sys
 import tempfile
+from contextlib import closing
 from pathlib import Path
+
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from scripts.verify_repair import BROKEN_PNG, TileServer, overwrite_tile, service_for  # noqa: E402
 
 from app.downloader import ResumePolicy  # noqa: E402
 from app.geo import DownloadRegion, GeoBounds, RegionTileEstimator, build_region_filter  # noqa: E402
@@ -28,7 +32,6 @@ from app.models import MapType  # noqa: E402
 from app.services.map_package_service import MapPackageService  # noqa: E402
 from app.services.mbtiles_inspection_service import MBTilesInspectionService  # noqa: E402
 from app.tasks import TaskService, TaskStore  # noqa: E402
-from scripts.verify_repair import BROKEN_PNG, TileServer, overwrite_tile, service_for  # noqa: E402
 
 
 def make_strategy():
@@ -106,7 +109,7 @@ async def run_checks(work_dir):
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
     assert not packages.validate(built.package_dir).valid
     print('[PASS] manifest 覆盖规则被篡改时拒绝通过校验')
-    with sqlite3.connect(task.output_path) as db:
+    with closing(sqlite3.connect(task.output_path)) as db, db:
         db.execute("UPDATE metadata SET value='corrupt' WHERE name='coverage_data'")
     result = MBTilesInspectionService().inspect(task.output_path)
     assert not result.valid and not result.coverage_checked

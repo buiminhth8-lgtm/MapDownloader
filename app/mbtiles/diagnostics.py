@@ -481,6 +481,7 @@ def check_structure(reader: MBTilesReader, result: MBTilesDiagnosticsResult) -> 
     ``metadata`` 缺几个可选键只记 WARNING（那是 :func:`check_metadata` 的事）。
     """
     tables = reader.list_tables()
+    result.errors.extend(reader.normalized_storage_errors())
     result.tables = tuple(sorted(tables))
     for name in REQUIRED_TABLES:
         if name not in tables:
@@ -994,7 +995,11 @@ def check_coverage(
                 zoom,
                 region_filter,
                 MAX_MISSING_TILE_DETAILS - len(details),
+                should_stop=should_stop,
             )
+            if should_stop is not None and should_stop():
+                aborted = True
+                break
             missing = max(0, expected - actual)
             details.extend(found)
 
@@ -1066,10 +1071,9 @@ def _resolve_coverage_region(
     """
     region_type = str(result.metadata.get("region_type") or "").strip().lower()
     if RegionType.parse(region_type) is RegionType.COVERAGE:
-        from app.geo.zoom_coverage import coverage_region
+        from app.geo.zoom_coverage import coverage_from_metadata
         try:
-            region = coverage_region(result.metadata.get("coverage_data", ""),
-                                     expected_fingerprint=result.metadata.get("boundary_version", ""))
+            region = coverage_from_metadata(result.metadata)
             return region, build_region_filter(region), ""
         except ValueError as exc:
             result.errors.append(f"多级覆盖策略损坏：{exc}")
@@ -1101,6 +1105,7 @@ def _polygon_zoom_coverage(
     zoom: int,
     region_filter: PolygonTileRegionFilter,
     detail_limit: int,
+    *, should_stop=None,
 ) -> tuple[int, int, list[str]]:
     """按行政区几何统计某个 zoom 的 ``(expected, actual, missing_details)``。
 
@@ -1119,14 +1124,18 @@ def _polygon_zoom_coverage(
     期望瓦片是千万级，先 materialize 再比对会直接把内存吃光（Spec §9）。
     """
     present: set[tuple[int, int]] = set()
-    for z, x, y in reader.iter_tile_coordinates(zoom):
+    for index, (z, x, y) in enumerate(reader.iter_tile_coordinates(zoom)):
+        if index % 256 == 0 and should_stop is not None and should_stop():
+            return 0, 0, []
         if region_filter.intersects_tile_xyz(z, x, y):
             present.add((x, y))
 
     expected = 0
     actual = 0
     details: list[str] = []
-    for x, y in region_filter.iter_selected_tiles(bounds, zoom):
+    for index, (x, y) in enumerate(region_filter.iter_selected_tiles(bounds, zoom)):
+        if index % 256 == 0 and should_stop is not None and should_stop():
+            return 0, 0, []
         expected += 1
         if (x, y) in present:
             actual += 1

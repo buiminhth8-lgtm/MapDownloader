@@ -466,6 +466,7 @@ class MainWindow(QMainWindow):
         #: 界面偏好（Slice 7，Spec §22）。**不存 Token。**
         self.preferences = preferences or UiPreferences()
         self._storage_budget_dialog = None
+        self._optimization_dialog = None
         self._storage_budget_context = None
         #: Android 传输编排层（Slice 10）。界面不直接碰 adb。
         self.android_service = android_service or AndroidTransferService()
@@ -686,6 +687,9 @@ class MainWindow(QMainWindow):
         self.storage_budget_action = QAction("下载容量预算与预测…", self)
         self.storage_budget_action.triggered.connect(self.open_storage_budget)
         file_menu.addAction(self.storage_budget_action)
+        self.storage_optimization_action = QAction("MBTiles 压缩、去重与区域分包…",self)
+        self.storage_optimization_action.triggered.connect(lambda:self.open_storage_optimization())
+        file_menu.addAction(self.storage_optimization_action)
 
         self.package_action = QAction(f"{UI_TEXT_PACKAGE_BUTTON}(&P)…", self)
         self.package_action.setToolTip(UI_TEXT_PACKAGE_BUTTON_HINT)
@@ -1422,8 +1426,11 @@ class MainWindow(QMainWindow):
             return self._plan_dialog._run_worker
         return None
 
-    def download_channel_busy(self, *, exclude_plan=False) -> bool:
+    def download_channel_busy(self, *, exclude_plan=False, exclude_export=False) -> bool:
         """所有下载入口共用的闸门，确认和准备阶段也占用通道。"""
+        export = self._optimization_dialog
+        if not exclude_export and export is not None and export.holds_channel:
+            return True
         budget = self._storage_budget_dialog
         if budget is not None and (budget.is_running or budget.guarding):
             return True
@@ -2762,6 +2769,34 @@ class MainWindow(QMainWindow):
         else:
             self._begin_plan_storage_budget(proceed)
 
+    def _optimization_targets_factory(self):
+        from app.services.mbtiles_optimizer import ExportTarget
+        entries = tuple((i.region_id,i.region_name,i.min_zoom,i.max_zoom) for i in self.plan_service.plan.enabled_items)
+        if not entries:
+            raise ValueError('下载计划没有启用的可用区域')
+        service = self.plan_service.region_service
+        return lambda: tuple(ExportTarget(name,service.get_download_region(rid),low,high)
+                             for rid,name,low,high in entries)
+
+    def open_storage_optimization(self,path=''):
+        from app.ui.storage_optimization_dialog import StorageOptimizationDialog
+        dialog = self._optimization_dialog
+        if dialog is None:
+            dialog = StorageOptimizationDialog(self,busy_checker=lambda:self.download_channel_busy(exclude_export=True),
+                                                target_factory=self._optimization_targets_factory,
+                                                signature_provider=self._plan_storage_signature)
+            dialog.activity_changed.connect(self._refresh_action_state)
+            dialog.log_message.connect(self.log_panel.append_log)
+            dialog.map_selected.connect(self.open_package_dialog)
+            self._optimization_dialog = dialog
+        if dialog.worker is None:
+            dialog.reserve_bytes=int(self.preferences.storage_budget.reserve_gib*1024**3)
+        if path:
+            dialog.set_source(path)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     @Slot()
     @Slot(str)
     def open_package_dialog(self, path: str = "") -> None:
@@ -2781,6 +2816,7 @@ class MainWindow(QMainWindow):
             dialog = PackageDialog(self)
             dialog.log_message.connect(self.log_panel.append_log)
             dialog.package_ready.connect(self._on_android_package_ready)
+            dialog.optimize_requested.connect(self.open_storage_optimization)
             self._package_dialog = dialog
 
         target = (path or "").strip()
@@ -3015,6 +3051,10 @@ class MainWindow(QMainWindow):
 
         无论如何都**不删** ``.mbtiles``：那是用户已经花掉的配额与时间。
         """
+        export = self._optimization_dialog
+        if export is not None and export.holds_channel:
+            export.shutdown()
+            return
         budget = self._storage_budget_dialog
         if budget is not None and (budget.is_running or budget.guarding):
             budget.reject()
@@ -3108,7 +3148,10 @@ class MainWindow(QMainWindow):
         download = self._download_worker
         plan_running = self._plan_dialog is not None and self._plan_dialog.is_running_plan()
         budget = self._storage_budget_dialog
-        if budget is not None and (budget.is_running or budget.guarding):
+        if self._optimization_dialog is not None and self._optimization_dialog.holds_channel:
+            state = UiTaskState.SCANNING
+            status_text = "正在优化/分包或等待导出确认，可取消"
+        elif budget is not None and (budget.is_running or budget.guarding):
             state = UiTaskState.SCANNING
             status_text = "正在预测容量或等待预算确认，可取消"
         elif plan_running:
@@ -4285,6 +4328,11 @@ class MainWindow(QMainWindow):
         # 还开着的非模态弹窗先关掉，避免它们引用着已销毁的父窗口。
         # 关之前要断开 finished 连接：``close()`` 会发出 Rejected，
         # 不挡掉的话会跑出一堆"已取消下载"的假日志。
+        export = self._optimization_dialog
+        if export is not None and not export.shutdown():
+            event.ignore()
+            self.statusBar().showMessage("优化导出正在停止，请稍后关闭",5000)
+            return
         budget = self._storage_budget_dialog
         if budget is not None and not budget.shutdown():
             event.ignore()

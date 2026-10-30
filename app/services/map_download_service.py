@@ -1049,6 +1049,9 @@ class MapDownloadService:
                 raise MapResumeError(
                     f"已有文件无法读取元数据，不能安全续传：{path}"
                 )
+            with MBTilesReader(path) as export_reader:
+                if export_reader.get_metadata().get('export_readonly') == 'true':
+                    raise MapResumeError('优化/分包产物只读，请续传或修复原地图后重新导出')
             compatibility = check_resume_compatibility(task, metadata)
             if not compatibility.compatible:
                 # 关键：**一张都不写**。往不属于这个任务的地图包里写瓦片，

@@ -19,6 +19,8 @@
 | 一次规划多块地 | [download_plan](download_plan.md) | 一份计划装多个区域 |
 | 让计划自己跑 | [plan_scheduler](plan_scheduler.md) | 串行 / 暂停 / 继续 / 重试 / 跳过 |
 | 沿一条航线下一窄条 | [mission_region](mission_region.md) | 按米缓冲的走廊 |
+| 压缩、内容去重、区域分包 | [storage_optimization](storage_optimization.md) | 只读源地图、PNG/JPEG、osmdroid 查询验证与实际空间报告 |
+| 同一地图包配置多区域、多 Zoom | [zoom_coverage](zoom_coverage.md) | 逐级区域并集、单文件下载、续传与覆盖检查 |
 | 预测卫星/矢量容量、设置预算 | [storage_budget](storage_budget.md) | 本地抽样、续传扣除、分盘预留和裁剪建议 |
 | 怕下太多把盘塞满 | [download_risk_analysis](download_risk_analysis.md) | 四级风险与强确认 |
 | 把包交给 Android | [map_package_v1](map_package_v1.md) | **跨端契约**（字段、目录、版本） |

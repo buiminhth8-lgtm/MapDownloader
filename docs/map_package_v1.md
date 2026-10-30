@@ -227,3 +227,33 @@
 - [ ] `createdAt` 带时区
 
 自动化版本：`python scripts/e2e_smoke_test.py`（见 README「端到端冒烟」）。
+
+
+## Slice 36：单包多级覆盖扩展
+
+旧 manifest 字段保持原样。新单包使用 `region.type = "coverage"`，可选
+`region.coverage` 含 `version: 1`、`fingerprint` 及 `rules` 数组。每条规则包括
+`id`、`name`、`level`、`boundaryVersion`、`bufferMeters`、`minZoom`、`maxZoom`、
+`bounds`（west/south/east/north 数组）。它描述逐级稀疏覆盖，顶层 bounds 仅为总包围盒。
+
+完整几何快照保存在 MBTiles `metadata.coverage_data`（UTF-8 JSON → zlib → Base64），
+不在 manifest 中重复几何。其原始 JSON 规范化后的 SHA-256 与 `boundary_version`
+及摘要 `fingerprint` 一致。验证器同时核对规则摘要、范围、Zoom、快照和已有文件校验值；
+规则损坏时不能退回矩形覆盖判定。图片、标准 `tiles` 表、索引和 XYZ→TMS 约定保持一致。
+
+读取端应将缺少高 Zoom 区域理解为计划内稀疏覆盖，不能只看总 bounds/minZoom/maxZoom
+推断全域高清已齐全。Android 的父级瓦片回退和多包优先级由 Slice 39 实现与验收。
+
+
+## Slice 38：内容去重与只读导出
+
+优化文件保留标准 `metadata` 及 `tiles(zoom_level,tile_column,tile_row,tile_data)` 读取接口。
+`storage_layout=normalized-v1` 使用 `map` 坐标表、`images` 图片表、`tiles` JOIN 视图；
+`storage_layout=flat-export-v1` 使用普通 `tiles` 表。内容哈希采用 SHA-256，命中后仍比较
+图片原字节，坐标一律 TMS 行号。当前读取器、诊断器和打包验证器接受两种结构。
+
+扩展键 `export_readonly=true`、`export_tile_count`、`optimization` 标记派生产物、固化
+瓦片数与压缩参数。源下载器拒绝往这些文件续传或修复，须修复原图后重新导出。
+诊断额外检查 map 图片引用、坐标唯一性、tiles 视图计数与固化计数，防止 JOIN 隐藏坏引用。
+图片压缩不改变格式版本；PNG 注记仍使用 PNG，JPEG 仅允许明确选择的卫星纯底图。
+manifest 中 MBTiles 大小、SHA256 与瓦片数取导出文件实际结果，覆盖规则沿用 Slice 36。

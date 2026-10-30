@@ -148,7 +148,8 @@ class RegionType(Enum):
     @property
     def display_name(self) -> str:
         """界面上的类型名（与预设下拉框里的选项文案一致）。"""
-        return "自定义矩形" if self is RegionType.RECTANGLE else "行政区域"
+        return {RegionType.RECTANGLE: "自定义矩形", RegionType.POLYGON: "行政区域",
+                RegionType.COVERAGE: "多级覆盖"}[self]
 
 
 # --------------------------------------------------------------------------- #
@@ -564,6 +565,7 @@ class DownloadRegion:
             "region_type": self.region_type.value,
             "region_id": self.region_id or "",
             "boundary_version": self.boundary_version or "",
+            **({"coverage_path": self.coverage_path} if self.coverage_data else {}),
         }
 
     def metadata_rows(self) -> dict[str, str]:
@@ -617,6 +619,9 @@ class DownloadRegion:
         "同一件事在两处的写法一致"，方便核对与测试。
         """
         data: dict[str, Any] = {"type": self.region_type.value}
+        if self.coverage_data:
+            from app.geo.zoom_coverage import coverage_summary
+            data["coverage"] = coverage_summary(self)
         if self.region_id:
             data["id"] = self.region_id
         if self.boundary_version:

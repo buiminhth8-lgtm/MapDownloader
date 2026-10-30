@@ -384,6 +384,7 @@ class PackageDialog(QDialog):
 
     #: 想写进主窗口日志区的一行，参数为 ``(文本, 级别)``
     package_ready = Signal(str)
+    optimize_requested = Signal(str)
     log_message = Signal(str, str)
 
     def __init__(
@@ -528,6 +529,9 @@ class PackageDialog(QDialog):
         for button in self.buttons.values():
             button.setProperty("action_id", button.text())
             button_row.addWidget(button)
+        self.optimize_button = QPushButton("压缩/分包…",self)
+        self.optimize_button.clicked.connect(lambda:self.optimize_requested.emit(self.path))
+        button_row.addWidget(self.optimize_button)
         button_row.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -769,6 +773,7 @@ class PackageDialog(QDialog):
         """构建期间只留 [验证地图包]（它作用在另一个目录上）与 [关闭]。"""
         self.buttons["build"].setEnabled(not running and self.diagnostics is not None)
         self.buttons["validate"].setEnabled(not running)
+        self.optimize_button.setEnabled(not running)
         self.choose_file_button.setEnabled(not running)
         self.choose_dir_button.setEnabled(not running)
         self.name_edit.setEnabled(not running)

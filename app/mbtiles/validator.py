@@ -154,6 +154,7 @@ def validate_mbtiles(
 
     try:
         tables = reader.list_tables()
+        result.errors.extend(reader.normalized_storage_errors())
     except sqlite3.DatabaseError as exc:
         result.errors.append(f"无法读取表清单：{exc}")
         reader.close()

@@ -324,10 +324,9 @@ class MapPackageValidator:
         """
         metadata = dict(diagnostics.metadata)
         if metadata.get("region_type") == "coverage" or (manifest.region and manifest.region.region_type == "coverage"):
-            from app.geo.zoom_coverage import coverage_region, coverage_summary
+            from app.geo.zoom_coverage import coverage_from_metadata, coverage_summary
             try:
-                expected = coverage_summary(coverage_region(metadata.get("coverage_data", ""),
-                                                            expected_fingerprint=metadata.get("boundary_version", "")))
+                expected = coverage_summary(coverage_from_metadata(metadata))
                 if manifest.region is None or manifest.region.region_type != "coverage" or manifest.region.coverage != expected:
                     result.errors.append("manifest 多级覆盖规则与 MBTiles 策略不一致")
             except ValueError as exc:
