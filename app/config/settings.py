@@ -618,9 +618,12 @@ UI_TEXT_DEVICE_EMPTY: str = "暂无设备"
 #: Slice 4 起：确实会落盘，提示改为说明输出产物形态（不再是"测试模式"）。
 #: Slice 31 起把类型写进文件名，提示跟着说清楚 —— 否则用户会以为"影像只是
 #: 换了个图层下载"，却在下完之后发现多出一个 ``_img.mbtiles``。
+#: Slice 43 起类型后缀改成中文（``_矢量`` / ``_影像``），提示必须同步：
+#: 界面上写着 ``_vec`` 而磁盘上是 ``_矢量``，是最容易让人"找不到文件"的那种错。
 UI_TEXT_MBTILES_OUTPUT_NOTICE: str = (
     "下载结果将写入 MBTiles 单文件"
-    "（<地图名称>_vec / _img.mbtiles，勾了中文注记再加 _cn），可直接供 osmdroid 读取"
+    "（<地图名称>_矢量 / _影像.mbtiles，取消中文注记时再加 _无注记），"
+    "可直接供 osmdroid 读取"
 )
 
 # --------------------------------------------------------------------------- #
@@ -780,9 +783,10 @@ UI_TEXT_VALIDATION_OUTPUT_DIR_IS_FILE: str = (
     "输出目录指向的是一个文件，不是目录：{path}"
 )
 
-#: 地图名称为空时自动生成（Spec §2.7）。生成规则见
-#: :func:`app.ui.validation.auto_map_name`——用中心点坐标，保证同名区域得到
-#: 同一个名字、不同区域不会撞名。
+#: 地图名称为空时自动生成（Spec §2.7）。Slice 43 起优先用**行政区域名**
+#: （``全国基础包`` / ``江苏省_苏州市``，见
+#: :attr:`app.ui.region_selection.RegionSelectionController.map_name_suggestion`）；
+#: 连区域都没有时才退回坐标名 :func:`app.ui.validation.auto_map_name`。
 UI_TEXT_MAP_NAME_AUTO_GENERATED: str = "地图名称为空，已自动生成：{name}"
 
 #: 取消下载的二次确认（Spec §15）。必须明说"数据会保留"——

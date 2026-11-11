@@ -157,8 +157,8 @@ def build_output_path(
     Args:
         output_dir: 输出目录（不存在也没关系，写入时会自动创建）。
         map_name: 地图名称，会被 :func:`sanitize_map_name` 规整。
-        map_type: 地图类型（或底图/注记图层标识），决定后缀是 ``_vec`` / ``_img``。
-        with_labels: 是否把中文注记合成进瓦片；``True`` 时后缀再加 ``_cn``
+        map_type: 地图类型（或底图/注记图层标识），决定后缀是 ``_矢量`` / ``_影像``。
+        with_labels: 是否把中文注记合成进瓦片；``False`` 时后缀再加 ``_无注记``
             —— 底图与"底图 + 注记"的内容互斥，不该共用一个文件名。
 
     Returns:

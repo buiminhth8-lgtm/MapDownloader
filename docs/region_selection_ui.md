@@ -130,6 +130,44 @@ def level(self) -> RegionLevel:
 这条很重要：**边界文件还没放好的条目，等级照样是准的**（等级是元数据）。
 缺文件时等级照样显示 `PROVINCE`，用户知道自己选对了地方，只是数据没到位。
 
+### 级联同时决定默认文件名（Slice 43）
+
+地图名称默认**跟着级联走**，不需要用户自己去名称框里敲一遍。规则一句话：
+**国家之后的每一级都保留，用 `_` 连接；国家本身不写进名字。**
+
+| 级联选择 | 名称框 | 默认输出文件（矢量 + 中文注记） |
+| --- | --- | --- |
+| 中国 / 全部省份 | `全国基础包` | `全国基础包_矢量.mbtiles` |
+| 中国 / 江苏省 / 全部 | `江苏省` | `江苏省_矢量.mbtiles` |
+| 中国 / 江苏省 / 苏州市 | `江苏省_苏州市` | `江苏省_苏州市_矢量.mbtiles` |
+| 中国 / 江苏省 / 苏州市 / 昆山市 | `江苏省_苏州市_昆山市` | `江苏省_苏州市_昆山市_矢量.mbtiles` |
+| 中国 / 北京市 / 东城区 | `北京市_东城区` | `北京市_东城区_矢量.mbtiles` |
+
+三个实现上的取舍：
+
+- **为什么不写"中国"。** 用户已经站在"中国"这个上下文里（那一行就写着），
+  每次都一样的前缀只是噪声。而全国级又不能只用"中国"（那像一份行政区划名录），
+  于是单给一个 `全国基础包` —— 它说的是这个包的**用途**，不是它的范围。
+- **为什么按真实父子链拼，而不是"省 + 市 + 县"三段。** 直辖市下辖区只有
+  "市 → 区"两段，省直辖县级市也是两段；按段数硬拼会给这两类凭空多出或少掉一级
+  （`北京市__东城区` 那种连续下划线）。按目录里的 `parentId` 往上走到国家为止，
+  特殊情况自动就是对的。
+- **类型段与名称段用同一个词。** 下拉框写"矢量地图"，文件名就是 `_矢量`；
+  只有**取消**「下载中文注记图层」时才追加 `_无注记`（默认态不加词，
+  最常见的那个包名字最短，也最不容易撞车）。
+
+名称只在**用户没手动改过**时跟随：一旦在名称框里敲了自己的名字，切省切市都不会
+覆盖它；把名称清空 = "没意见，按区域来"，下一次「计算」会补回区域名。
+判定与写回都在 `DownloadPanel`（`_sync_auto_map_name` / `_on_map_name_edited`），
+名称本身由 `RegionSelectionController.map_name_suggestion` 从目录推导 ——
+面板里没有一处"省 + 市"的字符串拼接。
+
+![选到市级时名称框与级联一致](images/slice43_naming_city.png)
+
+截图（`scripts/verify_slice43_map_naming.py` 生成）：级联停在「中国 / 江苏省 /
+苏州市 / 全部」，名称框是 `江苏省_苏州市`，底部提示同步写清 `_矢量` / `_影像` /
+`_无注记` 三种后缀 —— 界面上写的词和磁盘上的文件名必须是同一套。
+
 ---
 
 ## 3. 推荐 Zoom / 自定义 Zoom
@@ -397,6 +435,10 @@ panel.get_form_data()          # 多了 region_id / region_level / zoom_mode
     tests/test_download_panel_region_selection.py tests/test_ui_preferences.py \
     tests/test_ui_smoke.py -q
 .venv/Scripts/python.exe -m pytest -q          # 全量，确认无回归
+
+# 按区域自动命名（Slice 43）：真窗口 + 真下载一次，截图落 docs/images/
+.venv/Scripts/python.exe scripts/verify_slice43_map_naming.py
+.venv/Scripts/python.exe scripts/verify_slice43_map_naming.py --offscreen --no-shots
 
 # 实机验收（真 windows 平台插件、真窗口、真关窗再开、真点「计算」、截图落 docs/）
 .venv/Scripts/python.exe scripts/verify_slice19_region_ui.py

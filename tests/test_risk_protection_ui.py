@@ -452,6 +452,16 @@ def test_only_one_gate_fires_per_task(
     _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
+    # 点「开始下载」之后先跑一次**后台**区域估算（几何裁剪不阻塞主线程），
+    # 确认框要等估算回来才建。只 `_flush` 一次在快机器上够、机器一忙就不够 ——
+    # 这条曾经因此在全量跑里偶发失败。等价于用户"等一下看到确认框"。
+    import time
+
+    deadline = time.monotonic() + 10
+    while window._estimate_worker is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.002)
+    _flush(qapp)
 
     dialog = window._confirm_dialog
     assert dialog is not None

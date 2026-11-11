@@ -21,10 +21,18 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from app.config.settings import DEFAULT_MAP_NAME
 
-__all__ = ["sanitize_filename", "sanitize_map_name"]
+__all__ = [
+    "CHINA_NATIONWIDE_MAP_NAME",
+    "NATIONWIDE_BASE_SUFFIX",
+    "nationwide_map_name",
+    "region_map_name",
+    "sanitize_filename",
+    "sanitize_map_name",
+]
 
 
 #: Windows 文件名非法字符（``\\ / : * ? " < > |``）与其余控制字符
@@ -74,3 +82,73 @@ def sanitize_map_name(name: str) -> str:
 #: 项目里的既有名字是 ``sanitize_map_name``（Slice 7 起的全部调用方与测试都用它），
 #: 因此保留原名字、加一个别名，而不是为一个叫法去改十几处调用点。
 sanitize_filename = sanitize_map_name
+
+
+# --------------------------------------------------------------------------- #
+# 按行政区域自动命名（Slice 43）
+# --------------------------------------------------------------------------- #
+#: 全国级下载的固定名字。用户点的是"中国 + 全部省份"，产出的却叫
+#: ``中国_矢量.mbtiles`` 会让人以为这是个国家名录之类的东西；"全国基础包"才是
+#: 那个包的用途（一张全国底图，作为其他包的底座）。
+CHINA_NATIONWIDE_MAP_NAME: str = "全国基础包"
+
+#: 非中国国家的全国级名字后缀（``示例国`` → ``示例国基础包``）。
+#: 不套用"全国基础包"：那个词是给中国的，别的国家叫什么就写什么。
+NATIONWIDE_BASE_SUFFIX: str = "基础包"
+
+
+def region_map_name(names: Sequence[str]) -> str:
+    """把"省 / 市 / 县"这条名称链拼成地图名称的主体。
+
+    规则（与界面上的级联选择一一对应）::
+
+        中国 + 全部省份            → 全国基础包          （不经过本函数）
+        中国 + 江苏省 + 全部        → 江苏省
+        中国 + 江苏省 + 苏州市      → 江苏省_苏州市
+        中国 + 江苏省 + 苏州市 + 昆山市 → 江苏省_苏州市_昆山市
+
+    也就是说**国家级之后的所有层级都保留**，用 ``_`` 连接。不按等级写死
+    "市级拼两段"这类规则，是因为直辖市与省直辖县根本不遵循那条：
+    ``北京市 + 东城区`` 只有两段，``江苏省 + 昆山市``（省直辖县级市）同样只有两段，
+    写死段数会让这两类区域凭空缺一级或多出一级。按"实际选中的这条链"拼，
+    两种特殊情况自动就是对的。
+
+    分隔符用 ``_`` 而不是空格：文件名里空格在命令行、``adb push``、脚本里都要
+    额外引号，而 ``江苏省_苏州市`` 已经足够可读。
+
+    Args:
+        names: 国家**之后**的名称链，从最上级到当前区域（例如
+            ``["江苏省", "苏州市"]``）。空序列在调用方处理（那代表国家级）。
+
+    Returns:
+        拼接后的名称主体；空项会被跳过，因此不会出现 ``江苏省__苏州市``。
+
+    >>> region_map_name(["江苏省"])
+    '江苏省'
+    >>> region_map_name(["江苏省", "苏州市"])
+    '江苏省_苏州市'
+    >>> region_map_name(["北京市", "东城区"])
+    '北京市_东城区'
+    """
+    return "_".join(part for part in (str(name).strip() for name in names) if part)
+
+
+def nationwide_map_name(country_name: str, *, is_china: bool = False) -> str:
+    """全国级下载的名称主体。
+
+    Args:
+        country_name: 国家名（国家节点的 ``name``）。
+        is_china: 这个国家是不是中国（由调用方按 ``region_id`` 判定，不按名字
+            猜 —— 名字是可以被数据包改的）。
+
+    Returns:
+        中国 → :data:`CHINA_NATIONWIDE_MAP_NAME`；其余国家 → ``<国名>基础包``。
+
+    >>> nationwide_map_name("中国", is_china=True)
+    '全国基础包'
+    >>> nationwide_map_name("示例国")
+    '示例国基础包'
+    """
+    if is_china:
+        return CHINA_NATIONWIDE_MAP_NAME
+    return f"{str(country_name).strip()}{NATIONWIDE_BASE_SUFFIX}"

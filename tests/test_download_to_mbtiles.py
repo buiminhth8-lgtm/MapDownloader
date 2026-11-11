@@ -646,15 +646,15 @@ def test_sanitize_map_name(raw: str, expected: str) -> None:
 def test_build_output_path(work_dir: Path) -> None:
     assert (
         build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
-        == work_dir / "beijing_vec.mbtiles"
+        == work_dir / "beijing_矢量_无注记.mbtiles"
     )
     assert (
         build_output_path(work_dir, "a/b", map_type=MapType.IMAGE)
-        == work_dir / "a_b_img.mbtiles"
+        == work_dir / "a_b_影像_无注记.mbtiles"
     )
     assert (
         build_output_path(work_dir, "", map_type=MapType.VECTOR)
-        == work_dir / "offline_map_vec.mbtiles"
+        == work_dir / "offline_map_矢量_无注记.mbtiles"
     )
 
 

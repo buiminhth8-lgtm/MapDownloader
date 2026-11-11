@@ -421,3 +421,199 @@ def test_load_document_raises_the_documented_errors(region_root: Path) -> None:
 def test_missing_message_points_at_the_file(controller: RegionSelectionController) -> None:
     """没选区域时也要给一句话，而不是空串。"""
     assert controller.missing_message() == "还没有选择行政区域"
+
+
+# --------------------------------------------------------------------------- #
+# 按区域自动生成的地图名（Slice 43）
+# --------------------------------------------------------------------------- #
+#: 与真实中国目录同构的一小份：省 → 市 → 县，外加一个直辖市（下辖区直接挂省）。
+_CHINA_ENTRIES: list[dict] = [
+    {"id": "china", "name": "中国", "level": "country", "parentId": None,
+     "geojson": "country/china.geojson"},
+    {"id": "jiangsu", "name": "江苏省", "level": "province", "parentId": "china",
+     "geojson": "province/jiangsu.geojson"},
+    {"id": "suzhou", "name": "苏州市", "level": "city", "parentId": "jiangsu",
+     "geojson": "city/suzhou.geojson"},
+    {"id": "kunshan", "name": "昆山市", "level": "county", "parentId": "suzhou",
+     "geojson": "county/kunshan.geojson"},
+    {"id": "beijing", "name": "北京市", "level": "province", "parentId": "china",
+     "geojson": "province/beijing.geojson"},
+    {"id": "dongcheng", "name": "东城区", "level": "county", "parentId": "beijing",
+     "geojson": "county/dongcheng.geojson"},
+]
+
+
+def _china_controller(tmp_path: Path) -> RegionSelectionController:
+    return RegionSelectionController(RegionService(root=_catalog_root(tmp_path, _CHINA_ENTRIES)))
+
+
+def test_map_name_suggestion_adds_one_level_at_a_time(tmp_path: Path) -> None:
+    """用户点下来的每一级，名字就跟着长一级（这正是他要的文件名）。
+
+    全国 → ``全国基础包``（不写"中国"）；省 → ``江苏省``；市 → ``江苏省_苏州市``；
+    县 → 再加一段。国家节点永远不出现 —— 它是所有选择共同的上下文。
+    """
+    controller = _china_controller(tmp_path)
+
+    assert controller.select_country("china") is True
+    assert controller.map_name_suggestion == "全国基础包"
+
+    assert controller.select_province("jiangsu") is True
+    assert controller.map_name_suggestion == "江苏省"
+
+    assert controller.select_city("suzhou") is True
+    assert controller.map_name_suggestion == "江苏省_苏州市"
+
+    assert controller.select_county("kunshan") is True
+    assert controller.map_name_suggestion == "江苏省_苏州市_昆山市"
+
+
+def test_map_name_suggestion_handles_municipalities_without_a_city_level(tmp_path: Path) -> None:
+    """直辖市下辖区只有"省 → 区"两段 —— 不能按固定段数硬拼。
+
+    这正是"按真实父子链拼"而不是"省 + 市 + 县三段"的理由：北京没有市级上级，
+    硬拼会拼出 ``北京市__东城区``（中间空一段）。
+    """
+    controller = _china_controller(tmp_path)
+    assert controller.select_country("china") is True
+    assert controller.select_province("beijing") is True
+    assert controller.select_county("dongcheng") is True
+
+    assert controller.map_name_suggestion == "北京市_东城区"
+
+
+def test_map_name_suggestion_names_other_countries_by_their_own_name(
+    controller: RegionSelectionController,
+) -> None:
+    """"全国基础包"是给中国的词；别的国家叫什么就写什么，不套用。"""
+    assert controller.select_country("demoland") is True
+    assert controller.map_name_suggestion == "示例国基础包"
+
+    assert controller.select_province("northland") is True
+    assert controller.map_name_suggestion == "示例北省"
+
+    assert controller.select_city("rivertown") is True
+    assert controller.map_name_suggestion == "示例北省_示例河市"
+
+
+def test_map_name_suggestion_is_empty_without_a_country(
+    controller: RegionSelectionController,
+) -> None:
+    """什么都没选时返回空串 —— 调用方据此保留用户已填的名字，不拿空串覆盖。"""
+    controller.reset()
+    assert controller.map_name_suggestion == ""
+
+
+def test_map_name_suggestion_survives_a_broken_parent_link(tmp_path: Path) -> None:
+    """父 id 指向不存在的记录：退化成"只有自己这一段"，绝不死循环/抛异常。
+
+    目录坏了该由校验器报错；界面不该因此卡住或崩掉（Spec §13 的同一原则）。
+    """
+    entries = [
+        {"id": "china", "name": "中国", "level": "country", "parentId": None,
+         "geojson": "country/china.geojson"},
+        {"id": "orphan", "name": "孤儿市", "level": "city", "parentId": "missing",
+         "geojson": "city/orphan.geojson"},
+    ]
+    controller = RegionSelectionController(RegionService(root=_catalog_root(tmp_path, entries)))
+    assert controller.select_region("orphan") is True
+
+    assert controller.map_name_suggestion == "孤儿市"
+
+
+# --------------------------------------------------------------------------- #
+# 按区域自动生成的地图名（Slice 43）
+# --------------------------------------------------------------------------- #
+#: 与真实中国目录同构的一小份：省 → 市 → 县，外加一个直辖市（下辖区直接挂省）。
+_CHINA_ENTRIES: list[dict] = [
+    {"id": "china", "name": "中国", "level": "country", "parentId": None,
+     "geojson": "country/china.geojson"},
+    {"id": "jiangsu", "name": "江苏省", "level": "province", "parentId": "china",
+     "geojson": "province/jiangsu.geojson"},
+    {"id": "suzhou", "name": "苏州市", "level": "city", "parentId": "jiangsu",
+     "geojson": "city/suzhou.geojson"},
+    {"id": "kunshan", "name": "昆山市", "level": "county", "parentId": "suzhou",
+     "geojson": "county/kunshan.geojson"},
+    {"id": "beijing", "name": "北京市", "level": "province", "parentId": "china",
+     "geojson": "province/beijing.geojson"},
+    {"id": "dongcheng", "name": "东城区", "level": "county", "parentId": "beijing",
+     "geojson": "county/dongcheng.geojson"},
+]
+
+
+def _china_controller(tmp_path: Path) -> RegionSelectionController:
+    return RegionSelectionController(RegionService(root=_catalog_root(tmp_path, _CHINA_ENTRIES)))
+
+
+def test_map_name_suggestion_adds_one_level_at_a_time(tmp_path: Path) -> None:
+    """用户点下来的每一级，名字就跟着长一级（这正是他要的文件名）。
+
+    全国 → ``全国基础包``（不写"中国"）；省 → ``江苏省``；市 → ``江苏省_苏州市``；
+    县 → 再加一段。国家节点永远不出现 —— 它是所有选择共同的上下文。
+    """
+    controller = _china_controller(tmp_path)
+
+    assert controller.select_country("china") is True
+    assert controller.map_name_suggestion == "全国基础包"
+
+    assert controller.select_province("jiangsu") is True
+    assert controller.map_name_suggestion == "江苏省"
+
+    assert controller.select_city("suzhou") is True
+    assert controller.map_name_suggestion == "江苏省_苏州市"
+
+    assert controller.select_county("kunshan") is True
+    assert controller.map_name_suggestion == "江苏省_苏州市_昆山市"
+
+
+def test_map_name_suggestion_handles_municipalities_without_a_city_level(tmp_path: Path) -> None:
+    """直辖市下辖区只有"省 → 区"两段 —— 不能按固定段数硬拼。
+
+    这正是"按真实父子链拼"而不是"省 + 市 + 县三段"的理由：北京没有市级上级，
+    硬拼会拼出 ``北京市__东城区``（中间空一段）。
+    """
+    controller = _china_controller(tmp_path)
+    assert controller.select_country("china") is True
+    assert controller.select_province("beijing") is True
+    assert controller.select_county("dongcheng") is True
+
+    assert controller.map_name_suggestion == "北京市_东城区"
+
+
+def test_map_name_suggestion_names_other_countries_by_their_own_name(
+    controller: RegionSelectionController,
+) -> None:
+    """"全国基础包"是给中国的词；别的国家叫什么就写什么，不套用。"""
+    assert controller.select_country("demoland") is True
+    assert controller.map_name_suggestion == "示例国基础包"
+
+    assert controller.select_province("northland") is True
+    assert controller.map_name_suggestion == "示例北省"
+
+    assert controller.select_city("rivertown") is True
+    assert controller.map_name_suggestion == "示例北省_示例河市"
+
+
+def test_map_name_suggestion_is_empty_without_a_country(
+    controller: RegionSelectionController,
+) -> None:
+    """什么都没选时返回空串 —— 调用方据此保留用户已填的名字，不拿空串覆盖。"""
+    controller.reset()
+    assert controller.map_name_suggestion == ""
+
+
+def test_map_name_suggestion_survives_a_broken_parent_link(tmp_path: Path) -> None:
+    """父 id 指向不存在的记录：退化成"只有自己这一段"，绝不死循环/抛异常。
+
+    目录坏了该由校验器报错；界面不该因此卡住或崩掉（Spec §13 的同一原则）。
+    """
+    entries = [
+        {"id": "china", "name": "中国", "level": "country", "parentId": None,
+         "geojson": "country/china.geojson"},
+        {"id": "orphan", "name": "孤儿市", "level": "city", "parentId": "missing",
+         "geojson": "city/orphan.geojson"},
+    ]
+    controller = RegionSelectionController(RegionService(root=_catalog_root(tmp_path, entries)))
+    assert controller.select_region("orphan") is True
+
+    assert controller.map_name_suggestion == "孤儿市"

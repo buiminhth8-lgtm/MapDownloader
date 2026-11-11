@@ -365,24 +365,24 @@ def test_plan_directory_prefers_the_explicit_output_dir() -> None:
 
 
 def test_file_stem_matches_the_spec_examples() -> None:
-    """Spec §15 的例子，加上 Slice 31 的类型后缀：``china_z4_10_vec.mbtiles``。"""
+    """Spec §15 的例子，加上 Slice 31 的类型后缀：``china_z4_10_矢量_无注记.mbtiles``。"""
     assert (
         item_file_stem(
             make_item("china", min_zoom=4, max_zoom=10), map_type=MapType.VECTOR
         )
-        == "china_z4_10_vec"
+        == "china_z4_10_矢量_无注记"
     )
     assert (
         item_file_stem(
             make_item("zhejiang", min_zoom=9, max_zoom=13), map_type=MapType.VECTOR
         )
-        == "zhejiang_z9_13_vec"
+        == "zhejiang_z9_13_矢量_无注记"
     )
     assert (
         item_file_stem(
             make_item("hangzhou", min_zoom=12, max_zoom=16), map_type=MapType.IMAGE
         )
-        == "hangzhou_z12_16_img"
+        == "hangzhou_z12_16_影像_无注记"
     )
 
 
@@ -396,32 +396,32 @@ def test_file_stem_marks_type_and_labels() -> None:
         item_file_stem(item, map_type=MapType.IMAGE, with_labels=True),
     }
     assert names == {
-        "china_z4_10_vec",
-        "china_z4_10_vec_cn",
-        "china_z4_10_img",
-        "china_z4_10_img_cn",
+        "china_z4_10_矢量_无注记",
+        "china_z4_10_矢量",
+        "china_z4_10_影像_无注记",
+        "china_z4_10_影像",
     }
 
 
 def test_file_stem_is_sanitized_for_windows() -> None:
     stem = item_file_stem(make_item("a/b:c"), map_type=MapType.VECTOR)
-    assert stem == "a_b_c_z4_10_vec"
+    assert stem == "a_b_c_z4_10_矢量_无注记"
 
 
 def test_file_stem_dedupes_against_taken_names() -> None:
     """同名时安全处理（Spec §15）：**不覆盖**前一个。"""
     item = make_item("china", min_zoom=4, max_zoom=10)
     assert (
-        item_file_stem(item, map_type=MapType.VECTOR, taken=["china_z4_10_vec"])
-        == "china_z4_10_vec-2"
+        item_file_stem(item, map_type=MapType.VECTOR, taken=["china_z4_10_矢量_无注记"])
+        == "china_z4_10_矢量_无注记-2"
     )
     assert (
         item_file_stem(
             item,
             map_type=MapType.VECTOR,
-            taken=["china_z4_10_vec", "china_z4_10_vec-2"],
+            taken=["china_z4_10_矢量_无注记", "china_z4_10_矢量_无注记-2"],
         )
-        == "china_z4_10_vec-3"
+        == "china_z4_10_矢量_无注记-3"
     )
 
 
@@ -443,8 +443,8 @@ def test_vector_and_image_plans_of_the_same_name_do_not_collide() -> None:
 
     # 目录相同（计划名就是目录名），但文件名必须不同
     assert vector_path.parent == image_path.parent
-    assert vector_path.name == "china_z4_10_vec.mbtiles"
-    assert image_path.name == "china_z4_10_img.mbtiles"
+    assert vector_path.name == "china_z4_10_矢量_无注记.mbtiles"
+    assert image_path.name == "china_z4_10_影像_无注记.mbtiles"
 
 
 def test_plan_keeps_the_type_suffix_in_sync_with_its_labels() -> None:
@@ -456,8 +456,8 @@ def test_plan_keeps_the_type_suffix_in_sync_with_its_labels() -> None:
     for plan in (plain, labeled):
         plan.add_item(make_item("china", selected_tiles=1, candidate_tiles=1))
 
-    assert planned_output_paths(plain)["china"].name == "china_z4_10_img.mbtiles"
-    assert planned_output_paths(labeled)["china"].name == "china_z4_10_img_cn.mbtiles"
+    assert planned_output_paths(plain)["china"].name == "china_z4_10_影像_无注记.mbtiles"
+    assert planned_output_paths(labeled)["china"].name == "china_z4_10_影像.mbtiles"
 
 
 def test_plan_map_type_defaults_to_vector_for_legacy_plans() -> None:
@@ -475,8 +475,8 @@ def test_planned_output_paths_only_covers_enabled_in_order() -> None:
 
     paths = planned_output_paths(plan)
     assert list(paths) == ["china", "hangzhou"]
-    assert paths["china"] == Path("D:/out/计划/china_z4_10_vec.mbtiles")
-    assert paths["hangzhou"] == Path("D:/out/计划/hangzhou_z4_10_vec.mbtiles")
+    assert paths["china"] == Path("D:/out/计划/china_z4_10_矢量_无注记.mbtiles")
+    assert paths["hangzhou"] == Path("D:/out/计划/hangzhou_z4_10_矢量_无注记.mbtiles")
     # 缺省输出目录时落到 DEFAULT_OUTPUT_DIR（不在这里创建任何目录）
     assert plan_directory(DownloadPlan(name="p")).name == "p"
 

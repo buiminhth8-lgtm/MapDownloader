@@ -292,6 +292,19 @@ class DownloadPanel(QGroupBox):
         #: 表现为切换省时城市列表被清两次、或者推荐值把用户刚选的东西顶掉。
         self._syncing: bool = False
 
+        #: 地图名称是否**跟随行政区域**自动更新（Slice 43）。
+        #: 默认跟随：用户选"中国 / 江苏省 / 苏州市"就该看到
+        #: ``江苏省_苏州市_矢量.mbtiles``，不必自己去名称框里敲一遍。一旦他手动
+        #: 改过名称，就停止跟随 —— 谁都不希望自己刚敲的名字被下一次切省顶掉。
+        #: 名称被清空时恢复跟随（"空"意味着"没意见，按区域来"）。
+        self._map_name_follows_region: bool = True
+        #: 上一次由程序自动写入的名称。用来区分"用户改了"与"程序刚写的"：
+        #: 只有当前文本**不等于**它，才算用户真的动过手。
+        self._auto_map_name: str = ""
+        #: 名称输入框是否已建好。级联在 ``_build_area_form`` 里就会刷新一次区域，
+        #: 那时输出表单还没建（构造顺序如此），同步名称要等到这一步之后。
+        self._name_ready: bool = False
+
         self._build_general_form()
         self._build_area_form()
         self._build_output_form()
@@ -828,7 +841,7 @@ class DownloadPanel(QGroupBox):
         return None if entry is None else entry.id
 
     def _refresh_region_state(self) -> None:
-        """重新加载当前区域边界，并刷新等级 / Zoom 建议。
+        """重新加载当前区域边界，并刷新等级 / Zoom 建议 / 自动地图名。
 
         级联变化（换国家/省/市/县）、重新发布行政区数据、以及面板初次装配
         都走这里。范围**只**来自边界文件 —— 没有任何"顺手填一个默认矩形"的
@@ -837,6 +850,7 @@ class DownloadPanel(QGroupBox):
         self._load_selected_region()
         self._apply_zoom_mode()
         self._refresh_zoom_policy_hint()
+        self._sync_auto_map_name()
 
     def _load_selected_region(self) -> None:
         """加载当前生效区域的边界，缓存几何并回填只读范围（Spec §8）。
@@ -1133,11 +1147,39 @@ class DownloadPanel(QGroupBox):
 
         self._browse_button.clicked.connect(self._on_browse_clicked)
         self._output_edit.textChanged.connect(self._on_output_config_changed)
-        self._map_name_edit.textChanged.connect(self._on_output_config_changed)
+        # 名称单独接一个槽：要借"谁改的"决定要不要停止跟随区域（Slice 43）。
+        self._map_name_edit.textChanged.connect(self._on_map_name_edited)
+
+        # 控件就位后立刻按当前区域落一个名字（国家级 → ``全国基础包``）。
+        # 放在这里而不是构造开头：``_build_area_form`` 已经刷新过一次区域，
+        # 但那时本方法还没执行，名称框根本不存在。
+        self._name_ready = True
+        self._sync_auto_map_name()
 
     @Slot()
     def _on_output_config_changed(self) -> None:
-        """输出目录 / 地图名称变了，通知外部刷新预览。"""
+        """输出目录变了，通知外部刷新预览。"""
+        self.output_config_changed.emit()
+
+    @Slot()
+    def _on_map_name_edited(self) -> None:
+        """用户改动了地图名称 —— 记录"是否还跟随区域"并刷新预览。
+
+        三种情况，区别只在用户意图：
+
+        - **清空** → 恢复跟随。空名字的意思是"我没意见，按区域来"，下一次
+          区域变化或点「计算」时补回 ``江苏省_苏州市``。
+        - **改成别的** → 停止跟随。这是他明确指定的名字，不能被下一次切省顶掉。
+        - **恰好等于程序刚写的那个** → 什么都不做（``_apply_auto_map_name``
+          临时屏蔽了信号，正常情况下不会走到这里；防御性保留）。
+        """
+        text = self._map_name_edit.text().strip()
+        if not text:
+            self._map_name_follows_region = True
+        elif text != self._auto_map_name:
+            self._map_name_follows_region = False
+            # 清掉自动值：以后文本再变回它也不算"没动过手"。
+            self._auto_map_name = ""
         self.output_config_changed.emit()
 
     def _build_buttons(self) -> None:
@@ -1386,30 +1428,88 @@ class DownloadPanel(QGroupBox):
         return self._map_name_edit.text().strip()
 
     def set_map_name(self, name: str) -> None:
-        """写入地图名称（回填与自动生成共用）。"""
+        """写入地图名称（回填与外部指定共用）。
+
+        **这是一次显式指定**：写入之后名称不再跟随行政区域，直到用户把这个框
+        清空（见 :meth:`_on_map_name_edited`）。任务回填、验收脚本里的固定名字
+        都走这里，因此不会被下一次切换区域悄悄改掉。
+        """
+        self._auto_map_name = ""
+        self._map_name_follows_region = False
         self._map_name_edit.setText(str(name))
+
+    def suggested_map_name(self) -> str:
+        """当前行政区域建议的地图名称主体（不含类型后缀）。
+
+        例如 ``全国基础包`` / ``江苏省`` / ``江苏省_苏州市``。没有选国家时返回
+        空串 —— 那种情况下调用方应保留用户已填的名字，别拿一个空串去覆盖。
+        """
+        return self._controller.map_name_suggestion
+
+    def _apply_auto_map_name(self, name: str) -> None:
+        """把自动生成的名字写进输入框，**不**改变"是否跟随"。
+
+        屏蔽 ``textChanged`` 的原因：那是"用户改动了名称"的信号，而这里是程序
+        自己写的。不屏蔽的话，每次切区域都会被误判成"用户手动改名"，跟随逻辑
+        第一次就自我关闭了。
+        """
+        self._auto_map_name = name
+        blocked = self._map_name_edit.blockSignals(True)
+        try:
+            self._map_name_edit.setText(name)
+        finally:
+            self._map_name_edit.blockSignals(blocked)
+        # 信号被屏蔽了，预览刷新要自己发一次 —— 否则"输出文件"那一行还停在
+        # 上一个区域的名字上。
+        self.output_config_changed.emit()
+
+    def _sync_auto_map_name(self) -> str | None:
+        """区域变化后，若仍在跟随则把名称改成区域名（Slice 43）。
+
+        Returns:
+            本次写入的名称；没跟随 / 没有建议名 / 名字本来就一样时返回 ``None``。
+        """
+        if not self._name_ready or not self._map_name_follows_region:
+            return None
+        suggested = self.suggested_map_name()
+        if not suggested:
+            return None
+        if suggested == self.map_name_text():
+            # 文本已经是对的（例如任务回填的名字恰好等于区域名）：
+            # 记下自动值，让后续"用户再改成别的"能被正确识别为手动改动。
+            self._auto_map_name = suggested
+            return None
+        self._apply_auto_map_name(suggested)
+        return suggested
 
     def ensure_map_name(self) -> str | None:
         """地图名称为空时自动补一个（Spec §2.7）。
 
-        规则在 :func:`app.ui.validation.auto_map_name`（用范围中心点），本方法
-        只负责"写回输入框"——写回而不是悄悄用在内部，是因为用户必须**看得见**
-        将要生成的文件叫什么；否则他会在"输出文件"那一行看到一个自己没写过的
-        名字，怀疑程序弄错了。
+        优先用**行政区域名**（``全国基础包`` / ``江苏省_苏州市``），这与用户在
+        级联里选的东西一一对应，比他看不出含义的中心点坐标有用得多；只有连
+        区域都没有时才退回 :func:`app.ui.validation.auto_map_name` 的坐标名。
+
+        写回而不是悄悄用在内部，是因为用户必须**看得见**将要生成的文件叫什么；
+        否则他会在"输出文件"那一行看到一个自己没写过的名字，怀疑程序弄错了。
 
         Returns:
-            本次自动生成的名称；名称本来就非空、或范围非法导致无法生成时返回
-            ``None``（后一种情况由校验层去报错，这里不抢着下结论）。
+            本次自动生成的名称；名称本来就非空、或既没有区域也没有可用范围时
+            返回 ``None``（后一种情况由校验层去报错，这里不抢着下结论）。
         """
         if self.map_name_text():
             return None
-        try:
-            bounds = self.current_bounds()
-            name = auto_map_name(bounds.west, bounds.south, bounds.east, bounds.north)
-        except (TypeError, ValueError):
-            # 还没选到可用区域 → 不编名字，让校验层去说"请选择行政区域"
-            return None
-        self.set_map_name(name)
+        name = self.suggested_map_name()
+        if not name:
+            try:
+                bounds = self.current_bounds()
+                name = auto_map_name(
+                    bounds.west, bounds.south, bounds.east, bounds.north
+                )
+            except (TypeError, ValueError):
+                # 还没选到可用区域 → 不编名字，让校验层去说"请选择行政区域"
+                return None
+        self._map_name_follows_region = True
+        self._apply_auto_map_name(name)
         return name
 
     def map_type_plan_text(self) -> str:

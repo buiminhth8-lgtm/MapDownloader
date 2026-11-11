@@ -24,6 +24,7 @@ import pytest
 
 from app.config import settings
 from app.models import MapType
+from app.models.naming import nationwide_map_name, region_map_name
 from app.services import build_output_path, sanitize_map_name
 
 
@@ -134,7 +135,7 @@ def test_non_string_input_is_coerced() -> None:
 #: （见 conftest.py 里的说明）。
 def test_build_output_path_joins_dir_and_sanitized_name(work_dir: Path) -> None:
     path = build_output_path(work_dir, "北京/2024", map_type=MapType.IMAGE)
-    assert path == work_dir / "北京_2024_img.mbtiles"
+    assert path == work_dir / "北京_2024_影像_无注记.mbtiles"
     assert path.parent == work_dir
 
 
@@ -147,7 +148,7 @@ def test_build_output_path_uses_the_mbtiles_suffix(work_dir: Path) -> None:
 
 def test_build_output_path_accepts_str_dir() -> None:
     path = build_output_path("D:/maps", "beijing", map_type=MapType.VECTOR)
-    assert path == Path("D:/maps") / "beijing_vec.mbtiles"
+    assert path == Path("D:/maps") / "beijing_矢量_无注记.mbtiles"
     assert isinstance(path, Path)
 
 
@@ -161,8 +162,8 @@ def test_build_output_path_marks_the_map_type(work_dir: Path) -> None:
     vector = build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
     image = build_output_path(work_dir, "beijing", map_type=MapType.IMAGE)
     assert vector != image
-    assert vector.name == "beijing_vec.mbtiles"
-    assert image.name == "beijing_img.mbtiles"
+    assert vector.name == "beijing_矢量_无注记.mbtiles"
+    assert image.name == "beijing_影像_无注记.mbtiles"
 
 
 def test_build_output_path_marks_whether_labels_are_merged(work_dir: Path) -> None:
@@ -171,8 +172,8 @@ def test_build_output_path_marks_whether_labels_are_merged(work_dir: Path) -> No
     labeled = build_output_path(
         work_dir, "beijing", map_type=MapType.VECTOR, with_labels=True
     )
-    assert plain.name == "beijing_vec.mbtiles"
-    assert labeled.name == "beijing_vec_cn.mbtiles"
+    assert plain.name == "beijing_矢量_无注记.mbtiles"
+    assert labeled.name == "beijing_矢量.mbtiles"
 
 
 def test_build_output_path_rejects_an_unknown_map_type(work_dir: Path) -> None:
@@ -186,3 +187,62 @@ def test_build_output_path_is_stable(work_dir: Path) -> None:
     assert build_output_path(
         work_dir, "beijing", map_type=MapType.VECTOR
     ) == build_output_path(work_dir, "beijing", map_type=MapType.VECTOR)
+
+
+# --------------------------------------------------------------------------- #
+# 按行政区域自动命名（Slice 43）
+# --------------------------------------------------------------------------- #
+def test_region_map_name_keeps_every_level_after_the_country() -> None:
+    """省 → 市 → 县逐级保留；国家节点由调用方剥掉，不进名字。"""
+    assert region_map_name(["江苏省"]) == "江苏省"
+    assert region_map_name(["江苏省", "苏州市"]) == "江苏省_苏州市"
+    assert region_map_name(["江苏省", "苏州市", "昆山市"]) == "江苏省_苏州市_昆山市"
+    # 直辖市只有"市 → 区"两段：不按固定段数硬拼，自然就是对的
+    assert region_map_name(["北京市", "东城区"]) == "北京市_东城区"
+
+
+def test_region_map_name_skips_blank_parts() -> None:
+    """坏数据里的空名字不该在文件名里留下连续下划线。"""
+    assert region_map_name(["江苏省", "  ", "苏州市"]) == "江苏省_苏州市"
+    assert region_map_name([]) == ""
+
+
+def test_nationwide_map_name_is_china_specific() -> None:
+    """"全国基础包"只属于中国；别的国家用"<国名>基础包"。"""
+    assert nationwide_map_name("中国", is_china=True) == "全国基础包"
+    assert nationwide_map_name("示例国") == "示例国基础包"
+    # 判定看 region_id 而不是名字：数据包把国家名改了也不该影响规则
+    assert nationwide_map_name("China", is_china=True) == "全国基础包"
+
+
+def test_the_three_names_from_the_spec_reach_disk_as_expected(work_dir: Path) -> None:
+    """需求里的三个例子，落到磁盘上就是这三个文件名。
+
+    ``全国基础包_矢量`` / ``江苏省_矢量`` / ``江苏省_苏州市_矢量`` —— 默认勾选
+    中文注记，所以类型段只有"矢量"两个字；取消注记才追加"无注记"。
+    """
+    assert (
+        build_output_path(
+            work_dir, "全国基础包", map_type=MapType.VECTOR, with_labels=True
+        ).name
+        == "全国基础包_矢量.mbtiles"
+    )
+    assert (
+        build_output_path(
+            work_dir, "江苏省", map_type=MapType.VECTOR, with_labels=True
+        ).name
+        == "江苏省_矢量.mbtiles"
+    )
+    assert (
+        build_output_path(
+            work_dir, "江苏省_苏州市", map_type=MapType.VECTOR, with_labels=True
+        ).name
+        == "江苏省_苏州市_矢量.mbtiles"
+    )
+    # 影像走同一套规则，只有类型段不同 —— 两个包不会撞在同一个文件上
+    assert (
+        build_output_path(
+            work_dir, "江苏省_苏州市", map_type=MapType.IMAGE, with_labels=True
+        ).name
+        == "江苏省_苏州市_影像.mbtiles"
+    )

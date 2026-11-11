@@ -617,7 +617,7 @@ def item_file_stem(
     with_labels: bool = False,
     taken: Iterable[str] = (),
 ) -> str:
-    """一个条目的文件名主体（不含扩展名），如 ``china_z4_10_vec``（Spec §15）。
+    """一个条目的文件名主体（不含扩展名），如 ``china_z4_10_矢量``（Spec §15）。
 
     形如 ``<区域 id>_z<下界>_<上界>_<类型>``：区域 id 而不是展示名，因为 id 是
     稳定且跨平台的（中文名字在命令行、外部工具、日志 grep 里都更难处理），

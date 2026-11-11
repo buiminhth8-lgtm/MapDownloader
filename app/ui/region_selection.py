@@ -38,8 +38,9 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from app.geo import GeoJSONError, RegionBoundaryMissing
+from app.geo import CHINA_REGION_PRESET, GeoJSONError, RegionBoundaryMissing
 from app.geo.bounds import GeoBounds
+from app.models.naming import nationwide_map_name, region_map_name
 from app.planning import RegionLevel, ZoomRecommendation, ZoomStrategyService
 from app.regions import RegionCatalogError, RegionPreset, RegionService
 
@@ -430,6 +431,59 @@ class RegionSelectionController:
     def path_text(self) -> str:
         """当前区域的面包屑（``中国 / 浙江省 / 杭州市``）；没有选中时是空串。"""
         return self.children_text(self.selected_region_id)
+
+    @property
+    def map_name_suggestion(self) -> str:
+        """按当前选择给出建议的地图名称主体（不含类型后缀，Slice 43）。
+
+        规则见 :func:`app.models.naming.region_map_name`：国家之后的所有层级都
+        保留，``中国 + 江苏省 + 苏州市`` → ``江苏省_苏州市``；国家级（省也选了
+        "全部"）则用 :func:`app.models.naming.nationwide_map_name`，中国是
+        ``全国基础包``。
+
+        **为什么国家节点不写进名字**：用户已经站在"中国"这个上下文里（面板上
+        那一行就写着），文件名叫 ``中国_江苏省.mbtiles`` 只是多一个每次都一样的
+        前缀；而全国级又不能用"中国"（那会像一个行政区划名录），所以单独给一个
+        ``全国基础包``。
+
+        名称链来自**目录里的真实父子关系**（而不是"省 + 市 + 县"三段的固定拼法）：
+        直辖市下辖区、省直辖县级市都只有两段，按段数硬拼会给它们凭空多出或少掉
+        一级。
+
+        Returns:
+            名称主体；没有国家/区域时返回空串（调用方保留用户已填的名字）。
+        """
+        entry = self.selected
+        if entry is None:
+            return ""
+
+        names: list[str] = []
+        seen: set[str] = set()
+        current: RegionPreset | None = entry
+        # 沿 parent 往上走到国家为止；带访问集合，坏数据里的环不会让它死循环
+        # （目录校验器会把环报出来，但查询侧永远不该因为坏数据卡住界面）。
+        while current is not None and not current.level.is_country:
+            if current.id in seen:
+                break
+            seen.add(current.id)
+            names.append(current.name)
+            parent_id = current.parent_id
+            current = (
+                self._service.get_region(parent_id) if parent_id else None
+            )
+        names.reverse()
+        if names:
+            return region_map_name(names)
+
+        # 走到这里说明"当前区域就是国家"（或者父链断在半路、连国家都没摸到）。
+        # 后者拼不出名字，就不要拿一个"某国基础包"去冒充 —— 返回空串让调用方
+        # 保留用户原本填的名字，比编一个错名安全。
+        country = self.country
+        if country is None:
+            return ""
+        return nationwide_map_name(
+            country.name, is_china=country.id == CHINA_REGION_PRESET.region_id
+        )
 
     @property
     def boundary_available(self) -> bool:

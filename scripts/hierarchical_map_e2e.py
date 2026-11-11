@@ -882,7 +882,7 @@ class Runner:
         if not self.outputs:
             # runner 没回写路径时，直接按**包里记着的 region_id**认领文件 ——
             # 不再拿 ``path.stem`` 当 key：Slice 31 起文件名多了类型后缀
-            # （``<区域>_z4_10_vec``），拿它去对计划条目会一个都对不上。
+            # （``<区域>_z4_10_矢量_无注记``），拿它去对计划条目会一个都对不上。
             found: dict[str, Path] = {}
             for path in sorted(self.output_dir.glob("*.mbtiles")):
                 with MBTilesReader(path) as reader:

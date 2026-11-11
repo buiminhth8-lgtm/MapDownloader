@@ -91,6 +91,10 @@ class FormValidation:
 def auto_map_name(west: float, south: float, east: float, north: float) -> str:
     """由范围自动生成一个地图名称（Spec §2.7）。
 
+    **这是兜底规则**：Slice 43 起，名称为空时优先用行政区域名
+    （``江苏省_苏州市``，见 :meth:`app.ui.download_panel.DownloadPanel.suggested_map_name`），
+    只有连区域都没有时才落到这里。
+
     用**中心点坐标**而不是时间戳或随机数：同一个区域重复下载会得到同一个
     文件名（于是"已有文件"的确认框能正常发挥作用），而不同区域不会撞名。
 

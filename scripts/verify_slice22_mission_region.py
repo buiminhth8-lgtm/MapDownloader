@@ -644,7 +644,7 @@ def scene_add_to_plan(app, window, dialog, checker: Checker, shots: bool) -> str
     checker.check(
         mission_task is not None
         and file_name.startswith(f"{mission_id}_z15_18_")
-        and "_vec" in file_name
+        and "_矢量" in file_name
         and file_name.endswith(".mbtiles"),
         "输出文件名是 <任务区id>_z15_18_<类型>.mbtiles（命名与行政区同源）",
         file_name,

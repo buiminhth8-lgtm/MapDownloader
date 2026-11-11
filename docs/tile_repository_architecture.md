@@ -231,7 +231,7 @@ osmdroid       f5ceba5  M .idea/codeStyles/Project.xml
 | 文件 | 字节 | 瓦片数 | 平均 | `map_type` | `labels` | `composition` | 表对象 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `offline_map.mbtiles` | 1,884,770,304 | 14,497 | ≈ 127 KiB/张 | `image` | `true` | `merged` | `metadata` + `tiles` |
-| `offline_map_vec_cn.mbtiles` | 110,161,920 | 9,999 | ≈ 10.8 KiB/张 | `vector` | `true` | `merged` | `metadata` + `tiles` |
+| `offline_map_矢量.mbtiles` | 110,161,920 | 9,999 | ≈ 10.8 KiB/张 | `vector` | `true` | `merged` | `metadata` + `tiles` |
 
 两者 `minzoom=5 / maxzoom=10 / region_level=country`。**注意**：两者内容不同（影像 vs 矢量），平均字节不能直接对比；张数也不同，不能据此推断覆盖完整度（可能是中断的部分下载）。这两条是实测值，不是模型估算。
 

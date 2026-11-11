@@ -10,9 +10,9 @@
 
 ::
 
-    A  矢量下一遍  → 产物 beijing_vec.mbtiles，metadata.map_type = vector
-    B  切影像再下  → 产物 beijing_img.mbtiles，**两个文件并存**，且不弹「已有文件」
-    C  勾中文注记  → 「输出文件」变成 beijing_img_cn.mbtiles
+    A  矢量下一遍  → 产物 beijing_矢量_无注记.mbtiles，metadata.map_type = vector
+    B  切影像再下  → 产物 beijing_影像_无注记.mbtiles，**两个文件并存**，且不弹「已有文件」
+    C  勾中文注记  → 「输出文件」变成 beijing_影像.mbtiles
     D  同名两个计划（一矢量一影像）→ 产物文件名不同、目录相同
 
 用法::
@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +39,90 @@ if str(PROJECT_ROOT) not in sys.path:
 # 复用 Slice 7 那套"假服务端 + 临时目录 + 打桩 service"的装配，避免两份实现漂移。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import verify_slice7_ui as base  # noqa: E402
+
+
+def _install_region(root: Path) -> str:
+    """在临时目录里放一块「北京市」合成边界，并把它设为资源目录。
+
+    自定义矩形早就删了，验收脚本不能再"填四个经纬度"——它必须像用户一样
+    **选一块行政区**。这里现造一份最小目录（国 → 省 → 市），北京那块地的
+    外包矩形与老脚本的默认值一致（116~116.1E / 39~39.1N），因此后面所有
+    关于瓦片数、文件名的判据都不需要改。
+
+    Returns:
+        区域 id（后面 ``set_region_id`` 用它）。
+    """
+    import json
+
+    from app.geo import region as region_module
+
+    regions = root / "regions"
+    (regions / "country").mkdir(parents=True, exist_ok=True)
+    (regions / "province").mkdir(parents=True, exist_ok=True)
+    (regions / "city").mkdir(parents=True, exist_ok=True)
+
+    def write(relative: str, name: str, region_id: str, bounds) -> None:
+        west, south, east, north = bounds
+        payload = {
+            "type": "Feature",
+            "properties": {"name": name, "id": region_id},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [west, south], [east, south], [east, north],
+                    [west, north], [west, south],
+                ]],
+            },
+        }
+        (regions / relative).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+    write("country/demoland.geojson", "演示国", "demoland", (110.0, 30.0, 114.0, 34.0))
+    write("province/huabei.geojson", "华北省", "huabei", (115.0, 38.0, 117.0, 40.0))
+    write("city/beijing.geojson", "北京市", "beijing", (116.0, 39.0, 116.1, 39.1))
+    (regions / "index.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "regions": [
+                    {"id": "demoland", "name": "演示国", "level": "country",
+                     "parentId": None, "geojson": "country/demoland.geojson"},
+                    {"id": "huabei", "name": "华北省", "level": "province",
+                     "parentId": "demoland", "geojson": "province/huabei.geojson"},
+                    {"id": "beijing", "name": "北京市", "level": "city",
+                     "parentId": "huabei", "geojson": "city/beijing.geojson"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    region_module.REGION_RESOURCE_DIR = regions
+    # 主窗口注入的是 ``RegionService(prefer_generated=True)``，它优先读
+    # ``settings.REGION_DATA_ROOT``（"导入并发布的数据集"）。两个全局必须一起改，
+    # 否则面板看到的还是开发机上那份真数据 —— 这类"改了没生效"极难排查。
+    from app.config import settings as settings_module
+
+    settings_module.REGION_DATA_ROOT = regions
+    return "beijing"
+
+
+def _fill_form(window, output_dir: Path, *, name="beijing", labels=False) -> None:
+    """填一份可下载的表单：选区域 + 定输出 + **显式**写名字。
+
+    名字用 ``set_map_name`` 而不是留空让程序自动补：本脚本验的是"类型后缀
+    与文件名"，需要文件名主体是稳定的 ``beijing``；自动名会跟着区域变成
+    ``华北省_北京市``，那是另一条规则（Slice 43），在 pytest 里单独验。
+    """
+    panel = window.download_panel
+    panel._token_edit.setText(base.FAKE_TOKEN)
+    assert panel.set_region_id("beijing") is True
+    panel.set_map_name(name)
+    panel._min_zoom_spin.setValue(10)
+    panel._max_zoom_spin.setValue(10)
+    panel._output_edit.setText(str(output_dir))
+    panel._labels_check.setChecked(labels)
 
 
 def _close_complete_dialog(app, window) -> None:
@@ -59,6 +144,25 @@ def _run_download(app, window, checker, label: str) -> bool:
     """点一次「开始下载」并等它结束；返回是否真的跑完了。"""
     window.download_panel.action_buttons["start"].click()
     base._pump(app)
+
+    # 点完「开始下载」之后的完整前置链路，每一步都会**异步**弹出来：
+    #   1. 后台区域估算（几何裁剪不阻塞主线程）；
+    #   2. 容量预算确认（Slice 42 起下载前先算一遍，用户点「继续」）；
+    #   3. 之后才是真正的下载线程。
+    # 这里按顺序把这些门都推过去 —— 不等它们，``_download_worker`` 一直是
+    # ``None``，``_wait_until`` 会立刻返回 True，把"根本没开始"当成"已完成"。
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        base._pump(app)
+        budget = window._storage_budget_dialog
+        if budget is not None:
+            base._wait_until(app, lambda current=budget: current.worker is None)
+            budget.continue_button.click()
+            base._pump(app)
+        if window._download_worker is not None:
+            break
+        time.sleep(0.02)
+
     finished = base._wait_until(app, lambda: window._download_worker is None)
     checker.check(finished, f"{label}：任务在超时内结束")
     result = window.download_panel.download_result_label.text()
@@ -73,22 +177,22 @@ def _output_preview(window) -> str:
 
 
 def scene_a_vector(app, window, checker, work_dir: Path, shots: bool) -> Path:
-    checker.section("场景 A：矢量地图 → beijing_vec.mbtiles")
+    checker.section("场景 A：矢量地图 → beijing_矢量_无注记.mbtiles")
 
     from app.models import MapType
 
     panel = window.download_panel
-    base._fill_form(window, work_dir, name="beijing", labels=False)
+    _fill_form(window, work_dir, name="beijing", labels=False)
     panel.set_map_type(MapType.VECTOR)
     panel.action_buttons["calculate"].click()
     base._pump(app)
 
-    vec_path = work_dir / "beijing_vec.mbtiles"
+    vec_path = work_dir / "beijing_矢量_无注记.mbtiles"
     text = _output_preview(window)
-    checker.check(f"输出文件：{vec_path}" in text, "「输出文件」显示 beijing_vec.mbtiles")
+    checker.check(f"输出文件：{vec_path}" in text, "「输出文件」显示 beijing_矢量_无注记.mbtiles")
 
     _run_download(app, window, checker, "矢量")
-    checker.check(vec_path.exists(), "磁盘上真的生成了 beijing_vec.mbtiles", str(vec_path))
+    checker.check(vec_path.exists(), "磁盘上真的生成了 beijing_矢量_无注记.mbtiles", str(vec_path))
 
     from app.mbtiles import MBTilesReader
 
@@ -115,9 +219,9 @@ def scene_b_image(app, window, checker, work_dir: Path, vec_path: Path, shots: b
     panel.set_map_type(MapType.IMAGE)
     base._pump(app)
 
-    img_path = work_dir / "beijing_img.mbtiles"
+    img_path = work_dir / "beijing_影像_无注记.mbtiles"
     text = _output_preview(window)
-    checker.check(f"输出文件：{img_path}" in text, "切换类型后「输出文件」立刻变成 _img")
+    checker.check(f"输出文件：{img_path}" in text, "切换类型后「输出文件」立刻变成 _影像_无注记")
     checker.check(panel.map_name_text() == before, "地图名称没有被改写（只有后缀变）",
                   panel.map_name_text())
     base._shot(window, "slice31_image_output.png", shots)
@@ -127,7 +231,7 @@ def scene_b_image(app, window, checker, work_dir: Path, vec_path: Path, shots: b
         window._exists_dialog is None,
         "没有弹「已有文件」——影像包与矢量包不是同一个目标",
     )
-    checker.check(img_path.exists(), "磁盘上真的生成了 beijing_img.mbtiles", str(img_path))
+    checker.check(img_path.exists(), "磁盘上真的生成了 beijing_影像_无注记.mbtiles", str(img_path))
     checker.check(vec_path.exists(), "矢量包原样还在（没被覆盖 / 没被备份走）", str(vec_path))
 
     from app.mbtiles import MBTilesReader
@@ -141,7 +245,7 @@ def scene_b_image(app, window, checker, work_dir: Path, vec_path: Path, shots: b
     )
     checker.check(
         sorted(p.name for p in work_dir.glob("*.mbtiles"))
-        == ["beijing_img.mbtiles", "beijing_vec.mbtiles"],
+        == ["beijing_影像_无注记.mbtiles", "beijing_矢量_无注记.mbtiles"],
         "目录里正好两个包，没有 -2 / .bak 之类的残留",
         str(sorted(p.name for p in work_dir.glob("*.mbtiles"))),
     )
@@ -156,8 +260,8 @@ def scene_c_labels(app, window, checker, work_dir: Path) -> None:
 
     text = _output_preview(window)
     checker.check(
-        f"输出文件：{work_dir / 'beijing_img_cn.mbtiles'}" in text,
-        "「输出文件」变成 beijing_img_cn.mbtiles（底图与合成不可混写）",
+        f"输出文件：{work_dir / 'beijing_影像.mbtiles'}" in text,
+        "「输出文件」变成 beijing_影像.mbtiles（底图与合成不可混写）",
     )
     panel._labels_check.setChecked(False)
     base._pump(app)
@@ -189,13 +293,13 @@ def scene_d_plans(checker, work_dir: Path) -> None:
         "两个计划的输出目录相同（计划名都是 offline_plan）",
     )
     checker.check(
-        vector_paths["demoland"].name == "demoland_z4_10_vec.mbtiles",
-        "矢量计划的产物是 demoland_z4_10_vec.mbtiles",
+        vector_paths["demoland"].name == "demoland_z4_10_矢量_无注记.mbtiles",
+        "矢量计划的产物是 demoland_z4_10_矢量_无注记.mbtiles",
         vector_paths["demoland"].name,
     )
     checker.check(
-        image_paths["demoland"].name == "demoland_z4_10_img.mbtiles",
-        "影像计划的产物是 demoland_z4_10_img.mbtiles",
+        image_paths["demoland"].name == "demoland_z4_10_影像_无注记.mbtiles",
+        "影像计划的产物是 demoland_z4_10_影像_无注记.mbtiles",
         image_paths["demoland"].name,
     )
     checker.check(
@@ -229,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"platform={app.platformName()}  work_dir={work_dir}")
     try:
+        _install_region(work_dir)
         window = base._build_window(app, work_dir)
         window.show()
         base._pump(app)

@@ -46,6 +46,7 @@ from app.models import (
     composition_for,
     describe_map_type,
 )
+from app.models.naming import nationwide_map_name
 from app.planning import RegionLevel
 from app.planning.risk_policy import (
     LARGE_SIZE_THRESHOLD as RISK_LARGE_SIZE_THRESHOLD,
@@ -78,7 +79,6 @@ from app.ui.package_dialog import (
     PackageValidateWorker,
 )
 from app.ui.region_selection import ZoomMode
-from app.ui.validation import auto_map_name
 from tests.android_fakes import FakeAdbClient
 
 #: 假 Token（禁止替换为真实密钥）
@@ -406,7 +406,11 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
     assert data["min_zoom"] == country_policy.recommended_min_zoom
     assert data["max_zoom"] == country_policy.recommended_max_zoom
     assert isinstance(data["output_dir"], Path)
-    assert data["map_name"] == settings.DEFAULT_MAP_NAME
+    # 名称默认**跟随行政区域**（Slice 43）：国家级 → ``<国名>基础包``。
+    # 合成目录里的国家是「示例国」，所以不是中国专用的「全国基础包」——
+    # 那个词只在 country_id == "china" 时出现（见 ``nationwide_map_name``）。
+    assert data["map_name"] == window.download_panel.suggested_map_name()
+    assert data["map_name"] == nationwide_map_name("示例国")
     # 默认是行政区域：目录里的第一个国家。测试环境用的是合成目录
     # （``region_resources``），它只有「示例国」（``demoland``）。
     assert data["region_type"] is RegionType.POLYGON
@@ -1455,10 +1459,11 @@ def test_download_without_a_region_never_starts_worker(
 def test_download_with_empty_map_name_is_auto_filled(
     window: MainWindow, monkeypatch, qapp, error_dialogs, work_dir: Path
 ) -> None:
-    """Spec §2.7：地图名称为空时**自动补一个**（用中心点坐标），而不是拦住用户。
+    """Spec §2.7：地图名称为空时**自动补一个**（按行政区域），而不是拦住用户。
 
     名称决定文件名，空着会让"输出文件"那一行显示不出来；但为此弹一个错误框
-    纯属给用户添活——坐标已经足够唯一地命名这块区域了。
+    纯属给用户添活——区域名本身就是这块地最准确的称呼（Slice 43 起优先用它，
+    坐标名只在连区域都没有时兜底）。
     """
     _stub_download_service(monkeypatch, _png_handler())
     _fill_small_region(window, work_dir)
@@ -1469,12 +1474,12 @@ def test_download_with_empty_map_name_is_auto_filled(
 
     _click_start(window)
 
-    # 自动名取的是**当前区域**的中心坐标（合成目录里的示例河市：110~111E / 33~34N）
-    data = window.download_panel.get_form_data()
-    expected_name = auto_map_name(
-        data["west"], data["south"], data["east"], data["north"]
-    )
-    assert window.download_panel.map_name_edit.text() == expected_name
+    # 自动名取的是**当前区域**的行政层级：合成目录里「示例河市」挂在
+    # 「示例北省」下 → ``示例北省_示例河市``；国家节点不写进名字。
+    panel = window.download_panel
+    expected_name = panel.suggested_map_name()
+    assert expected_name == "示例北省_示例河市"
+    assert panel.map_name_edit.text() == expected_name
     assert (
         settings.UI_TEXT_MAP_NAME_AUTO_GENERATED.format(name=expected_name)
         in window.log_panel.to_text()
@@ -1485,7 +1490,7 @@ def test_download_with_empty_map_name_is_auto_filled(
     path = _expected_output_path(window)
     assert path.exists() is True
     # 自动名只是"名称"，后缀（类型 + 注记）由命名规则统一补上
-    assert path.name == f"{expected_name}_vec_cn.mbtiles"
+    assert path.name == f"{expected_name}_矢量.mbtiles"
 
 
 def test_output_path_preview_follows_map_name(
@@ -1528,7 +1533,7 @@ def test_map_name_is_sanitized_into_filename(
 
     assert len(launched) == 1
     prepared = launched[0]
-    assert prepared.output_path.name == "北京_2024_地图_vec_cn.mbtiles"  # type: ignore[attr-defined]
+    assert prepared.output_path.name == "北京_2024_地图_矢量.mbtiles"  # type: ignore[attr-defined]
     assert prepared.output_path.parent == work_dir  # type: ignore[attr-defined]
 
 

@@ -40,7 +40,7 @@ def test_coverage_preview_before_task_creation_or_network(window, qapp, work_dir
     assert prepared.budget_checked and prepared.region.region_type.value == 'coverage'
     assert region_from_task(prepared.task).boundary_version == prepared.region.boundary_version
     assert prepared.total == sum(z.total for z in dialog.report.items[0].zooms)
-    assert 'coverage_' in prepared.output_path.name and '_vec' in prepared.output_path.name
+    assert 'coverage_' in prepared.output_path.name and '_矢量' in prepared.output_path.name
 
 
 def test_cancel_preview_creates_no_task_or_files(window, qapp, work_dir):
@@ -94,7 +94,7 @@ def test_plan_mode_changes_output_filename(window, qapp, work_dir, monkeypatch):
         until(qapp, lambda current=dialog: current.worker is None)
         paths.append(dialog.report.items[0].request.output_path)
         dialog.reject()
-    assert paths[0] != paths[1] and '_vec' in paths[0].name and '_img' in paths[1].name
+    assert paths[0] != paths[1] and '_矢量' in paths[0].name and '_影像' in paths[1].name
 
 
 def test_preview_works_when_default_auto_budget_is_disabled(window, qapp, work_dir):

@@ -43,6 +43,7 @@ __all__ = [
     "MAP_TYPE_FILE_TOKENS",
     "MAP_TYPE_LAYERS",
     "MAP_TYPE_SHORT_NAMES",
+    "NO_LABELS_FILE_TOKEN",
     "MapLayerType",
     "MapType",
     "composition_for",
@@ -275,14 +276,25 @@ MAP_TYPE_SHORT_NAMES: dict[MapType, str] = {
     MapType.IMAGE: "影像",
 }
 
-#: 文件名里的地图类型标记（Slice 31）。
+#: 文件名里的地图类型标记（Slice 31 引入，Slice 43 改为中文）。
 #:
-#: 用 ASCII 三元组而不是中文短名：输出文件最终要 ``adb push`` 到 Android 设备、
-#: 要被命令行工具和日志 grep，中文路径在那些地方只会添麻烦。
+#: Slice 31 原本用 ``vec`` / ``img`` 两个 ASCII 三元组，理由是"文件名最终要
+#: ``adb push`` 到 Android、要被命令行工具 grep"。实际用下来两个问题都站不住：
+#: 地图名本来就可以是中文（``示例河市``），路径里早就不是纯 ASCII；而给用户看的
+#: 那个文件（``全国基础包_矢量.mbtiles``）读起来比 ``quanguo_vec_cn`` 直觉得多。
+#: 于是类型段改用与下拉框一致的中文短名 —— 同一个概念在界面上和在磁盘上
+#: **用同一个词**，用户不必再做一次翻译。
 MAP_TYPE_FILE_TOKENS: dict[MapType, str] = {
-    MapType.VECTOR: "vec",
-    MapType.IMAGE: "img",
+    MapType.VECTOR: "矢量",
+    MapType.IMAGE: "影像",
 }
+
+#: "不含中文注记"的标记（Slice 43）。
+#:
+#: 默认（界面默认勾选中文注记）不附加任何后缀 —— ``全国基础包_矢量.mbtiles``
+#: 就是最常见的那个包，名字不该为"默认状态"多背一个词。只有用户**取消**注记时
+#: 才追加这一段：两者瓦片坐标完全相同、内容互斥，不区分就会互相覆盖或续传拒绝。
+NO_LABELS_FILE_TOKEN: str = "无注记"
 
 
 def map_type_file_token(
@@ -297,24 +309,27 @@ def map_type_file_token(
 
     ``with_labels`` 也编进名字，因为"底图"与"底图 + 中文注记"同样不可混写
     （见 :func:`composition_for`）：内容不同的两个包不该共用一个名字。
+    **默认状态（含中文注记）不加后缀**，取消注记才追加 :data:`NO_LABELS_FILE_TOKEN`。
 
     Args:
         map_type: 地图类型、底图/注记图层，或它们的字符串标识。
         with_labels: 是否把中文注记合成进瓦片。
 
     Returns:
-        ``vec`` / ``vec_cn`` / ``img`` / ``img_cn``。
+        ``矢量`` / ``矢量_无注记`` / ``影像`` / ``影像_无注记``。
 
     Raises:
         ValueError: 认不出来的图层标识（由 :meth:`MapType.from_layer` 抛出）。
 
-    >>> map_type_file_token(MapType.IMAGE)
-    'img'
+    >>> map_type_file_token(MapType.IMAGE, True)
+    '影像'
     >>> map_type_file_token("vec_w", True)
-    'vec_cn'
+    '矢量'
+    >>> map_type_file_token(MapType.VECTOR, False)
+    '矢量_无注记'
     """
     token = MAP_TYPE_FILE_TOKENS[MapType.from_layer(map_type)]
-    return f"{token}_cn" if with_labels else token
+    return token if with_labels else f"{token}_{NO_LABELS_FILE_TOKEN}"
 
 #: 图层类型的可读名称（Slice 2 起保留：日志与连接测试里按"单个图层"展示）
 LAYER_DISPLAY_NAMES: dict[MapLayerType, str] = {

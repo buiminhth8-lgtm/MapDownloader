@@ -912,3 +912,67 @@ def test_filling_the_cascade_asks_for_availability_in_batches(
 
     # 只剩"当前选中的那一份"需要单条确认（面板据此决定要不要读边界文件）
     assert len(single) <= 1, f"填一次级联不该逐条问：{single}"
+
+
+# --------------------------------------------------------------------------- #
+# 地图名称跟随行政区域（Slice 43）
+# --------------------------------------------------------------------------- #
+def test_the_name_starts_at_the_country_level(panel: DownloadPanel) -> None:
+    """面板一打开就有一个区域名，而不是 ``offline_map`` 这种占位值。
+
+    国家级：合成目录里的国家是「示例国」→ ``示例国基础包``（中国才是
+    ``全国基础包``，见 ``nationwide_map_name``）。
+    """
+    assert panel.map_name_text() == "示例国基础包"
+    assert panel.get_form_data()["map_name"] == "示例国基础包"
+
+
+def test_switching_the_region_renames_the_map(panel: DownloadPanel) -> None:
+    """选省 → 省名；选市 → 省_市。这是用户要的那三个文件名。"""
+    panel.set_region_id("northland")
+    assert panel.map_name_text() == "示例北省"
+
+    panel.set_region_id("rivertown")
+    assert panel.map_name_text() == "示例北省_示例河市"
+
+
+def test_a_hand_typed_name_stops_following_the_region(panel: DownloadPanel) -> None:
+    """用户自己敲的名字不能被下一次切省顶掉。
+
+    这条是"自动命名"最容易做坏的地方：一旦实现成"每次区域变化都覆盖名称"，
+    用户改完名字再点一下省，名字就没了，而且他会以为程序不让他改名。
+    """
+    panel.set_region_id("rivertown")
+    panel.set_map_name("我的离线包")
+
+    panel.set_region_id("hilltown")
+
+    assert panel.map_name_text() == "我的离线包"
+
+
+def test_clearing_the_name_restores_following(panel: DownloadPanel) -> None:
+    """名称清空 = "没意见，按区域来"：下一次自动补名用的是区域名。"""
+    panel.set_region_id("rivertown")
+    panel.set_map_name("临时名字")
+
+    panel.map_name_edit.clear()
+    restored = panel.ensure_map_name()
+
+    assert restored == "示例北省_示例河市"
+    assert panel.map_name_text() == "示例北省_示例河市"
+
+
+def test_the_suggested_name_ignores_a_broken_boundary(panel: DownloadPanel) -> None:
+    """边界文件不可用不影响名字 —— 名字只来自目录里的层级，不读几何。
+
+    这很重要：用户看到"边界不可用"的同时，文件名不该退回 ``offline_map``
+    （那会让人以为连区域都没选中）。
+    """
+    from app.geo.region import REGION_RESOURCE_DIR
+
+    target = REGION_RESOURCE_DIR / "city" / "rivertown.geojson"
+    target.unlink()
+
+    assert panel.set_region_id("rivertown") is True
+    assert panel.current_region_error() != ""
+    assert panel.map_name_text() == "示例北省_示例河市"
