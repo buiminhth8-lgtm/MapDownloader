@@ -41,6 +41,7 @@ from app.mbtiles import MBTilesReader
 from app.models import MapLayerType
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services.map_download_service import MapDownloadService
+from tests.region_helpers import rect_region
 
 FAKE_TOKEN = "abcdefghijklmn"
 LAYER = MapLayerType.VECTOR
@@ -336,13 +337,18 @@ async def test_filtered_tiles_do_not_show_up_as_failures(work_dir: Path) -> None
     assert sum(outcome.summary.failures_by_reason.values()) == 60
 
 
-async def test_rectangle_download_on_the_same_block_still_gets_one_hundred(
+async def test_a_bare_extent_download_still_gets_one_hundred(
     work_dir: Path,
 ) -> None:
-    """同一块矩形、不带区域 → 100 张全下（Spec §7 的回归锚点）。
+    """同一块范围、不带区域 → 100 张全下（Spec §7 的回归锚点）。
 
     与上面几条共用同一套夹具与同一个假服务器，所以"60 vs 100"的差别只可能
     来自 region，不可能来自夹具。
+
+    界面上已经没有"自定义矩形"这个选项，但 ``download_to_mbtiles`` 仍然接受
+    ``region=None``（纯范围下载，覆盖度与老调用方还在用）。它落盘时记的
+    ``region_type`` 仍是历史取值 ``rectangle``：那是**老包读得懂**的标记，
+    并不代表本版本还支持按矩形裁剪。
     """
     server = TileServer()
     service = make_service(server)
@@ -360,13 +366,19 @@ async def test_rectangle_download_on_the_same_block_still_gets_one_hundred(
         assert reader.get_metadata()["region_type"] == "rectangle"
 
 
-async def test_explicit_rectangle_region_behaves_like_no_region(work_dir: Path) -> None:
-    """显式传一个**矩形** ``DownloadRegion`` → 与不传逐位一致。"""
+async def test_a_region_covering_the_whole_block_behaves_like_no_region(
+    work_dir: Path,
+) -> None:
+    """区域边界**正好等于整块范围** → 与不传区域逐位一致（100 张）。
+
+    自定义矩形能力已删除，这里用"一份恰好铺满 block 的多边形边界文件"
+    代替它：走的是生产同一条几何裁剪链路，只是没有任何瓦片被裁掉。
+    """
     server = TileServer()
     service = make_service(server)
-    path = work_dir / "rect_explicit.mbtiles"
+    path = work_dir / "whole_block.mbtiles"
     bounds = block_bounds()
-    region = DownloadRegion.rectangle("自定义矩形", bounds)
+    region = rect_region("整块范围", bounds, work_dir)
 
     outcome = await service.download_to_mbtiles(
         bounds, ZOOM, ZOOM, LAYER, path, region=region

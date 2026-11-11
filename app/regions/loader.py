@@ -35,6 +35,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -120,11 +122,101 @@ class RegionLoader:
         return path
 
     def available(self, region_id: str | None) -> bool:
-        """边界文件是否已就位（不抛异常：目录里没这个 id 也只是"不可用"）。"""
+        """边界文件是否已就位（不抛异常：目录里没这个 id 也只是"不可用"）。
+
+        实现直接复用 :meth:`available_many`（一个元素）：单条走
+        :meth:`peek_path` 会为了判一个存在性解析两次真实路径，而这条路
+        （界面每次刷新都要问一遍）没必要付这个代价。口径差别见
+        :meth:`available_many` 的说明。
+        """
+        return self.available_many((region_id,)).get(str(region_id or ""), False)
+
+    def available_many(self, region_ids: Iterable[str | None]) -> dict[str, bool]:
+        """批量判断边界文件是否就位 —— **每个目录只列一次**。
+
+        为什么要有批量版：``available()`` 每条都走
+        :func:`~app.geo.region.resolve_region_path`，而那里对**每一条**都要
+        ``Path.resolve()`` 两次（root 一次、候选路径一次）。Windows 上
+        ``resolve()`` 落到 ``nt._getfinalpathname``；本机一次约 0.08 ms，
+        看着不多，但一个省带上百个下级条目就是上千次系统调用。条目多、磁盘慢
+        （网络盘 / 机械盘 / 杀毒软件逐个扫）时这一步能拖到几秒 —— 用户看到的
+        就是"点一下省份，界面卡住"。界面填下拉正走这条路。
+
+        这里改成：``root`` 只解析一次，然后**按目录分组**各 ``scandir`` 一次，
+        之后纯内存判名。系统调用次数与条目数无关（最多 = 用到的目录数）。
+
+        与 :meth:`available` 的差别只有一处，而且是**故意**的：这里不做
+        "``candidate.resolve()`` 后仍在 root 内"的复核，只做写法检查
+        （:func:`~app.geo.region.is_safe_region_relative_path`）。因为这个结果
+        只用于"下拉里这一条能不能选"，真正读文件仍然走
+        :meth:`resolve_path` 的全套检查 —— 少了那一步，最多让一条越界的
+        符号链接在列表里显示成"就绪"，读的时候照样被拒。
+
+        Args:
+            region_ids: 目录 id；``None`` / 空串算"不可用"，不抛异常。
+
+        Returns:
+            ``{id: 文件是否存在}``；目录里没有的 id 也是 ``False``。
+        """
+        root = self.root
+        answer: dict[str, bool] = {}
+        listings: dict[Path, frozenset[str] | None] = {}
+        for raw in region_ids:
+            region_id = str(raw or "")
+            if not region_id or region_id in answer:
+                continue
+            try:
+                entry = self.region(region_id)
+            except RegionCatalogError:
+                answer[region_id] = False
+                continue
+            target = self._boundary_target(entry, root)
+            if target is None:
+                answer[region_id] = False
+                continue
+            directory, name = target
+            if directory not in listings:
+                listings[directory] = self._list_directory(directory)
+            names = listings[directory]
+            if names is None:
+                # 目录读不出来（权限 / 路径过长）→ 退回逐个问磁盘，行为与
+                # available() 一致，慢一点但结论一样。
+                answer[region_id] = (directory / name).is_file()
+            else:
+                answer[region_id] = os.path.normcase(name) in names
+        return answer
+
+    def _boundary_target(
+        self, entry: RegionPreset, root: Path
+    ) -> tuple[Path, str] | None:
+        """条目对应的（目录, 文件名）；写法不安全时返回 ``None``。
+
+        只看**写法**（不碰磁盘、不解析真实路径），所以比
+        :func:`~app.geo.region.resolve_region_path` 便宜得多。``root`` 由调用方
+        传进来：批量判存时它已经解析过一次，这里不该再解析一遍。
+        """
         try:
-            return self.peek_path(region_id).is_file()
-        except (RegionCatalogError, ValueError):
-            return False
+            relative = geo_region.normalize_region_relative_path(entry.geojson_path)
+        except ValueError:  # pragma: no cover - str() 不会抛，留作防御
+            return None
+        if not geo_region.is_safe_region_relative_path(relative):
+            return None
+        target = root / relative
+        return target.parent, target.name
+
+    @staticmethod
+    def _list_directory(directory: Path) -> frozenset[str] | None:
+        """把目录里的**文件名**列成集合（大小写按本机规则归一）。
+
+        返回 ``None`` 表示目录列不出来，调用方要退回逐个 ``is_file()``。
+        """
+        try:
+            with os.scandir(directory) as entries:
+                return frozenset(
+                    os.path.normcase(item.name) for item in entries if item.is_file()
+                )
+        except OSError:
+            return None
 
     def missing_message(self, region_id: str | None) -> str:
         """文件缺失时给用户看的完整说明（位置 + 授权要求）。

@@ -142,8 +142,6 @@ from app.geo import (
     GeoBounds,
     GeoJSONError,
     RegionTileEstimate,
-    RegionTileEstimator,
-    RegionType,
     estimate_size_bytes,
     format_size,
     lat_to_tile_y,
@@ -300,7 +298,7 @@ def _about_html() -> str:
     return (
         f"<b>{APP_NAME}</b><br>版本 {APP_VERSION}<br><br>"
         "Windows 端生成天地图离线地图包，导入 Android 供 osmdroid 使用。<br><br>"
-        "<b>下载</b>：矩形 / GeoJSON 多边形 / 国·省·市·县四级行政区域；"
+        "<b>下载</b>：国·省·市·县四级行政区域按边界精确裁剪；"
         "底图与中文注记合成，并发下载、限速、重试、断点续传。<br>"
         "<b>规划</b>：分级 Zoom 推荐、瓦片估算、下载风险分析、"
         "多级下载计划与串行调度。<br>"
@@ -349,7 +347,8 @@ class _DownloadPlan:
             开启中文注记后每张瓦片要请求底图 + 注记两次，因此这个数字是
             ``effective_tiles`` 的两倍 —— 大任务提示必须给出它，
             否则用户看到"配额消耗"时无法预估真实开销。
-        region: 下载区域（Slice 16）。``None`` = 纯矩形（老行为）。
+        region: 下载区域（Slice 16）。所有构造点都会带上；``None`` 只作防御，
+            表示"计划缺区域信息"，此时容量预算会被跳过而不是伪造一个范围。
         estimate: 区域估算结果（Slice 16），只用于界面展示；
             ``total`` 才是权威数字，且它取自 ``estimate.selected_tiles``。
     """
@@ -386,12 +385,9 @@ class _DownloadPlan:
     def region_text(self) -> str:
         """一行区域说明（日志与结果区共用）。
 
-        矩形时不写"自定义矩形"这种废话——用户填的就是四个数字，再报一遍
-        只是噪音；行政区域时必须写名字，否则日志里看不出这次下的是哪块地。
+        行政区域必须写名字，否则日志里看不出这次下的是哪块地。
         """
         if self.region is None:
-            return ""
-        if not self.is_polygon:
             return ""
         return self.region.name
 
@@ -803,9 +799,9 @@ class MainWindow(QMainWindow):
         # Slice 6：切换地图类型 / 勾选中文注记会改变每张瓦片的请求次数，
         # 已算出的「预估结果」要跟着重画那一行请求量。
         self.download_panel.layer_plan_changed.connect(self._refresh_output_preview)
-        # Slice 16：区域（矩形 / 行政区）一变，上一次的预估结论就不再成立。
-        # 这一条是**必备**的：行政区域模式下边界文件不可用时，界面上如果还留着
-        # 上一个矩形算出来的张数，用户看到的就是一个"静默退化成矩形"的结论。
+        # 区域（省 / 市 / 县）一变，上一次的预估结论就不再成立。这一条是**必备**的：
+        # 边界文件不可用时，界面上如果还留着上一个区域算出来的张数，
+        # 用户看到的就是一个"旧结论套在新区域上"的假数字。
         self.download_panel.region_changed.connect(self._on_region_changed)
         self.download_panel.storage_budget_button.clicked.connect(self.open_storage_budget)
         self.device_panel.refresh_requested.connect(self._on_refresh_devices)
@@ -898,12 +894,12 @@ class MainWindow(QMainWindow):
         为什么必须显式作废，而不是"等用户再点一次计算"：
 
         - **旧的数字会张冠李戴。** 一次计算的结果属于**当时那个区域**。用户从
-          「自定义矩形」切到「行政区域」时，结果区里那句"预计 56 张"还在，而它
-          说的是矩形 —— 看起来就像"行政区域也算出了 56 张"。
+          一个省换到另一个省时，结果区里那句"预计 56 张"还在，而它说的是上一个
+          区域 —— 看起来就像"新区域也算出了 56 张"。
         - **错误提示会被擦掉。** 切换后若边界文件不可用，用户点「计算」会看到一句
           人话错误；但接下来只要动一下输出目录或勾一下注记，
           :meth:`_refresh_output_preview` 就会拿**缓存里的旧结论**把错误提示盖回去，
-          用户于是以为算成功了。这正是 Spec §16/§32 要禁的"静默退回矩形"。
+          用户于是以为算成功了。这正是 Spec §16/§32 要禁的"静默降级"。
 
         所以这里做三件事：清缓存、清结果区、把「总瓦片」退回占位。日志留一行，
         免得用户以为界面是自己抖了一下。
@@ -921,25 +917,21 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _run_tile_math(self) -> None:
-        """矩形直接计算；多边形在后台精确估算。"""
+        """在后台精确估算当前区域的瓦片数（区域边界可能是几十万个点）。"""
         if self.download_channel_busy():
             return
         data = self.download_panel.get_form_data()
         try:
             region = self._require_region()
-            if region.is_polygon:
-                self._begin_region_estimate(
-                    region,
-                    data,
-                    lambda estimate: self._show_tile_estimate(data, region.bounds, estimate),
-                    geometry=self.download_panel.region_geometry,
-                )
-                return
-            estimate = RegionTileEstimator(region).estimate(data["min_zoom"], data["max_zoom"])
+            # 所有区域都带几何 → 一律在后台精确估算，不在主线程枚举候选瓦片。
+            self._begin_region_estimate(
+                region,
+                data,
+                lambda estimate: self._show_tile_estimate(data, region.bounds, estimate),
+                geometry=self.download_panel.region_geometry,
+            )
         except (ValueError, GeoJSONError) as exc:
             self._report_calculation_error(str(exc))
-            return
-        self._show_tile_estimate(data, region.bounds, estimate)
 
     def _begin_region_estimate(self, region, data, on_done, *, geometry=None, check_form=True):
         """保留表单快照；线程退出后才接续下载，避免结果与新表单混用。"""
@@ -1137,8 +1129,8 @@ class MainWindow(QMainWindow):
     def _require_region(self) -> DownloadRegion:
         """读表单并拿到**可信的**下载区域；拿不到就抛 ``ValueError``（人话）。
 
-        Spec §16/§32 的红线：行政区域模式下边界文件没就绪时**绝不退回矩形**
-        —— 退回的后果是静默下一大片区域外的瓦片，而用户在界面上看不出这一点，
+        Spec §16/§32 的红线：边界文件没就绪时**绝不退化成外包矩形**
+        —— 退化的后果是静默下一大片区域外的瓦片，而用户在界面上看不出这一点，
         只会在账单上看到。
         """
         panel = self.download_panel
@@ -1146,9 +1138,7 @@ class MainWindow(QMainWindow):
         if region is not None:
             return region
         message = panel.current_region_error() or "无法解析下载区域"
-        if panel.current_region_type() is RegionType.POLYGON:
-            raise ValueError(f"行政区域不可用：{message}")
-        raise ValueError(message)
+        raise ValueError(f"行政区域不可用：{message}")
 
     def _resolve_output_path(self, data: dict) -> Path | None:
         """由表单里的"输出目录 + 地图名称 + 地图类型"得到输出文件路径。
@@ -1284,7 +1274,12 @@ class MainWindow(QMainWindow):
             return
 
         token = "已填写" if data["token"] else "未填写"
-        bounds = (data["west"], data["south"], data["east"], data["north"])
+        region = data["region"]
+        bounds = (
+            (region.bounds.west, region.bounds.south, region.bounds.east, region.bounds.north)
+            if region is not None
+            else "（未选择行政区域）"
+        )
         output_path = self._resolve_output_path(data)
         self.log_panel.append_log(
             "当前配置："
@@ -1317,12 +1312,12 @@ class MainWindow(QMainWindow):
             # 中文注记由复选框控制，本 Slice 只测底图（注记图层可在后续版本单列入口）
             layer = data["map_type"].base_layer
             zoom = int(data["min_zoom"])
-            bounds = GeoBounds(
-                west=data["west"],
-                south=data["south"],
-                east=data["east"],
-                north=data["north"],
-            )
+            region = data["region"]
+            if region is None:
+                raise ValueError(
+                    self.download_panel.current_region_error() or "请先选择行政区域"
+                )
+            bounds = region.bounds
             center_lat, center_lon = bounds.center
             x = lon_to_tile_x(center_lon, zoom)
             y = lat_to_tile_y(center_lat, zoom)
@@ -1667,12 +1662,11 @@ class MainWindow(QMainWindow):
 
         try:
             provider = TiandituProvider(data["token"])
-            bounds = GeoBounds(
-                west=data["west"],
-                south=data["south"],
-                east=data["east"],
-                north=data["north"],
-            )
+            # 先算总量——不能"跑起来才发现是几十万张"。
+            # `_require_region` 同时给出候选范围与几何：范围不再从四个手填框读，
+            # 而是边界的 6 位小数外包矩形（见 DownloadPanel.current_bounds）。
+            region = self._require_region()
+            bounds = region.bounds
             map_type = data["map_type"]
             with_labels = bool(data["with_labels"])
             # 任务记录里存的是**底图图层**（历史字段，续传校验与老版本兼容都靠它）；
@@ -1680,12 +1674,8 @@ class MainWindow(QMainWindow):
             layer = map_type.base_layer
             min_zoom = int(data["min_zoom"])
             max_zoom = int(data["max_zoom"])
-            # 先算总量——不能"跑起来才发现是几十万张"
-            region = self._require_region()
             if estimate is None:
-                if region.is_polygon:
-                    raise ValueError("多边形任务需要先完成后台估算")
-                estimate = RegionTileEstimator(region).estimate(min_zoom, max_zoom)
+                raise ValueError("区域任务需要先完成后台估算")
             total = estimate.selected_tiles
             output_path = build_output_path(
                 data["output_dir"],
@@ -2156,6 +2146,7 @@ class MainWindow(QMainWindow):
         except (TaskStoreError, OSError) as exc:  # pragma: no cover - 磁盘异常
             self.log_panel.append_log(f"任务状态落盘失败：{exc}", "WARNING")
         self._refresh_task_list(select_id=task.id)
+        self._reveal_download_status()
 
         token = self.download_panel.get_form_data()["token"]
         type_text = describe_map_type(plan.map_type, plan.with_labels, missing=plan.layer.value)
@@ -2604,7 +2595,18 @@ class MainWindow(QMainWindow):
 
     def _check_download_storage_budget(self, plan, *, proceed=None):
         from app.planning.storage_budget import BudgetInput
-        region = plan.region or DownloadRegion.rectangle(plan.map_name, plan.bounds)
+        region = plan.region
+        if region is None:  # pragma: no cover - 所有构造点都会带上区域
+            # 没有几何就没法按区域算预算。跳过检查（而不是伪造一块矩形）——
+            # 伪造出来的范围会让预算数字与实际要下的瓦片完全对不上。
+            self.log_panel.append_log(
+                "当前下载计划缺少区域信息，已跳过容量预算检查", "WARNING"
+            )
+            if proceed is None:
+                self._launch_download(plan, budget_checked=True)
+            else:
+                proceed(plan)
+            return
         request = BudgetInput(
             "current", plan.map_name, region, plan.min_zoom, plan.max_zoom, plan.output_path,
             plan.map_type or MapType.from_layer(plan.layer), plan.with_labels,
@@ -2944,6 +2946,18 @@ class MainWindow(QMainWindow):
         scroll = self._left_scroll
         if scroll is not None:
             scroll.ensureWidgetVisible(self.download_panel.download_result_group, 0, 0)
+
+    def _reveal_download_status(self) -> None:
+        """把左侧配置列滚到「下载状态」，让总进度条落在可视范围内。
+
+        下载范围只剩行政区域之后，左侧表单比矩形时代更高（四段级联 + 等级 +
+        区域范围 + 策略 + Min/Max + 说明），状态区默认就在折叠线以下。
+        而"开工以后最该看见的是进度条"这条护栏没有变：点完「开始下载」却只
+        看到表单，用户会以为没反应。
+        """
+        scroll = self._left_scroll
+        if scroll is not None:
+            scroll.ensureWidgetVisible(self.task_progress, 0, 0)
 
     @Slot(str)
     def _on_download_failed(self, message: str) -> None:
@@ -3306,9 +3320,9 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Slice 16：区域也要从记录里还原。记录里只有标识（类型 / id / 版本），
-        # 边界文件按 id 回预设表找 —— GeoJSON 本身**不进** tasks.json（Spec §12/§13）。
-        # 找不回来时**绝不退回矩形**：那会把"继续"变成"沿外包矩形下一大片"，
+        # 区域也要从记录里还原。记录里只有标识（类型 / id / 版本），边界文件按
+        # id 回预设表找 —— GeoJSON 本身**不进** tasks.json（Spec §12/§13）。
+        # 找不回来时**绝不退化成外包矩形**：那会把"继续"变成"沿外包矩形下一大片"，
         # 直接推翻这个任务的全部意义（Spec §12/§32）。
         try:
             region = region_from_task(task)
@@ -3317,16 +3331,21 @@ class MainWindow(QMainWindow):
                 f"任务参数无法还原，记录可能已损坏：{exc}", dialog_title="无法继续任务"
             )
             return
-        if RegionType.parse(getattr(task, "region_type", "")) is RegionType.POLYGON and (
-            region is None
-        ):
+        if region is None:
+            raw_type = str(getattr(task, "region_type", "") or "").strip().lower()
             region_id = getattr(task, "region_id", "")
-            message = (
-                f"该任务按行政区域「{region_id}」下载，但当前版本找不到它的边界文件，"
-                "无法安全继续。请补齐边界文件后重试，或重新发起一次下载。"
-            )
+            if raw_type == "rectangle":
+                message = (
+                    "该任务按自定义矩形下载，本版本只支持行政区域，无法安全继续。"
+                    "请重新选择行政区域后发起一次新的下载。"
+                )
+            else:
+                message = (
+                    f"该任务按行政区域「{region_id}」下载，但当前版本找不到它的边界文件，"
+                    "无法安全继续。请补齐边界文件后重试，或重新发起一次下载。"
+                )
             self.log_panel.append_log(message, "ERROR")
-            self.statusBar().showMessage("行政区域边界文件缺失，无法继续", 8000)
+            self.statusBar().showMessage("任务区域不可用，无法继续", 8000)
             self._show_error_dialog("无法继续任务", message)
             return
 
@@ -4223,22 +4242,21 @@ class MainWindow(QMainWindow):
             self.log_panel.append_log("已恢复上次的窗口位置与大小")
 
     def _restore_region_selection(self, selection: RegionSelection) -> None:
-        """恢复上次的行政区选择；认不出来就**安全回退**（Spec §14）。
+        """恢复上次的行政区选择；认不出来就**逐级回退**（Spec §14）。
 
-        回退是**逐级**的：县认不出来试市，市认不出来试省，省认不出来试国，
-        一个都不认识才落回自定义矩形。一个"已经不存在的旧 id"往往只是目录
-        改名或删了一层，用户真正想下的多半还是那个上级区域 —— 直接扔掉整条
-        链才是真正的退步。
+        回退是**逐级**的：县认不出来试市，市认不出来试省，省认不出来试国。
+        一个"已经不存在的旧 id"往往只是目录改名或删了一层，用户真正想下的
+        多半还是那个上级区域 —— 直接扔掉整条链才是真正的退步。
 
         注意逐级回退会**放大**下载范围（县 → 市 → 省），所以每降一级都写一条
         WARNING 日志：静默放大比报错更糟 —— 用户会以为下的还是那个县。
 
+        一个都不认识时保留面板当前的默认区域（国家 + 全部），只记一条日志。
+        自定义矩形已移除，这里不再有"退回矩形"这条退路。
+
         全程不抛异常：偏好是锦上添花，读不出来就该当没存过。
         """
         if selection.is_empty or not selection.region_type:
-            return
-        if RegionType.parse(selection.region_type) is not RegionType.POLYGON:
-            # 上次就是自定义矩形（或值认不出来）→ 保持默认的矩形
             return
 
         deepest = (
@@ -4256,9 +4274,6 @@ class MainWindow(QMainWindow):
         ):
             if not candidate:
                 continue
-            # 先问目录里有没有这一条，再动界面：`set_region_id` 会把面板切到
-            # 「行政区域」，对着一个不存在的 id 反复切，最后反而留在多边形模式
-            # 上 —— 那正是"回退没生效"的样子。
             if service.get_region(candidate) is None:
                 continue
             if self.download_panel.set_region_id(candidate):
@@ -4269,10 +4284,8 @@ class MainWindow(QMainWindow):
                     )
                 return
 
-        # 一个都不认识 → 安全回退到自定义矩形（Spec §14），并把模式**真的**切回去
-        self.download_panel.set_region_type(RegionType.RECTANGLE)
         self.log_panel.append_log(
-            "上次选的行政区域在当前目录里已经不存在，已退回「自定义矩形」",
+            "上次选的行政区域在当前目录里已经不存在，保持默认区域",
             "WARNING",
         )
 

@@ -201,11 +201,11 @@ def build_region_filter(
         GeoJSONError: 边界文件不存在（``GeoJSONNotFoundError``）或内容不合法
             （``GeoJSONParseError`` / ``GeoJSONGeometryError``）。
     """
-    if region is not None and region.coverage_data:
+    if region is None:
+        return None
+    if region.coverage_data:
         from app.geo.zoom_coverage import CoverageTileFilter
         return CoverageTileFilter(region)
-    if region is None or not region.is_polygon:
-        return None
     if geometry is None:
         if not region.geojson_path:
             raise ValueError(

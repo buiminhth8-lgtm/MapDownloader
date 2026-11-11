@@ -1,18 +1,19 @@
 """下载区域模型（Slice 16）。
 
-统一"这次要下哪一块地"的表达方式，让矩形与多边形走**同一条**下载链路 ——
-差别只在"候选瓦片要不要再过一道几何过滤"，而不是两套调度器。
+统一"这次要下哪一块地"的表达方式。下载范围**只有行政区域**（含任务区走廊）：
+自定义矩形的界面入口与数据模型都已移除，:class:`RegionType` 里不再有
+``rectangle`` 这个取值。
 
-两个概念必须分清（这是本 Slice 的核心）
----------------------------------------
+两个概念必须分清
+----------------
 
-- **候选范围（candidate）**：矩形的 BoundingBox，或行政区的外包矩形
-  （``geometry.bounds``）。它只用来**快速缩小搜索面**，本身不决定要下什么。
+- **候选范围（candidate）**：行政区的外包矩形（``geometry.bounds``）。它只用来
+  **快速缩小搜索面**，本身不决定要下什么。
 - **选中瓦片（selected）**：候选范围内、**与行政区域真正相交**的那些瓦片。
 
-矩形模式下两者恒等；多边形模式下 selected 是 candidate 的（可能很小的）子集。
-UI 的预估、进度条分母、大任务提示都必须用 selected —— 用 candidate 会让
-"要下 4 万张"和"实际下 2.8 万张"变成两个对不上的数字。
+selected 永远是 candidate 的（可能很小的）子集。UI 的预估、进度条分母、
+大任务提示都必须用 selected —— 用 candidate 会让"要下 4 万张"和
+"实际下 2.8 万张"变成两个对不上的数字。
 
 中国边界数据
 ------------
@@ -114,26 +115,28 @@ class RegionType(Enum):
 
     ``value`` 会被**写进 MBTiles metadata 与地图包 manifest**，因此它是一份
     持久化契约：改名等于让老包读不出区域信息。
+
+    只剩两种取值：普通行政区（``polygon``）与多级 Zoom 覆盖（``coverage``）。
+    早期的 ``rectangle``（自定义矩形）已随界面入口一起移除；读到它时
+    :meth:`parse` 退回 :attr:`POLYGON`，再由调用方按"缺 ``region_id`` /
+    ``geojson_path``"明确报错 —— **不会**静默当成一块矩形下出去。
     """
 
-    RECTANGLE = "rectangle"
     POLYGON = "polygon"
     COVERAGE = "coverage"
 
     @classmethod
     def parse(cls, value: object) -> RegionType:
-        """宽容解析：认不出来的一律按 :attr:`RECTANGLE` 处理。
+        """宽容解析：认不出来的一律按 :attr:`POLYGON` 处理。
 
-        这条宽容规则是**有意为之**（Spec §21）：老 MBTiles / 老 manifest
-        没有 region 字段，未来版本也可能引入 ``multipolygon`` 之类的新取值。
-        把它们当成矩形只会"多下一点"，而报错或猜成多边形都可能"少下" ——
-        少下是用户看不见的缺陷，多下只是浪费，两者代价不对称。
+        宽容是为了老数据不直接炸：老 MBTiles / 老 manifest / 老任务记录里
+        可能有 ``rectangle``（已移除），未来版本也可能引入 ``multipolygon``。
+        退回 ``POLYGON`` 后它们会在"缺少 region_id / geojson_path"处**可见地
+        失败**（提示补边界或重新选区域），而不是被当成一块矩形静默下载。
 
-        >>> RegionType.parse(None) is RegionType.RECTANGLE
-        True
         >>> RegionType.parse("polygon") is RegionType.POLYGON
         True
-        >>> RegionType.parse("multipolygon") is RegionType.RECTANGLE
+        >>> RegionType.parse("rectangle") is RegionType.POLYGON
         True
         """
         if isinstance(value, cls):
@@ -143,13 +146,12 @@ class RegionType(Enum):
             for item in cls:
                 if item.value == normalized:
                     return item
-        return cls.RECTANGLE
+        return cls.POLYGON
 
     @property
     def display_name(self) -> str:
         """界面上的类型名（与预设下拉框里的选项文案一致）。"""
-        return {RegionType.RECTANGLE: "自定义矩形", RegionType.POLYGON: "行政区域",
-                RegionType.COVERAGE: "多级覆盖"}[self]
+        return {RegionType.POLYGON: "行政区域", RegionType.COVERAGE: "多级覆盖"}[self]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +264,7 @@ class RegionPreset:
         default_boundary_version: 边界数据版本。``None`` 表示"以 GeoJSON 里
             ``properties.boundaryVersion`` 为准"——数据自带版本时不该在代码里
             再抄一份，那两者迟早不一致。
-        region_type: 几何类型（矩形 / 多边形）。
+        region_type: 几何类型（行政区 / 多级覆盖）。
         region_level: 规划等级（Slice 17，Spec §7）。全国 / 省 / 市 / 任务区
             决定 Zoom 建议，见 :data:`~app.planning.DEFAULT_ZOOM_POLICIES`。
             缺省是 :attr:`~app.planning.RegionLevel.CUSTOM`：**不写就是自定义**，
@@ -393,23 +395,22 @@ class DownloadRegion:
     """一次下载的区域（Spec §2）。
 
     Attributes:
-        region_type: 矩形 / 多边形。
-        name: 展示名（"自定义矩形" / "中国"）。
-        bounds: 矩形范围，**或**多边形候选范围（``geometry.bounds``）。
-            多边形模式下它**只用于快速筛掉绝大部分瓦片**，最终每一张瓦片
-            仍要经 :class:`~app.geo.PolygonTileRegionFilter` 判定。
-        region_id: 行政区标识（``china``）；自定义矩形为 ``None``。
+        region_type: 几何类型（行政区 / 多级覆盖）。
+        name: 展示名（"中国" / "杭州市"）。
+        bounds: 候选范围（多边形外包矩形）。它**只用于快速筛掉绝大部分瓦片**，
+            最终每一张瓦片仍要经 :class:`~app.geo.PolygonTileRegionFilter` 判定。
+        region_id: 行政区标识（``china``）；任务区也用这个字段。
         boundary_version: 边界数据版本（可追溯"这批瓦片是按哪版边界裁的"）。
         geojson_path: 边界文件路径（字符串，便于写进任务记录）。
         region_level: 规划等级（Slice 17，Spec §7）。缺省
-            :attr:`~app.planning.RegionLevel.CUSTOM` —— 老任务记录、老 manifest
-            与自定义矩形都落在这里，因此它们的行为与 Slice ≤16 逐位一致。
+            :attr:`~app.planning.RegionLevel.CUSTOM` —— 老任务记录与老 manifest
+            都落在这里。
             **不写进 tasks.json / manifest**：它由 ``region_id`` 反查预设即可得到
             （见 :func:`region_from_task`），多存一份就多一处会不同步的地方。
             **例外**是任务区（``MISSION``，Slice 22）：它的几何不在资源目录里，
             反查不出等级，因此 metadata 里会显式写下 ``region_level=mission``。
         buffer_meters: 任务区走廊半径（米，Slice 22）。只有任务区有值；
-            矩形与行政区边界都是 ``None``（它们的"半径"没有意义）。
+            行政区边界是 ``None``（它的"半径"没有意义）。
             它会被写进 MBTiles metadata，供 Inspector / 打包说明"这个包是
             按几公里的走廊下的"。
 
@@ -438,7 +439,7 @@ class DownloadRegion:
         object.__setattr__(self, "region_level", RegionLevel.parse(self.region_level))
 
         if region_type is RegionType.COVERAGE and not self.coverage_data:
-            raise ValueError("多级覆盖区域缺少策略快照，不能退化为矩形")
+            raise ValueError("多级覆盖区域缺少策略快照，无法构造下载区域")
         path = (self.geojson_path or "").strip()
         if region_type is RegionType.POLYGON and not path:
             raise ValueError(
@@ -464,11 +465,6 @@ class DownloadRegion:
     # ------------------------------------------------------------------ #
     # 构造
     # ------------------------------------------------------------------ #
-    @classmethod
-    def rectangle(cls, name: str, bounds: GeoBounds) -> DownloadRegion:
-        """构造自定义矩形区域（与 Slice 0~15 的行为完全一致）。"""
-        return cls(region_type=RegionType.RECTANGLE, name=name, bounds=bounds)
-
     @classmethod
     def from_preset(
         cls,
@@ -510,7 +506,13 @@ class DownloadRegion:
     # ------------------------------------------------------------------ #
     @property
     def is_polygon(self) -> bool:
-        """是否需要走几何过滤。"""
+        """是否需要走几何过滤。
+
+        自定义矩形移除后，本工具能表达的区域**都带几何**（行政区边界或
+        任务区走廊），因此该属性当前恒为 ``True``。保留它是为了让下游
+        "按几何过滤"与"按外包矩形"两种读取方式仍然显式可读，而不是
+        在十几处调用点各写一个 ``True``。
+        """
         return self.region_type in (RegionType.POLYGON, RegionType.COVERAGE)
 
     @property
@@ -526,14 +528,12 @@ class DownloadRegion:
     @property
     def preset(self) -> RegionPreset | None:
         """多边形区域对应的预设（用于 Inspector 按 region_id 找边界文件）。"""
-        return get_region_preset(self.region_id) if self.is_polygon else None
+        return get_region_preset(self.region_id) if self.region_id else None
 
     def describe(self) -> str:
-        """一行展示文案，如 ``中国（行政区域）`` / ``自定义矩形`` / ``某航线（任务区，5.00 km）``。"""
+        """一行展示文案，如 ``中国（行政区域）`` / ``某航线（任务区，5.00 km）``。"""
         if self.region_type is RegionType.COVERAGE:
             return f"{self.name}（多级 Zoom 区域覆盖）"
-        if not self.is_polygon:
-            return "自定义矩形"
         if self.is_mission:
             radius = (
                 f"，{self.buffer_meters / 1000.0:.2f} km"
@@ -571,13 +571,12 @@ class DownloadRegion:
     def metadata_rows(self) -> dict[str, str]:
         """写进 MBTiles ``metadata`` 表的键值（Spec §19）。
 
-        矩形也写 ``region_type=rectangle``：显式写出来，Inspector 才不用靠
-        "没有这个键"来猜。``region_id`` / ``boundary_version`` 只在有值时写，
-        避免矩形包多出两个空值键。
+        ``region_id`` / ``boundary_version`` 只在有值时写，避免任务区包多出
+        两个空值键。
 
         **``region_level`` 只要有等级就写（Slice 25 修正，Slice 27 补县级）**：
-        矩形是 ``custom``、行政区是 ``country`` / ``province`` / ``city`` /
-        ``county``、任务区是 ``mission``。
+        行政区是 ``country`` / ``province`` / ``city`` / ``county``、
+        任务区是 ``mission``。
         Slice 22 曾以"等级能从 ``region_id`` 反查"为由只给任务区写 ——
         那句话只对**本工具自己**成立：Android 侧没有区域目录，反查不出来，
         于是行政区包在那边一律落到"未知等级"，分层选包的等级优先级整条失效。
@@ -609,10 +608,9 @@ class DownloadRegion:
         ``boundaryVersion`` 表达了。
 
         ``type`` 仍然是**几何类型**（``polygon``）而不是 ``mission``：
-        这个键在 Slice 16 就定成"矩形还是多边形"，
-        它的读取方（含 Android）对认不出的取值一律按矩形兜底 ——
-        把 ``mission`` 塞进去，等于让老读取方把一个多边形包当矩形看，
-        "是哪种区域"改由 ``level`` 表达，两者各管一件事、互不挤占。
+        "是哪种区域"由 ``level`` 表达，两者各管一件事、互不挤占。
+        老版本读取方对认不出的 ``type`` 会按矩形兜底，因此这里不能塞
+        ``mission`` 之类的业务类型。
 
         注意：真正写 manifest 的是 :mod:`app.package`（它从 MBTiles metadata
         取信息，见 ``package_builder._region_from_metadata``）。本方法保证
@@ -713,13 +711,14 @@ def region_from_task(task: object) -> DownloadRegion | None:
 
     还原规则：
 
-    - 记录里的 ``region_type`` 认不出、或就是 ``rectangle`` → 矩形区域；
-    - 是多边形但 ``region_id`` 找不到对应预设 → 先问一遍动态解析器
-      （任务区走这条路，Slice 22），仍然还原不出来才返回 ``None``
-      （调用方据此提示"这个任务的行政区边界已不可用"，而不是猜一个形状）。
+    - ``region_type=coverage`` → 多级 Zoom 覆盖区域；
+    - 其余（含老记录里的空串 / ``rectangle``）一律按行政区处理：``region_id``
+      找不到对应预设时先问一遍动态解析器（任务区走这条路，Slice 22），仍然
+      还原不出来才返回 ``None`` —— 调用方据此提示"这个任务的区域已不可用"，
+      而不是猜一个形状继续下。
 
     Returns:
-        :class:`DownloadRegion`；多边形无法还原时返回 ``None``。
+        :class:`DownloadRegion`；无法还原时返回 ``None``。
 
     Raises:
         ValueError: 记录里的经纬度/缩放不构成合法范围。
@@ -734,8 +733,6 @@ def region_from_task(task: object) -> DownloadRegion | None:
     if region_type is RegionType.COVERAGE:
         from app.geo.zoom_coverage import coverage_from_task
         return coverage_from_task(task)
-    if region_type is RegionType.RECTANGLE:
-        return DownloadRegion.rectangle(str(getattr(task, "name", "") or ""), bounds)
 
     region_id = str(getattr(task, "region_id", "") or "").strip()
     preset = get_region_preset(region_id)
@@ -769,9 +766,13 @@ def region_from_metadata(
 
         与 :func:`region_from_task` 的差别在于**多返回一句解释**：Inspector 需要
         把"边界文件找不到了"讲给用户听，而下载链路只需要知道成功还是失败。
-    """
-    if RegionType.parse(region_type) is RegionType.RECTANGLE:
-        return DownloadRegion.rectangle("自定义矩形", bounds), ""
+        """
+    # 老包（自定义矩形时代）留下的 ``rectangle``：本版本已不支持按矩形校验，
+    # 必须说清"是不支持"而不是"缺 region_id"——后者会把用户引去补一个不存在的东西。
+    if str(region_type or "").strip().lower() == "rectangle":
+        return None, (
+            "该地图包按自定义矩形下载，本版本只支持行政区域，无法校验边界覆盖度"
+        )
 
     wanted = (region_id or "").strip()
     preset = get_region_preset(wanted)

@@ -321,6 +321,72 @@ DEFAULT_PLANS_FILE: Path = DEFAULT_TASKS_DIR / PLANS_FILE_NAME
 DEFAULT_PLAN_EXECUTIONS_FILE: Path = DEFAULT_TASKS_DIR / PLAN_EXECUTIONS_FILE_NAME
 
 # --------------------------------------------------------------------------- #
+# 统一瓦片仓库（Slice 42）
+# --------------------------------------------------------------------------- #
+#: 仓库根目录名。默认放在 ``~/MapDownloader/tile_repo`` —— 与 ``output/`` **同盘**
+#: 是硬要求：导出期的"暂存 → 发布"用的是 ``os.replace``，跨卷会退化成复制+删除，
+#: 既不是原子的，也会在峰值时多占一整份空间（见 docs/tile_repository_architecture）。
+DEFAULT_TILE_REPO_ROOT: Path = DEFAULT_OUTPUT_DIR.parent / "tile_repo"
+
+#: 仓库是否参与下载/导出主流程。Slice 42 只提供模块能力，默认 **false**，
+#: 旧流程（直接写交付 mbtiles）行为完全不变；Slice 44 起才可能被打开。
+TILE_REPO_ENABLED: bool = False
+
+#: 仓库 schema 版本。分片与 catalog 各自记一份，两者都必须是这个值：
+#: 认不出来就**拒绝服务**，不做自动迁移（迁移脚本属于 Slice 49）。
+TILE_REPO_SCHEMA_VERSION: int = 1
+
+#: 数据源标识与坐标规格。``projection`` / ``tile_size`` 是数据源的属性，
+#: 不进单个瓦片的身份（同一数据源内不会变）。
+TILE_REPO_SOURCE_ID: str = "tianditu"
+TILE_REPO_PROVIDER: str = MBTILES_PROVIDER_TIANDITU
+TILE_REPO_PROJECTION: str = "EPSG:3857"
+TILE_REPO_TILE_SIZE: int = TILE_SIZE
+
+#: 仓库内部只接受这个 zoom 上界（与 tile_math 一致：0~22）。
+TILE_REPO_MAX_ZOOM: int = TILE_MATH_MAX_ZOOM
+
+#: 分片规则：``(z_min, z_max)`` 闭区间，按"图层 × zoom 带"切片。
+#:
+#: 四个带的理由见架构 §6.2：导出只开需要的带、单库规模量级可控、路由是纯函数。
+#: 改这张表等于改分片布局，需要重建索引（Slice 49），因此它同时被写进
+#: ``catalog.zoom_bands`` —— 代码里的默认值只在**首次初始化**时使用。
+TILE_REPO_ZOOM_BANDS: tuple[tuple[int, int], ...] = ((0, 6), (7, 11), (12, 14), (15, 18))
+
+#: 分片写租约：心跳超过这么久没更新，就认为持有者已死，允许接管。
+TILE_REPO_LEASE_TIMEOUT_SECONDS: float = 90.0
+
+#: 心跳间隔（每写入这么多秒刷新一次租约文件的 mtime）。
+TILE_REPO_LEASE_HEARTBEAT_SECONDS: float = 15.0
+
+#: 单次事务的瓦片条数。与下载侧的 ``MBTILES_BATCH_SIZE`` 同量级：
+#: 太小则 WAL 反复提交，太大则中断回滚的代价高。
+TILE_REPO_BATCH_SIZE: int = 200
+
+#: 流式遍历的 ``fetchmany`` 批大小（决定"一次读多少行到内存"）。
+TILE_REPO_STREAM_BATCH_SIZE: int = 1000
+
+#: catalog 与分片的 SQLite ``busy_timeout``（毫秒）。到点仍拿不到写锁 →
+#: 抛 ``Busy``，而不是无限阻塞（界面上表现为"仓库正被另一个任务写入"）。
+TILE_REPO_SQLITE_BUSY_TIMEOUT_MS: int = 5000
+
+#: ``staging/`` 下的残留超过这个年龄才允许清理（秒）。
+TILE_REPO_STAGING_MAX_AGE_SECONDS: int = 24 * 60 * 60
+
+#: 缺口报告里每级最多列多少个缺失坐标样例。
+TILE_REPO_MISSING_SAMPLE_LIMIT: int = 32
+
+#: 生成缺失样例时最多扫多少列（``x``）。超出就标"样例已截断"，
+#: 不为了凑够样例去遍历整个 zoom。
+TILE_REPO_MISSING_SAMPLE_MAX_COLUMNS: int = 512
+
+#: ``superseded`` 版本默认保留天数（超过后由 ``prune`` 回收，Slice 49 才执行）。
+TILE_REPO_SUPERSEDED_RETENTION_DAYS: int = 30
+
+#: 完整健康检查抽样多少条内容做 SHA256 复算与解码。
+TILE_REPO_HEALTH_CONTENT_SAMPLE: int = 32
+
+# --------------------------------------------------------------------------- #
 # 行政区域边界资源（Slice 16）
 # --------------------------------------------------------------------------- #
 #: 行政区域边界（GeoJSON）所在目录：``<仓库根>/resources/regions``。

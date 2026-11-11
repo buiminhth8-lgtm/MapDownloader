@@ -607,7 +607,6 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 F：界面下拉来自目录（真窗口）")
     from PySide6.QtCore import Qt
 
-    from app.geo import RegionType
     from app.geo.region import CHINA_REGION_PRESET
     from app.planning import RegionLevel, ZoomStrategyService
     from app.ui.download_panel import ACTION_CALCULATE
@@ -660,7 +659,6 @@ def scene_ui(app, window, checker: Checker, shots: bool) -> None:
         str(tips),
     )
 
-    panel.set_region_type(RegionType.POLYGON)
     _pump(app)
     checker.check(
         panel.current_region_level() is RegionLevel.COUNTRY,

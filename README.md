@@ -142,6 +142,13 @@ Windows端生成天地图离线地图包，后续导入Android供osmdroid使用�
 
 ## 当前进度
 
+**本版：删除「自定义矩形」，下载范围只剩行政区域。** 界面上不再有「区域类型」下拉与
+`West / East / South / North` 四个输入框，`RegionType` 也只剩 `POLYGON` / `COVERAGE`
+两个取值。老任务、老地图包里那句 `region_type=rectangle` 仍然**读得懂**，但只会换来
+一句"本版本只支持行政区域"的明确提示 —— 不会静默按一块矩形继续下载或校验
+（详见[`docs/region_selection_ui.md`](docs/region_selection_ui.md) 与
+[`docs/troubleshooting.md`](docs/troubleshooting.md) 的"自定义矩形已移除"一条）。
+
 损坏瓦片修复已闭环：在 MBTiles 检查窗口点击「校验并修复」，或在损坏提示中进入修复。
 只重下损坏与缺失瓦片，拒绝坏响应覆盖，结束后全量解码复检；支持取消后再次修复。
 详见[操作说明与验收](docs/tile_repair.md)。
@@ -1215,7 +1222,7 @@ Min Zoom: 12（只读）    Max Zoom: 16（只读）
 
 | 键 | 值 |
 | --- | --- |
-| `download/region_type` | `rectangle` / `polygon` |
+| `download/region_type` | 恒为 `polygon`（`rectangle` 已删除，读到只用于识别老配置） |
 | `download/country_id` / `province_id` / `city_id` / `county_id` | 四级 id **分别**存 |
 | `download/zoom_mode` | `recommended` / `custom` |
 | `download/custom_min_zoom` / `custom_max_zoom` | 用户自己定的区间 |
@@ -1456,9 +1463,37 @@ Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
 
 ### 界面（Spec §15 / §17）
 
-「区域类型」下拉两个选项：**自定义矩形** / **行政区域**。选行政区域后，行政区下拉
-（当前只有「中国」）出现，四个经纬度框**自动填上外包矩形并变成只读** —— 范围由数据
-文件决定，手改会让"界面显示的范围"与"实际裁剪依据"对不上，而用户看不出这一点。
+> **Slice 43 已删除「自定义矩形」**：界面上不再有「区域类型」下拉与四个经纬度输入框，
+> 下载范围**只有行政区域**一种。范围由边界文件算出（按 6 位小数量化后写进
+> MBTiles metadata），用户没有任何可填的入口 —— 手改会让"界面显示的范围"与
+> "实际裁剪依据"对不上，而用户看不出这一点。
+
+行政区下拉（当前只有「中国」）出现后，选中的行政区的**外包矩形**显示在只读的
+「区域范围」行上（`区域范围（由行政区边界决定，最终只下载与边界相交的瓦片）`）。
+
+#### 自定义矩形已删除（本版）
+
+旧版本有「区域类型」下拉（自定义矩形 / 行政区域）。它带来的是持续的解释成本：
+两条"要下哪块地"的来源同时存在，用户分不清当前用的是哪一条；切模式还会互相污染
+（切回矩形时四个框里躺着上一个行政区的外包矩形）。而矩形本身只是"一块范围"，
+用一份恰好等于该范围的 GeoJSON 边界文件可以精确表达同一件事，走的还是生产那条
+几何裁剪链路。
+
+删除的范围：
+
+| 位置 | 变化 |
+| --- | --- |
+| `RegionType` | 只剩 `POLYGON` / `COVERAGE`；读到 `rectangle` 退回 `POLYGON`，在缺 `region_id` / `geojson_path` 处**可见地失败**，绝不静默当成一块矩形 |
+| `DownloadRegion` | 删掉 `rectangle()` 构造器；`POLYGON` 必须带 `geojson_path`（构造时就拦） |
+| `DownloadPanel` | 删掉区域类型下拉、四个经纬度框、`set_region_type()` / `bounds_spins` / `manual_bounds`；候选范围改由边界外包矩形提供（**按 6 位小数量化**，与写进 metadata 的精度一致） |
+| `MainWindow` | 估算一律走后台区域估算；没有区域就拒绝开工，不再伪造矩形 |
+| 老数据 | 老任务续传 → "该任务按自定义矩形下载，本版本只支持行政区域"；老地图包 → Inspector 提示"无法校验边界覆盖度"，不会按外包矩形算出假缺口 |
+
+这条删除也拿掉了一条性能捷径：矩形以前走 `calculate_tile_range` 的**算术快路径**
+（`selected == candidate`，不逐张判定），所以"一秒钟算出 685 万张"是可能的；现在
+所有范围都是行政区域，几百万张就要真枚举。因此风险分析的四档验收改成"真估算 +
+钉住等级"（见 `scripts/verify_slice23_risk.py` 的 `_pin_risk_level`），而不是靠
+构造一块巨型矩形。
 
 点「计算」给出六个数字：候选 / 区域内 / 过滤 / 占比 / 预计请求量 / 预计容量，
 外加逐级明细。**运行日志里是同一份文案**（`estimate.as_lines()` 一份产出两处用），
@@ -1468,8 +1503,8 @@ Slice 16 解决了"下哪一块地"，这一版解决"下到**多少级**"。
 
 本地实测抓到一条真缺陷，`pytest` 全绿也发现不了（没有用例会去切区域类型再看结果区）：
 
-1. 先在「自定义矩形」下算一次 → 结果区写着 `预计瓦片：56`；
-2. 切到「行政区域」，而 `china.geojson` 不在 → **结果区那句"预计瓦片 56"还在**，
+1. 先在某块区域下算一次 → 结果区写着 `预计瓦片：56`；
+2. 换到另一个区域，而它的边界文件不在 → **结果区那句"预计瓦片 56"还在**，
    看起来就像是"行政区域也算出了 56 张"；
 3. 再点「计算」会给出人话错误，但只要动一下输出目录（`output_config_changed`）
    或勾一下注记（`layer_plan_changed`），`_refresh_output_preview` 就会拿**缓存里的
@@ -2054,7 +2089,7 @@ python -m pytest tests/test_region_selection_controller.py \
 | `tests/test_zoom_policy.py` | **Slice 17** 四级区间逐个数钉死、策略自洽与重叠带、CUSTOM 不警告、单一来源三条静态守卫、`app.geo` ↔ `app.planning` 导入顺序（子进程） |
 | `tests/test_zoom_strategy.py` | **Slice 17** 推荐 / 评估（超范围只 warning、**不改写**用户 Zoom）、非法输入逐条拒绝、`recommend_with_estimate` 与直接调 `RegionTileEstimator` 逐字段一致 |
 | `tests/test_region_selection_controller.py` | **Slice 19** 级联状态（换国家清省 / 市、只选国 / 省 / 市各自的等级）、推荐区间取自策略、自定义保原值、`ZoomMode.parse` 宽容、`download_region` 真的用边界、缺 / 坏边界安全返回 `None` |
-| `tests/test_download_panel_region_selection.py` | **Slice 19** 控件行为：矩形模式逐像素兼容、三段下拉联动、推荐模式自动填值且只读、模式切换不改值、两个单选互斥、范围倒置只提示、估算用区域内张数、偏好往返与脏 id 回退 |
+| `tests/test_download_panel_region_selection.py` | **Slice 19** 控件行为：三段下拉联动、推荐模式自动填值且只读、两个单选互斥、范围倒置只提示、估算用区域内张数、偏好往返与脏 id 回退；另含"面板上没有手填边界控件"这条守卫（自定义矩形已删除） |
 
 `tests/test_ui_smoke.py` 里还有两条**专门盯着"弹窗关掉之后"**的用例
 （`test_dismissing_complete_dialog_then_closing_window_is_safe` /

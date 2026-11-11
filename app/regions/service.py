@@ -34,7 +34,7 @@ Zoom 建议**不在这一层算**（Spec §9）：这里只把目录里的
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +86,10 @@ class RegionService:
         self._strategy = strategy if strategy is not None else ZoomStrategyService()
         self._cache: RegionCatalog | None = None
         self._catalog_error: str = ""
+        #: 根目录"原样 → 真实路径"的缓存（见 :meth:`_resolved`）。填一次级联会
+        #: 问几十次根目录，每次 ``resolve()`` 都是一次 ``nt._getfinalpathname``；
+        #: 缓存的键是**原样路径**，所以全局被重定向（测试 / 验收脚本）时自然失效。
+        self._root_cache: tuple[Path, Path] | None = None
         #: 生成数据集（import pipeline 发布的那种）是否优先（Slice 26，§16）。
         #: **默认关**：默认路径与 Slice 18 逐字节一致，测试与验收脚本继续
         #: monkeypatch ``REGION_RESOURCE_DIR`` 就行。要"导入后不用重启就看
@@ -106,12 +110,32 @@ class RegionService:
         把内置资源重定向到临时目录时，这个服务会自动跟着走，不必再多同步一处。
         """
         if self._explicit_root is not None:
-            return self._explicit_root.resolve()
+            return self._resolved(self._explicit_root)
         if self._explicit_catalog is not None:
             return self._explicit_catalog.root
         if self._prefer_generated:
-            return effective_region_root().resolve()
-        return region_resource_root().resolve()
+            return self._resolved(effective_region_root())
+        return self._resolved(region_resource_root())
+
+    def _resolved(self, root: Path) -> Path:
+        """把根目录解析成真实路径 —— 同一个原样路径只解析一次。
+
+        为什么要缓存：一次级联刷新会问几十次 :attr:`root`（`:attr:`catalog`
+        每次都要拿它比对、`:attr:`loader` 每次都要拿它构造），而
+        ``Path.resolve()`` 在 Windows 上是 ``nt._getfinalpathname``，一次
+        0.1~0.2 ms，几十次就是几毫秒的纯浪费 —— 恰恰落在"点一下省份"这条
+        用户能感知的路径上。
+
+        缓存键是**原样路径**（不是解析结果）：测试与验收脚本把
+        ``REGION_RESOURCE_DIR`` 指到临时目录时，原样路径变了，这里就重新解析，
+        不会把上一个目录的结论带过去。
+        """
+        cached = self._root_cache
+        if cached is not None and cached[0] == root:
+            return cached[1]
+        resolved = Path(root).resolve()
+        self._root_cache = (Path(root), resolved)
+        return resolved
 
     @property
     def catalog(self) -> RegionCatalog:
@@ -345,6 +369,15 @@ class RegionService:
     def boundary_available(self, region_id: str) -> bool:
         """边界文件就位了没有。"""
         return self.loader.available(region_id)
+
+    def boundary_available_many(self, region_ids: Iterable[str | None]) -> dict[str, bool]:
+        """批量版 :meth:`boundary_available`（界面填下拉时用）。
+
+        单条版每条都要解析两次真实路径，条目一多就是几百上千次
+        ``nt._getfinalpathname``；批量版按目录各列一次，系统调用次数与条目数
+        无关。判定口径见 :meth:`RegionLoader.available_many`。
+        """
+        return self.loader.available_many(region_ids)
 
     def missing_message(self, region_id: str) -> str:
         """边界文件缺失时给用户看的那段话（放哪、叫什么、要什么授权）。"""

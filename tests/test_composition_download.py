@@ -46,6 +46,7 @@ from app.models import (
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import MapDownloadService, MapResumeError, read_existing_metadata
 from app.tasks import TaskService, TaskStore
+from tests.region_helpers import rect_region, register_for_resume
 
 FAKE_TOKEN = "abcdefghijklmn"
 NO_RETRY = RetryPolicy(max_attempts=1, base_delay_seconds=0.0, max_delay_seconds=0.0)
@@ -485,6 +486,11 @@ def _task_for(
 ):
     task_service = TaskService(TaskStore(work_dir / "tasks.json"))
     total = _expected_tiles(SMALL_BOUNDS, 12, 12)
+    # 记录里必须带区域：续传要按 region_id 找回边界文件（矩形能力已删除，
+    # 一条没有区域的记录会被明确拒绝，用例就测不到合成一致性了）
+    region = register_for_resume(
+        rect_region("测试区域", SMALL_BOUNDS, work_dir / "region_geojson")
+    )
     task = task_service.create_task(
         name="resume",
         bounds=SMALL_BOUNDS,
@@ -495,6 +501,7 @@ def _task_for(
         output_path=work_dir / output_name,
         total_tiles=total,
         with_labels=with_labels,
+        region=region,
     )
     return task_service, task, total
 

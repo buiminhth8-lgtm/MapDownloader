@@ -34,6 +34,7 @@ from app.models import DownloadTaskStatus, MapLayerType
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import MapDownloadService, MapResumeError
 from app.tasks import TaskService, TaskStore
+from tests.region_helpers import rect_region, register_for_resume
 
 FAKE_TOKEN = "abcdefghijklmn"
 LAYER = MapLayerType.VECTOR
@@ -196,9 +197,18 @@ def _new_task(
     name: str = "beijing",
     output_name: str = "beijing.mbtiles",
 ):
-    """建一条任务记录 + 一个 TaskService（任务文件与地图文件同在临时目录）。"""
+    """建一条任务记录 + 一个 TaskService（任务文件与地图文件同在临时目录）。
+
+    记录里必须带**下载区域**：续传时服务要按 ``region_id`` 找回边界文件来数
+    "区域内已有多少张、还缺哪些"。矩形能力删掉之后，一条没有区域的任务记录
+    会被明确拒绝（"本版本只支持行政区域"），所以这里现造一块恰好等于
+    ``bounds`` 的合成行政区，并挂进动态解析表。
+    """
     task_service = TaskService(TaskStore(work_dir / "tasks.json"))
     expected = len(_target_tiles(bounds, min_zoom, max_zoom))
+    region = register_for_resume(
+        rect_region("测试区域", bounds, work_dir / "region_geojson")
+    )
     task = task_service.create_task(
         name=name,
         bounds=bounds,
@@ -207,6 +217,7 @@ def _new_task(
         map_layer=layer,
         output_path=work_dir / output_name,
         total_tiles=expected,
+        region=region,
     )
     return task_service, task, expected
 

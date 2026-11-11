@@ -242,10 +242,18 @@ def use_region_resources(root: Path) -> None:
     """把行政区资源目录重定向到 ``root``（仓库资源区保持干净）。
 
     必须在**建窗口之前**调用：面板与计划服务构造时就会去读一次目录。
+
+    两个全局都要改：``REGION_RESOURCE_DIR`` 是手工资源目录，
+    ``app.config.settings.REGION_DATA_ROOT`` 是导入器发布生成数据的目录 ——
+    ``effective_region_root`` 只要看到后者"已发布"就优先用后者。本机真装过
+    行政区数据时，只改前者等于没改（合成目录会被真实数据顶掉，验收断言全部
+    落在另一份数据上，看起来像产品缺陷）。
     """
+    from app.config import settings as verification_settings
     from app.geo import region as region_module
 
     region_module.REGION_RESOURCE_DIR = root
+    verification_settings.REGION_DATA_ROOT = root / "_unpublished_generated"
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +261,6 @@ def use_region_resources(root: Path) -> None:
 # --------------------------------------------------------------------------- #
 def scene_entries(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 A：面板上的两个入口（真窗口 / 真按钮）")
-    from app.geo import RegionType
     from app.ui.download_panel import ACTION_PLAN_ADD, ACTION_PLAN_OPEN
 
     panel = window.download_panel
@@ -303,8 +310,7 @@ def scene_entries(app, window, checker: Checker, shots: bool) -> None:
         f"{geometry[0]} ∩ {geometry[1]}",
     )
 
-    # 切到行政区域，选一块地
-    panel.set_region_type(RegionType.POLYGON)
+    # 选一块行政区域（下载范围只剩这一种，不需要先切模式）
     _pump(app)
     checker.check(
         panel.set_region_id("northland") is True and panel.current_region_id() == "northland",
@@ -727,7 +733,18 @@ def scene_generate(app, window, page, checker: Checker, work_dir: Path, shots: b
     page.buttons()["generate"].click()
     _pump(app, 12)
 
-    tasks = window.task_service.list_tasks()
+    # ``list_tasks()`` 是**按更新时间倒序**（任务是"最新的在最前"）—— 那是界面
+    # 需要的样子，与"生成顺序"是两回事。这里先按计划顺序把生成的记录排回来，
+    # 再逐项比对：拿 ``list_tasks()`` 的原始顺序当"生成顺序"会在时间戳恰好
+    # 跨秒时时好时坏（三条任务间隔往往不足 1 秒，等时间戳真不同了就翻车）。
+    ordered_items = plan.ordered_enabled_items()
+    plan_order = {
+        item.region_id: index for index, item in enumerate(ordered_items)
+    }
+    tasks = sorted(
+        window.task_service.list_tasks(),
+        key=lambda task: plan_order.get(task.region_id, len(plan_order)),
+    )
     checker.check(
         len(tasks) == before + 3,
         "每条启用项各生成一条下载任务（3 项 → 3 条）",
@@ -745,7 +762,7 @@ def scene_generate(app, window, page, checker: Checker, work_dir: Path, shots: b
     )
     checker.check(
         [task.total_tiles for task in tasks]
-        == [item.selected_tiles for item in plan.ordered_enabled_items()],
+        == [item.selected_tiles for item in ordered_items],
         "任务的目标张数就是计划里那一项的选中张数（Spec §7）",
         str([task.total_tiles for task in tasks]),
     )
@@ -889,7 +906,6 @@ def scene_cancel(app, checker: Checker, store, preferences, work_dir: Path) -> N
 def scene_persistence(app, checker: Checker, work_dir: Path, preferences) -> None:
     checker.section("场景 H：关窗 → 新窗（计划还在 / 坏文件不阻塞启动）")
 
-    from app.geo import RegionType
     from app.tasks import TaskService, TaskStore
     from app.ui.main_window import MainWindow
 
@@ -908,7 +924,6 @@ def scene_persistence(app, checker: Checker, work_dir: Path, preferences) -> Non
 
     window = open_window()
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     _pump(app, 6)
     checker.check(
         window.plan_service.plan.is_empty is True,

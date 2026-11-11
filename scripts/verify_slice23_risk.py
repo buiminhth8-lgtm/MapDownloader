@@ -22,10 +22,13 @@
   而这里要验的是**闸门**（拦没拦住），不是下载引擎（那是 Slice 3/5 的事）；
 * 计划里那一条"危险"条目的**已存估算**直接写成 TB 级数字 —— 想真的算出
   100 GiB 需要枚举 360 万张以上瓦片（几分钟 + 几百 MB 内存），而分析器读的
-  本来就是"条目已存下的那几个字段"（Spec §21 的契约）。
+  本来就是"条目已存下的那几个字段"（Spec §21 的契约）；
+* 单任务那两档（"很大" / "危险"）在**真估算**之上把"这次判成哪一档"钉住 ——
+  自定义矩形连同它的算术快路径一起删掉之后，几百万张只能靠真枚举，同一类耗时
+  问题。等级 → 弹窗档位这条映射仍然全部由生产代码走（见 ``_pin_risk_level``）。
 
-除这两处之外，全部走真代码：真窗口、真按钮、真策略表、真分析器、真估算器
-（单任务那四档的等级**全部**由真区域 + 真矩形算出）。
+除这三处之外，全部走真代码：真窗口、真按钮、真策略表、真分析器、真估算器
+（"正常" / "较大"两档的等级是**真算**出来的）。
 
 **全程只碰临时目录**：不往仓库的 ``resources/regions/`` 写任何东西，
 不往注册表写偏好（``QSettings(IniFormat)`` 指向临时 ini），不触网、不下载任何瓦片，
@@ -69,23 +72,21 @@ ACTION_START = "start"
 
 FAKE_TOKEN = "verify-slice23-token"
 
-#: 四档规模用到的三套输入（全部是真区域 / 真矩形，算出来就是那个等级）：
+#: 四档规模用到的输入：
 #:
 #: ==================  ==============  ==================  ============
 #: 构造                 张数             容量                等级
 #: ==================  ==============  ==================  ============
 #: northland Z9~13        3,184           93.28 MB          NORMAL
 #: rivertown Z12~17     190,074            5.44 GB          LARGE
-#: 矩形 2°×2° Z4~18   3,036,871           86.89 GB          VERY_LARGE
-#: 矩形 3°×3° Z4~18   6,850,091          195.98 GB          DANGEROUS
+#: northland Z12~16     ~53,000            1.5 GB           （真算，见下）
 #: ==================  ==============  ==================  ============
 #:
-#: 矩形那两档走的是 `RegionTileEstimator` 的**算术快路径**（矩形下
-#: ``selected == candidate``，不逐张判定），因此"一秒钟算出 685 万张"是真的，
-#: 不是编的。刻意不用真区域 + 真几何去凑这两个等级：那要枚举几百万次点在多边形内，
-#: 脚本会从"验收"变成"等"。
-RECT_VERY_LARGE_BOX = (116.0, 32.0, 118.0, 34.0)  # 2°×2° / Z4~18 → 86.89 GB
-RECT_DANGEROUS_BOX = (110.0, 30.0, 113.0, 33.0)  # 3°×3° / Z4~18 → 195.98 GB
+#: 后两档（VERY_LARGE / DANGEROUS）**不再靠"几百万张"凑**：自定义矩形连同它
+#: 那条 ``selected == candidate`` 的算术快路径一起删掉了，界面上现在只有行政
+#: 区域，凑出 685 万张要真枚举几百万次点在多边形内 —— 脚本会从"验收"变成"等"。
+#: 这两档改成"真估算 + 钉住等级"（见 :func:`_pin_risk_level`）：弹窗的标题 /
+#: 图标 / 正文 / 放行闸门仍然全部是生产代码，被替换的只是"这次被判成哪一档"。
 
 
 # --------------------------------------------------------------------------- #
@@ -250,30 +251,6 @@ def use_region_resources(root: Path) -> None:
 # --------------------------------------------------------------------------- #
 # 表单填写与"真的点一下"
 # --------------------------------------------------------------------------- #
-def _fill_rectangle(
-    panel,
-    box,
-    *,
-    min_zoom: int,
-    max_zoom: int,
-    work_dir: Path,
-    name: str,
-) -> None:
-    """把表单填成"自定义矩形 + 指定 Zoom"（矩形模式下 selected == candidate）。"""
-    from app.geo import RegionType
-
-    west, south, east, north = box
-    panel.set_region_type(RegionType.RECTANGLE)
-    panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(west)
-    panel._south_spin.setValue(south)
-    panel._east_spin.setValue(east)
-    panel._north_spin.setValue(north)
-    _fill_zoom(panel, min_zoom=min_zoom, max_zoom=max_zoom)
-    panel._output_edit.setText(str(work_dir))
-    panel.map_name_edit.setText(name)
-
-
 def _fill_zoom(panel, *, min_zoom: int, max_zoom: int) -> None:
     """切到自定义模式并填两个 Zoom（推荐模式下两个框是只读的）。"""
     from app.ui.region_selection import ZoomMode
@@ -306,6 +283,37 @@ def _click_calculate(window, panel) -> None:
     panel.action_buttons[ACTION_CALCULATE].click()
     wait_for_region_estimate(_APP, window)
     _pump(10)
+
+
+def _pin_risk_level(window, level):
+    """把"这次的风险结论"钉到指定等级（真报告，只换等级与两个确认标记）。
+
+    为什么要钉：VERY_LARGE / DANGEROUS 的阈值按**张数与容量**分档，而无自定义
+    矩形之后，凑到那个规模要真枚举几百万张多边形瓦片（分钟级）。这份脚本要验
+    的是"等级 → 弹窗档位"这条映射（标题、图标、确认词、放行闸门），
+    与同时覆盖 E 场景的"注入输入"是同一个思路：改输入，不改判据。
+
+    两个确认标记从策略层取（与 ``DEFAULT_RISK_POLICY`` 一致的推导），而不是
+    在这里手写 ``True`` —— 手写就等于绕开被测的那条推导。
+    """
+    from dataclasses import replace
+
+    from app.planning.risk_policy import DEFAULT_RISK_POLICY
+
+    base = window._last_risk
+    assert base is not None, "钉等级之前必须先真的算过一次"
+    report = replace(
+        base,
+        level=level,
+        requires_confirmation=DEFAULT_RISK_POLICY.requires_confirmation(level),
+        requires_strong_confirmation=DEFAULT_RISK_POLICY.requires_strong_confirmation(
+            level
+        ),
+    )
+    window._plan_risk = lambda plan: report
+    window._last_risk = report
+    window.download_panel.set_risk_report(report)
+    return report
 
 
 def _install_launch_recorder(window) -> list:
@@ -676,20 +684,28 @@ def scene_start_protection(
     )
 
     # --- D3：VERY_LARGE → 警告图标 ---
-    _fill_rectangle(
+    # 真估算一次（一块真行政区域、真几何、真张数），再把"这次的等级"钉到「很大」：
+    # 无自定义矩形之后，几百万张那个规模要真枚举几分钟（见 _pin_risk_level）。
+    _fill_region(
         panel,
-        RECT_VERY_LARGE_BOX,
-        min_zoom=4,
-        max_zoom=18,
+        "northland",
+        min_zoom=12,
+        max_zoom=16,
         work_dir=work_dir,
         name="验收-很大",
     )
     _click_calculate(window, panel)
-    very_large = window._last_risk
+    base = window._last_risk
     checker.check(
-        very_large is not None and very_large.level is RiskLevel.VERY_LARGE,
-        "2°×2° / Z4~18（3,036,871 张 / 86.89 GB）判成「很大」",
-        "" if very_large is None else f"{very_large.level.name} {very_large.size_text}",
+        base is not None,
+        "先真的算出一次风险结论（后面两档在它的基础上换等级）",
+        "" if base is None else f"{base.level.name} {base.total_tiles:,} 张",
+    )
+    very_large = _pin_risk_level(window, RiskLevel.VERY_LARGE)
+    checker.check(
+        very_large.level is RiskLevel.VERY_LARGE and very_large.requires_confirmation,
+        "「很大」档要求确认（标记由策略层推出）",
+        f"{very_large.level.name} confirmation={very_large.requires_confirmation}",
     )
     panel.start_button.click()
     wait_for_region_estimate(app, window)
@@ -711,20 +727,20 @@ def scene_start_protection(
         _pump(10)
 
     # --- D4：DANGEROUS → 强确认（手输确认词） ---
-    _fill_rectangle(
+    _fill_region(
         panel,
-        RECT_DANGEROUS_BOX,
-        min_zoom=4,
-        max_zoom=18,
+        "rivertown",
+        min_zoom=12,
+        max_zoom=16,
         work_dir=work_dir,
         name="验收-危险",
     )
     _click_calculate(window, panel)
-    danger = window._last_risk
+    danger = _pin_risk_level(window, RiskLevel.DANGEROUS)
     checker.check(
-        danger is not None and danger.level is RiskLevel.DANGEROUS,
-        "3°×3° / Z4~18（6,850,091 张 / 195.98 GB）判成「危险」",
-        "" if danger is None else f"{danger.level.name} {danger.size_text}",
+        danger.level is RiskLevel.DANGEROUS and danger.requires_strong_confirmation,
+        "「危险」档要求强确认（标记由策略层推出）",
+        f"{danger.level.name} strong={danger.requires_strong_confirmation}",
     )
     panel.start_button.click()
     wait_for_region_estimate(app, window)

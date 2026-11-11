@@ -266,95 +266,67 @@ def panel_bounds_matches_region(panel, region) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 场景 A：矩形基线（确认新功能没有动到老行为）
+# 场景 A：界面上**没有**自定义矩形的任何入口（本版本只支持行政区域）
 # --------------------------------------------------------------------------- #
-def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
-    checker.section("场景 A：自定义矩形（Slice 0~15 的老行为，一个字都不许变）")
-    from app.geo import GeoBounds, calculate_tile_range
+def scene_no_rectangle_entry(app, window, checker: Checker, shots: bool) -> None:
+    checker.section("场景 A：下载范围只剩行政区域，界面上不许再留矩形入口")
     from app.ui.download_panel import ACTION_CALCULATE
 
     panel = window.download_panel
     panel.set_zoom_range(ZOOM, ZOOM)
-    panel._west_spin.setValue(BOUNDS[0])
-    panel._south_spin.setValue(BOUNDS[1])
-    panel._east_spin.setValue(BOUNDS[2])
-    panel._north_spin.setValue(BOUNDS[3])
     _pump(app)
 
     checker.check(
-        panel.current_region_type().value == "rectangle",
-        "默认区域类型是「自定义矩形」",
+        not hasattr(panel, "_west_spin")
+        and not hasattr(panel, "_south_spin")
+        and not hasattr(panel, "_east_spin")
+        and not hasattr(panel, "_north_spin"),
+        "面板上没有四个经纬度输入框",
+    )
+    checker.check(
+        not hasattr(panel, "bounds_spins") and not hasattr(panel, "manual_bounds"),
+        "面板上没有「手填边界」这组接口",
+    )
+    checker.check(
+        not hasattr(panel, "set_region_type"),
+        "面板上没有「区域类型」切换（只用一种范围：行政区域）",
+    )
+    checker.check(
+        panel.current_region_type().value == "polygon",
+        "区域类型恒为 polygon",
         panel.current_region_type().value,
     )
-    checker.check(
-        not panel._west_spin.isReadOnly(),
-        "矩形模式下经纬度可编辑（行政区域模式才收起）",
-    )
-    # Slice 30：两条范围路径互斥 —— 矩形模式下四个框是**可见的**，而级联那一整块
-    # 与「区域范围」行全都收起。只断言"可编辑"不够：控件藏起来时 `isReadOnly()`
-    # 照样返回 `False`。
-    checker.check(
-        all(spin.isVisibleTo(panel) for spin in panel.bounds_spins),
-        "矩形模式下四个经纬度框可见",
-    )
-    checker.check(
-        not panel.bounds_hint_label.isVisibleTo(panel),
-        "矩形模式下没有「区域范围」行（那是行政区域才有的只读展示）",
-    )
-    checker.check(
-        panel.region_error == "",
-        "矩形模式没有「区域错误」",
-        panel.region_error,
-    )
 
+    # 临时资源目录是空的 → 默认区域（中国）没有边界文件
+    checker.check(
+        panel.current_region() is None,
+        "边界不可用时 current_region() 是 None（上层据此拒绝开工）",
+    )
+    hint = panel._bounds_hint_label.text()
+    checker.check("边界不可用" in hint, "「区域范围」行说明了边界不可用", hint.replace("\n", " "))
+
+    # 关键：没有区域就**算不出任何数字**，不许悄悄按一块矩形兜底
     panel.action_buttons[ACTION_CALCULATE].click()
     wait_for_region_estimate(app, window)
     _pump(app)
 
-    cached = window._last_calculation
-    checker.check(cached is not None, "点「计算」后拿到了结论")
-    if cached is None:
-        return
-    _total, _size, estimate = cached
-
-    # 期望值用**另一条**生产链路算：``calculate_tile_range``（Slice 1 的瓦片数学）。
-    # 拿 UI 的数字去和它比，才叫"界面没有自己重算"。
-    expected = calculate_tile_range(GeoBounds(*BOUNDS), ZOOM).tile_count
     checker.check(
-        estimate.candidate_tiles == expected,
-        f"候选瓦片数 {expected}（来自 calculate_tile_range）",
-        str(estimate.candidate_tiles),
+        window._last_calculation is None,
+        "没有区域时「计算」不产出结论（不退回矩形）",
+    )
+    text = panel.result_label.text()
+    checker.check(
+        "计算失败" in text or "边界" in text,
+        "「计算」给出的是人话错误，而不是一个数字",
+        text.replace("\n", " / "),
     )
     checker.check(
-        estimate.selected_tiles == expected,
-        "矩形模式下 selected == candidate",
-        f"{estimate.selected_tiles} != {expected}",
-    )
-    checker.check(
-        estimate.filtered_tiles == 0,
-        "矩形模式没有过滤掉任何瓦片",
-        str(estimate.filtered_tiles),
-    )
-    checker.check(
-        window._status_values["tile_total"].text() == f"{expected:,}",
-        "状态栏「总瓦片」与预估一致",
+        window._status_values["tile_total"].text() in ("0", ""),
+        "状态栏「总瓦片」保持占位",
         window._status_values["tile_total"].text(),
     )
 
-    text = panel.result_label.text()
-    checker.check("预计瓦片：" in text, "结果区正常渲染")
-    checker.check(
-        "区域内" not in text,
-        "矩形模式**不**显示「区域内」那几行（那是行政区域模式专有的）",
-        text.replace("\n", " / "),
-    )
-    checker.check(
-        "预计容量：" in text,
-        "结果区同时给出了容量预估",
-        text.replace("\n", " / "),
-    )
-
-    _shot(window, "slice16_rect_baseline.png", shots)
+    _shot(window, "slice16_no_rectangle_entry.png", shots)
 
 
 # --------------------------------------------------------------------------- #
@@ -363,19 +335,14 @@ def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
 def scene_polygon_missing_boundary(
     app, window, checker: Checker, shots: bool, regions_dir: Path
 ) -> None:
-    checker.section("场景 B：行政区域 + 边界文件不在（必须明确失败，不许退回矩形）")
-    from app.geo import RegionType
+    checker.section("场景 B：边界文件不在（必须明确失败，不许退回矩形）")
     from app.ui.download_panel import ACTION_CALCULATE
 
     boundary = regions_dir / china_relative_path()
     checker.check(not boundary.exists(), "前提：边界文件确实不在（临时资源目录是空的）")
 
     panel = window.download_panel
-    before = window._status_values["tile_total"].text()
-    checker.check(before not in ("", "0"), f"前提：上一轮矩形算出了 {before}")
-
-    # --- 用户在界面上把「区域类型」切到「行政区域」 ---
-    checker.check(panel.set_region_type(RegionType.POLYGON), "切到「行政区域」成功")
+    panel.reload_region_boundary()
     _pump(app)
 
     checker.check(
@@ -383,18 +350,8 @@ def scene_polygon_missing_boundary(
         "边界不可用时 current_region() 必须是 None（上层据此拒绝开工）",
     )
     checker.check(
-        panel._west_spin.isReadOnly() and panel._north_spin.isReadOnly(),
-        "行政区域模式下经纬度只读（范围由边界文件决定）",
-    )
-    # Slice 30：行政区域模式下这一整行**收起** —— 界面上不留可填的边界范围，
-    # 免得用户以为"选完区域还能再改两下"。取而代之的是下面那行只读的「区域范围」。
-    checker.check(
-        not any(spin.isVisibleTo(panel) for spin in panel.bounds_spins),
-        "行政区域模式下四个经纬度框收起（互斥：选了区域就没有边界范围输入）",
-    )
-    checker.check(
-        panel.bounds_hint_label.isVisibleTo(panel),
-        "行政区域模式下有「区域范围」只读行",
+        panel._bounds_hint_label.isVisibleTo(panel),
+        "有「区域范围」只读行（界面上没有任何可填的边界范围）",
     )
     hint = panel._bounds_hint_label.text()
     checker.check(
@@ -415,16 +372,11 @@ def scene_polygon_missing_boundary(
         error,
     )
 
-    # --- 关键断言：旧的矩形结论不许留在界面上 ---
+    # --- 关键断言：失败之后不许在结果区留下任何数字 ---
     text = panel.result_label.text()
     checker.check(
-        before not in text,
-        f"{before} 是矩形算出来的，切到行政区域后不该还留在结果区",
-        text.replace("\n", " / "),
-    )
-    checker.check(
         "预计瓦片" not in text,
-        "结果区已退回占位（没有「看起来算成功」的数字）",
+        "结果区没有「看起来算成功」的数字",
         text.replace("\n", " / "),
     )
     checker.check(
@@ -451,9 +403,8 @@ def scene_polygon_missing_boundary(
         failure_text.replace("\n", " / "),
     )
     checker.check(
-        before not in failure_text,
-        "失败提示里没有混进矩形的数字",
-        failure_text.replace("\n", " / "),
+        window._last_calculation is None,
+        "失败之后主窗口里也没有缓存出一份结论",
     )
 
 
@@ -549,43 +500,30 @@ def scene_polygon_ready(app, window, checker: Checker, shots: bool) -> object:
 
     _shot(window, "slice16_polygon_selected.png", shots)
 
-    # --- Slice 30：两条范围路径互斥（来回切一次，看两边有没有互相污染） ---
-    from app.geo import RegionType as _RegionType
-
+    # --- 范围只来自边界文件：界面上没有任何手填入口（自定义矩形已删除） ---
+    checker.check(
+        not hasattr(panel, "_west_spin") and not hasattr(panel, "bounds_spins"),
+        "面板上没有经纬度输入框（范围只能来自边界文件）",
+    )
+    checker.check(
+        not hasattr(panel, "set_region_type"),
+        "面板上没有「区域类型」切换（下载范围只剩行政区域）",
+    )
     polygon_bounds = panel.current_bounds()
-    checker.check(panel.set_region_type(_RegionType.RECTANGLE), "切回「自定义矩形」成功")
+    panel.reload_region_boundary()
+    wait_for_region_estimate(app, window)
     _pump(app)
-    checker.check(
-        panel.current_region_id() is None and panel.current_region_level().value == "custom",
-        "切回矩形后**没有**生效的行政区域（选择被清掉，不是只藏起来）",
-        str(panel.current_region_id()),
-    )
-    checker.check(
-        panel.region_controller.selected_region_id is not None
-        and (panel.region_controller.province, panel.region_controller.city,
-             panel.region_controller.county) == (None, None, None),
-        "级联落回「国家 = 中国、其余全部」（与刚打开界面一致，要重新选）",
-        panel.region_controller.path_text,
-    )
-    checker.check(
-        all(spin.isVisibleTo(panel) for spin in panel.bounds_spins)
-        and not panel.bounds_hint_label.isVisibleTo(panel),
-        "矩形模式下只有四个经纬度框，没有「区域范围」行",
-    )
-    restored = panel.current_bounds()
-    checker.check(
-        (restored.west, restored.south, restored.east, restored.north) == BOUNDS,
-        "切回矩形拿到的是**用户自己填的那四个数**，不是刚才那个行政区的外包矩形",
-        f"{restored.west}, {restored.south}, {restored.east}, {restored.north}",
-    )
-
-    checker.check(panel.set_region_type(_RegionType.POLYGON), "再切回「行政区域」成功")
-    _pump(app)
+    checker.check(panel.current_region() is not None, "重新加载边界后区域仍然可用")
     again = panel.current_bounds()
     checker.check(
         (again.west, again.south, again.east, again.north)
-        == (polygon_bounds.west, polygon_bounds.south, polygon_bounds.east, polygon_bounds.north),
-        "行政区域模式下的范围仍来自边界文件（用户填的矩形没有把它顶掉）",
+        == (
+            polygon_bounds.west,
+            polygon_bounds.south,
+            polygon_bounds.east,
+            polygon_bounds.north,
+        ),
+        "重新加载边界后范围仍是同一份边界文件算出来的",
         f"{again.west}, {again.south}, {again.east}, {again.north}",
     )
 
@@ -853,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
         _pump(app)
 
-        scene_rect_baseline(app, window, checker, shots)
+        scene_no_rectangle_entry(app, window, checker, shots)
         scene_polygon_missing_boundary(app, window, checker, shots, regions_dir)
 
         # 关掉计算失败那几个非模态提示框，免得它们压在后面的截图上

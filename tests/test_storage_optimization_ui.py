@@ -7,9 +7,10 @@ import pytest
 from PySide6.QtCore import QThread
 from scripts.verify_storage_optimization import seed_source
 
-from app.geo import DownloadRegion, GeoBounds
+from app.geo import GeoBounds
 from app.services.mbtiles_optimizer import ExportCancelled, ExportTarget
 from app.ui import storage_optimization_dialog as ui
+from tests.region_helpers import rect_region
 from tests.test_storage_budget_ui import until, window  # noqa: F401
 
 
@@ -102,9 +103,9 @@ def test_plan_region_split_requires_current_enabled_regions(dialog,qapp):
     assert '没有启用' in dialog.status_label.text()
 
 
-def test_plan_change_invalidates_selected_region_preview(dialog,qapp,window):
+def test_plan_change_invalidates_selected_region_preview(dialog,qapp,window,tmp_path):
     dialog.split_combo.setCurrentIndex(2)
-    region=DownloadRegion.rectangle('requested',GeoBounds(115,38,118,42))
+    region=rect_region('requested',GeoBounds(115,38,118,42),tmp_path)
     dialog.target_factory=lambda:lambda:(ExportTarget('requested',region,12,12),)
     preview(dialog,qapp)
     window.plan_service.plan.name='changed-after-preview'

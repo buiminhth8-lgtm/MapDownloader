@@ -1024,11 +1024,24 @@ class MapDownloadService:
         # --- 1b. 下载目标：具体图层 / 地图类型 + 是否合成（Slice 6） ---
         target, with_labels = _resolve_task_target(task)
 
-        # --- 1c. 区域（Slice 16）：老任务没有这三个字段 → 矩形，行为与以前一致 ---
+        # --- 1c. 区域（Slice 16）：区域不可用就不能续传 ---
         region = region_from_task(task)
         if region is None:
+            # 两种情况都要**说清是哪一种**：让用户去补一个不存在的东西，
+            # 是最容易把人带偏的一类提示。
+            raw_type = str(getattr(task, "region_type", "") or "").strip().lower()
+            if raw_type == "rectangle" or not str(
+                getattr(task, "region_id", "") or ""
+            ).strip():
+                # 老的自定义矩形任务没有 region_id，本版本已不支持按矩形裁剪：
+                # 原样续传会让 metadata 里那句 region_type=rectangle 继续存在，
+                # 而边界覆盖度再也校验不了。
+                raise MapResumeError(
+                    f"任务 {task.id} 按自定义矩形下载，本版本只支持行政区域，"
+                    "无法继续续传；请重新选择行政区域后再下载"
+                )
             # 任务记录说是多边形、但本版本找不到对应预设：**不能猜**。
-            # 按矩形续传会把区域外的瓦片也下下来，等于悄悄改变了这个任务的定义。
+            # 按外包矩形续传会把区域外的瓦片也下下来，等于悄悄改变了这个任务的定义。
             raise MapResumeError(
                 f"任务 {task.id} 记录的区域（region_id={task.region_id!r}）"
                 "在本版本找不到对应的行政区边界，无法安全续传"
@@ -1565,13 +1578,13 @@ def region_target_tiles(
 ) -> int:
     """本次任务的**目标瓦片数**（进度分母、续传的"共多少张"）。
 
-    - 矩形（或 ``region`` 为 ``None``）→ 候选数，与 Slice 0~15 逐位一致；
-    - 多边形 → 与区域真正相交的瓦片数（``selected``）。
+    - 没有区域（``region`` 为 ``None``）→ 候选数；
+    - 有区域 → 与区域真正相交的瓦片数（``selected``）。
 
     用候选数当分母的后果不是"数字大一点"：进度条会永远停在 60% 然后突然跳满，
     续传时"还差 1.4 万张"也会一直说不准（Spec §11/§12）。
     """
-    if region is None or not region.is_polygon:
+    if region is None:
         return estimate_tile_count(bounds, min_zoom, max_zoom)
     return RegionTileEstimator(region).estimate(min_zoom, max_zoom).selected_tiles
 
@@ -1590,9 +1603,9 @@ def count_existing_region_tiles(
 
     这里逐张过一遍几何判定，与下载时的判据**同源**（同一个
     :class:`~app.geo.PolygonTileRegionFilter`），不存在"下载算一套、统计算另一套"。
-    矩形区域直接转发给 :func:`count_existing_tiles`，不做任何额外 IO。
+    没有区域时直接转发给 :func:`count_existing_tiles`，不做任何额外 IO。
     """
-    if region is None or not region.is_polygon:
+    if region is None:
         return count_existing_tiles(path, zooms)
 
     region_filter = build_region_filter(region)

@@ -94,7 +94,7 @@ def build_coverage(name, rules):
     entries = []
     for rule in rules:
         region = rule.region
-        geometry = (load_geojson_geometry(region.geojson_path) if region.is_polygon
+        geometry = (load_geojson_geometry(region.geojson_path) if region.geojson_path
                     else box(*region.bounds.as_tuple()))
         entries.append({'id': region.region_id or region.name, 'name': region.name,
                         'level': region.region_level.value, 'boundaryVersion': region.boundary_version or '',

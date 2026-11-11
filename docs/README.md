@@ -28,6 +28,7 @@
 | 为什么现在"一次下载只能交付一次" | [tile_repository_architecture](tile_repository_architecture.md) | 现状证据、缺哪一层、仓库与打包引擎长什么样 |
 | 查仓库的字段、身份与接口 | [tile_repository_contracts](tile_repository_contracts.md) | 资产身份、分片表结构、八组接口、打包与预算契约 |
 | 排后续开发顺序 | [tile_repository_roadmap](tile_repository_roadmap.md) | Slice 42~49 的目标、依赖、验收与回退 |
+| 仓库现在能干什么、坏了怎么修 | [tile_repository_usage](tile_repository_usage.md) | 用法、版本号、恢复与重建步骤、容量口径、与 43/44/45 的接口 |
 | 把授权 GeoJSON 导进目录 | [region_data_pipeline](region_data_pipeline.md) | 导入管线与合规要求 |
 | 验一遍整条链路 | [e2e_acceptance_checklist](e2e_acceptance_checklist.md) | Windows → ADB → Android 逐步验收 |
 | 检查或修复损坏瓦片 | [tile_repair](tile_repair.md) | 定向重下、全量复检与故障验收 |
@@ -66,6 +67,7 @@
 | 风险与确认框 | [download_risk_analysis](download_risk_analysis.md) |
 | 包格式 / 跨端字段 | [map_package_v1](map_package_v1.md) + [hierarchical_offline_map](hierarchical_offline_map.md) §4 |
 | 瓦片仓库 / 导出引擎 | [tile_repository_architecture](tile_repository_architecture.md) + [tile_repository_contracts](tile_repository_contracts.md) |
+| 仓库层代码（`app/tilerepo/`） | [tile_repository_usage](tile_repository_usage.md) 先看"能干什么/边界"，再回契约对字段 |
 
 **改契约字段的话**：先读 [hierarchical_offline_map](hierarchical_offline_map.md) §4
 与 [map_package_v1](map_package_v1.md) §6，再跑
@@ -113,13 +115,18 @@
 - [region_selection_ui](region_selection_ui.md) —— 级联选择与偏好持久化
 - [troubleshooting](troubleshooting.md) —— 按症状查
 
-### 7. 仓库化改造（设计阶段，未实现）
+### 7. 仓库化改造（基础已落地，其余仍在设计阶段）
 
 这三份是一组，按顺序读：先看**现状与架构**，再看**契约**，最后看**怎么排期**。
+读完想知道"现在到底能跑什么"，跳到第四份（写的是实际行为，不是计划）。
 
 - [tile_repository_architecture](tile_repository_architecture.md) —— 现状证据表、差距分析、分片规则论证、设计决策
 - [tile_repository_contracts](tile_repository_contracts.md) —— 资产身份、导入规则、八组服务接口、打包与预算契约
 - [tile_repository_roadmap](tile_repository_roadmap.md) —— Slice 42~49 的拆解与验收矩阵
+- [tile_repository_usage](tile_repository_usage.md) —— **落地补充**：实际 schema / 去重范围 / 快照与并发限制 / 恢复重建 / 容量口径 / 与 43~45 的接口 / 未实现能力
+
+> 设计文档写"打算怎么做"，`tile_repository_usage` 写"实际怎么做"。
+> 两者冲突时以 usage 与代码为准 —— 那份文档 §12 专门列了 10 条差异，不藏在正文里。
 
 ---
 

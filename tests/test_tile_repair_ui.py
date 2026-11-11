@@ -7,15 +7,20 @@ from types import SimpleNamespace
 from app.geo import GeoBounds
 from app.mbtiles.diagnostics import MBTilesDiagnosticsResult
 from app.models import DownloadTaskStatus, MapLayerType
+from tests.region_helpers import rect_region, register_for_resume
 from tests.test_download_coordination import window  # noqa: F401
 
 
 def _task(window, work_dir):
     path = work_dir / "repair.mbtiles"
     path.write_bytes(b"placeholder")
+    bounds = GeoBounds(116, 39, 116.1, 39.1)
+    # 记录里必须带区域：修复走的是续传链路，按 region_id 找回边界文件
+    region = register_for_resume(rect_region("测试区域", bounds, work_dir / "region_geojson"))
     task = window.task_service.create_task(
-        name="repair", bounds=GeoBounds(116, 39, 116.1, 39.1), min_zoom=12, max_zoom=12,
+        name="repair", bounds=bounds, min_zoom=12, max_zoom=12,
         map_layer=MapLayerType.VECTOR, output_path=path, total_tiles=6,
+        region=region,
     )
     window.task_service.set_status(task, DownloadTaskStatus.COMPLETED)
     window.download_panel._token_edit.setText("fake-repair-token")

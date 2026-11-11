@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import base64
+import itertools
 import json
+import shutil
 import sqlite3
+import tempfile
 import zlib
 from contextlib import closing
 from dataclasses import replace
@@ -36,10 +40,24 @@ from app.models import MapType
 from app.planning.storage_budget import BudgetInput, BudgetSettings, assess_budget
 from app.services.map_download_service import MapResumeError
 from app.tasks import TaskService, TaskStore
+from tests.region_helpers import rect_region
+
+#: 多级覆盖用例的"按外包矩形造区域"需要一个能落盘的目录（行政区域必须有边界文件）
+_REGION_DIR = Path(tempfile.mkdtemp(prefix="zoom-coverage-regions-"))
+_REGION_SEQ = itertools.count()
+atexit.register(shutil.rmtree, _REGION_DIR, True)
 
 
-def rectangle(name='a', bounds=(116.2, 39.7, 116.3, 39.8)):
-    return DownloadRegion.rectangle(name, GeoBounds(*bounds))
+def bounds_region(name='a', bounds=(116.2, 39.7, 116.3, 39.8)):
+    """按外包矩形造一块行政区域：几何就是这块矩形，因此不裁掉任何瓦片。
+
+    覆盖度快照关心的是"某一级下哪些瓦片属于这块范围"，与几何来自哪个文件
+    无关；旧的 ``DownloadRegion.rectangle`` 已随界面入口一起删除，这里改用
+    "现场写一份矩形 GeoJSON"的等价做法。
+    """
+    return rect_region(
+        name, GeoBounds(*bounds), _REGION_DIR, region_id=f"cov{next(_REGION_SEQ)}"
+    )
 
 
 def tiles(region, low, high):
@@ -48,7 +66,7 @@ def tiles(region, low, high):
 
 
 def test_overlapping_rules_are_union_not_sum():
-    a, b = rectangle(), rectangle('b', (116.25, 39.75, 116.35, 39.85))
+    a, b = bounds_region(), bounds_region('b', (116.25, 39.75, 116.35, 39.85))
     one = build_coverage('one', (CoverageRule(a, 11, 12),))
     two = build_coverage('two', (CoverageRule(b, 12, 12),))
     combined = build_coverage('combined', (CoverageRule(a, 11, 12), CoverageRule(b, 12, 12)))
@@ -59,14 +77,14 @@ def test_overlapping_rules_are_union_not_sum():
 
 
 def test_identical_rules_do_not_duplicate_tiles():
-    r = CoverageRule(rectangle(), 12, 12)
+    r = CoverageRule(bounds_region(), 12, 12)
     single, duplicate = build_coverage('same', (r,)), build_coverage('same', (r, r))
     assert RegionTileEstimator(single).estimate(12, 12).selected_tiles == RegionTileEstimator(duplicate).estimate(12, 12).selected_tiles
 
 
 def test_high_zoom_never_scans_overview_bbox():
-    overview = rectangle('overview', (73, 3, 135, 54))
-    local = rectangle('local', (116.2, 39.7, 116.2001, 39.7001))
+    overview = bounds_region('overview', (73, 3, 135, 54))
+    local = bounds_region('local', (116.2, 39.7, 116.2001, 39.7001))
     region = build_coverage('sparse', (CoverageRule(overview, 5, 5), CoverageRule(local, 18, 18)))
     f = build_region_filter(region)
     assert f.candidate_count(18) <= 4
@@ -77,7 +95,7 @@ def test_high_zoom_never_scans_overview_bbox():
 
 
 def test_separated_missions_only_enumerate_their_candidate_union():
-    regions = [rectangle('west', (75, 40, 75.0001, 40.0001)), rectangle('east', (130, 40, 130.0001, 40.0001))]
+    regions = [bounds_region('west', (75, 40, 75.0001, 40.0001)), bounds_region('east', (130, 40, 130.0001, 40.0001))]
     combined = build_coverage('far', [CoverageRule(r, 18, 18) for r in regions])
     f = build_region_filter(combined)
     assert f.candidate_count(18) <= 8
@@ -130,7 +148,7 @@ def test_wrong_fingerprint_fails_closed():
 
 def test_invalid_rule_range_empty_and_nested_are_rejected():
     with pytest.raises(ValueError):
-        CoverageRule(rectangle(),12,11)
+        CoverageRule(bounds_region(),12,11)
     with pytest.raises(ValueError):
         build_coverage('empty', [])
     with pytest.raises(ValueError):
@@ -154,7 +172,7 @@ def test_tasks_store_only_snapshot_reference(work_dir):
     assert restored.coverage_path == region.coverage_path
 
 
-def test_missing_or_damaged_sidecar_with_no_map_cannot_become_rectangle(work_dir):
+def test_missing_or_damaged_sidecar_without_a_map_fails_closed(work_dir):
     region=save_coverage_snapshot(make_strategy(), work_dir/'map.mbtiles')
     from app.models import DownloadTask
     task=DownloadTask(name='coverage',region_type='coverage',boundary_version=region.boundary_version,
@@ -187,7 +205,7 @@ async def test_complete_offline_acceptance(work_dir):
 async def test_resume_refuses_different_strategy_before_any_http(work_dir):
     tasks,task,server,service,_=await seed(work_dir)
     server.requests.clear()
-    other=build_coverage('other',[CoverageRule(rectangle(),12,12)])
+    other=build_coverage('other',[CoverageRule(bounds_region(),12,12)])
     with closing(sqlite3.connect(task.output_path)) as db, db:
         db.execute("UPDATE metadata SET value=? WHERE name='coverage_data'",(other.coverage_data,))
     with pytest.raises(MapResumeError,match='指纹'):

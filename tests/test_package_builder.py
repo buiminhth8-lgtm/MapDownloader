@@ -1041,8 +1041,16 @@ def test_polygon_region_is_copied_into_the_manifest(
     assert list(manifest).index("region") == list(manifest).index("bounds") + 1
 
 
-def test_rectangle_region_is_written_as_a_type_only_object(work_dir: Path) -> None:
-    """矩形包写 ``{"type": "rectangle"}``：显式，但不多出两个空值键。"""
+def test_legacy_rectangle_region_is_written_as_a_type_only_object(
+    work_dir: Path,
+) -> None:
+    """老的自定义矩形包照常打包：``region`` 写 ``{"type": "rectangle"}``。
+
+    矩形能力已删除（下载链路不会再写出这个值），但磁盘上还留着那个时代的包。
+    它们的覆盖完整性可以照常按外包矩形核对 —— 矩形时代下载的就是整块矩形，
+    这不是"退化成矩形"那种误报。协议侧则原样透传：显式写 ``type``，
+    但不多出两个空值键。
+    """
     source = _make_mbtiles(
         work_dir / "rect.mbtiles",
         metadata=MBTilesMetadata.for_bounds(

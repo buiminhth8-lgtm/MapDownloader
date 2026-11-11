@@ -1059,17 +1059,36 @@ def _resolve_coverage_region(
     Returns:
         ``(region, region_filter, note)``：
 
-        - 矩形包 / 老包（没有 ``region_type``）→ ``(None, None, "")``，
-          调用方走原来的矩形路径，行为与 Slice ≤15 逐位一致；
-        - 多边形且边界可用 → 过滤器；
-        - 多边形但边界不可用 / 认不出 ``region_id`` → ``note`` 非空，
-          调用方应把覆盖度标成**未知**。
+        - 有行政区域且边界可用 → 区域 + 几何过滤器；
+        - 边界不可用 / 认不出 ``region_id`` / 老的自定义矩形包 → ``note`` 非空，
+          调用方应把覆盖度标成**未知**。老的矩形包没有几何可校验，只能报
+          "该能力已移除"，绝不能退回去按外包矩形算一个假缺口。
 
     "边界不可用就标未知"是 Spec §20 的硬性要求，理由很实际：按 bounding box
     去算一个多边形包的 expected，会得出"缺了区域外那 60% 瓦片"的结论，
     而那个包很可能是**完整**的。误报比不知道更糟 —— 用户会去重下几万张。
     """
     region_type = str(result.metadata.get("region_type") or "").strip().lower()
+    raw_region_id = str(result.metadata.get("region_id") or "").strip()
+    if region_type == "rectangle" or (not region_type and not raw_region_id):
+        # 两种"按外包矩形核对"的情形：
+        #
+        # 1. **老的自定义矩形包**（``region_type=rectangle``）：它声明的范围就是
+        #    "铺满整个外包矩形"，按 ``bounds`` 核对是**等价**判定，不是误报 ——
+        #    矩形时代下载的确实就是那整块矩形。
+        # 2. **没有区域声明**的包（别的工具生成的、或 Slice ≤15 的产物）：只能按
+        #    它自己的 ``bounds`` 核对；本工具的下载链路现在**一定**会写区域信息，
+        #    所以走到这里的几乎都是外来文件。
+        #
+        # 两者都**不等于**"还能续传"：矩形能力已删除，续传那条路仍然明确拒绝
+        # （拿不到几何就数不出"区域内已有多少张"）。"校验一个已存在的文件"与
+        # "继续下载它"是两件事，前者的答案不该被后者的能力缺失拖累。
+        result.notices.append(
+            "覆盖完整性按外包矩形核对"
+            + ("（老的自定义矩形包）" if region_type == "rectangle" else "")
+        )
+        return None, None, ""
+
     if RegionType.parse(region_type) is RegionType.COVERAGE:
         from app.geo.zoom_coverage import coverage_from_metadata
         try:
@@ -1078,8 +1097,6 @@ def _resolve_coverage_region(
         except ValueError as exc:
             result.errors.append(f"多级覆盖策略损坏：{exc}")
             return None, None, str(exc)
-    if RegionType.parse(region_type) is RegionType.RECTANGLE:
-        return None, None, ""
 
     region, note = region_from_metadata(
         region_type,

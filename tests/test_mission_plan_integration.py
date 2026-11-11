@@ -75,6 +75,7 @@ from app.services import MBTilesInspectionService
 from app.tasks.task_service import TaskService
 from app.tasks.task_store import TaskStore
 from tests.plan_fakes import FakeRunner
+from tests.region_helpers import polygon_region
 
 #: 一条作业航线（杭州西湖北侧），带三个点就够画折线。
 ROUTE = [(120.00, 30.00), (120.05, 30.02), (120.10, 30.01)]
@@ -462,14 +463,14 @@ def test_an_admin_polygon_carries_its_level_but_not_the_mission_keys(
     assert "geometryVersion" not in payload
 
 
-def test_a_plain_rectangle_declares_itself_custom() -> None:
-    """纯矩形（没有区域目录条目）写 ``custom``，而不是留空。
+def test_a_region_without_a_level_declares_itself_custom() -> None:
+    """没有等级的区域（不是任务区、也没写 ``region_level``）写 ``custom``，而不是留空。
 
     留空在 Android 侧与"老包没有这条信息"收敛到同一个 ``UNKNOWN``，
-    而这两件事不一样：一个明确是"用户画的一块矩形"，一个是"不知道"。
+    而这两件事不一样：一个明确是"一块非任务区的下载范围"，一个是"不知道"。
     """
-    region = region_module.DownloadRegion.rectangle(
-        "自定义矩形", GeoBounds(west=0.0, south=0.0, east=1.0, north=1.0)
+    region = polygon_region(
+        "临时区域", GeoBounds(west=0.0, south=0.0, east=1.0, north=1.0)
     )
     assert region.is_mission is False
     assert region.metadata_rows()["region_level"] == "custom"

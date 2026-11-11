@@ -58,6 +58,9 @@
 
 ## Slice 42：统一瓦片仓库基础
 
+**状态：已交付。** 本节保留原计划不动，实做与计划的差异集中在末尾「交付结果」。
+想知道"现在到底能跑什么、坏了怎么修"，看 [tile_repository_usage](tile_repository_usage.md)。
+
 **目标**：仓库能存、能读、能自检；不接下载、不接导出。
 
 **范围**
@@ -102,6 +105,23 @@
 9. `pytest` 全量无回归；`e2e_smoke` 6/6；`hierarchical_map_e2e` 10/10
 
 **回退方式**：`tile_repo.enabled = false`（默认就是 false）；删仓库目录即可，不影响任何现有文件。
+
+**交付结果（实做 vs 上面的计划）**
+
+| 项 | 计划 | 实际 | 原因 |
+| --- | --- | --- | --- |
+| 模块 | identity / shard / store / catalog / health | 同上，另加 `snapshot.py`、`stats.py`、`errors.py`、`cli.py`、`_testhooks.py` | 版本快照与容量口径是验收场景 2/5 的必要条件，不是额外功能 |
+| `verify_asset` | 独立断言接口 | `health_check(scope)`（`quick` / `full`）+ `read_tile(verify=True)` | 只读诊断要一次报全，不能遇错即抛 |
+| catalog 级租约 | 有（契约 §2.4） | **未做**，只用 SQLite 写者锁 + `busy_timeout` | 两把锁会造出"谁先谁后"的新故障模式；写者锁本身已跨进程互斥 |
+| 发布可见性 | 靠"catalog 登记了什么" | 新增 `shards.published_epoch` 发布水位，未发布行是显式 `UNPUBLISHED` | 推断出来的状态无法测试，也无法在报告里说清 |
+| 历史代数 | current + `superseded` | 一致，但明确**只保留一代** | 主键 `(z,x,y,state)` 决定；`prune` 会把更早的孤儿内容报出来 |
+| 死锁接管 | 90 秒无心跳 | 另加"持有者进程已死立即接管" | 崩溃后不该白等 90 秒 |
+| 性能验证 | 10 万条合成数据计时 | 12,000 张 bulk 写入 + 300 轮并发写压测 | 真实分片规模要等 Slice 44 的真实数据才有意义（架构 §12 A1/A4 仍是假设） |
+
+验收场景 1~8 全部落地为 `tests/test_tilerepo_*.py`（8 个文件、156 条用例，含真子进程崩溃与重建）
+与 `scripts/verify_tile_repository.py`（101 项）；场景 9 的全量 `pytest` 为 **2946 passed**（基线 2790）。
+契约测试 C1~C5 / C13~C15 已落地并被用例钉住，C6~C12、C16~C17 依赖 43/45/48，逐条对照见
+[contracts §10](tile_repository_contracts.md)。
 
 ---
 

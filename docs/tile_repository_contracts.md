@@ -5,6 +5,8 @@
 架构与取舍见 [tile_repository_architecture](tile_repository_architecture.md)；这里只写契约。
 
 **本文不包含可执行实现。** 伪代码只用来固定输入输出与失败语义，不代表已有代码。
+仓库基础层已按其实现（`app/tilerepo/`）；**哪些接口现在真的能调、字段实际长什么样**，
+以 [tile_repository_usage](tile_repository_usage.md) 与代码为准，两者的差异列在 usage §12。
 
 ---
 
@@ -704,22 +706,30 @@ patch.mbtiles
 
 ## 10. 契约测试清单（Slice 42 起逐条落地）
 
-| # | 断言 | 类型 |
-| --- | --- | --- |
-| C1 | 同坐标同摘要写入两次 → 第二次 `Unchanged`，`coords` 仍一行 | 幂等 |
-| C2 | 同坐标不同摘要、未授权 → `Conflict`，旧内容不变 | 冲突 |
-| C3 | 授权替换后旧行 `superseded`、`contents` 两行都在 | 版本 |
-| C4 | 快照冻结两次（同 selector、同数据）→ 同 fingerprint | 可复现 |
-| C5 | 快照引用的内容被删 → `read_snapshot` 抛 `SnapshotExpired` | 快照 |
-| C6 | 导入后源文件 mtime 与大小不变 | 只读 |
-| C7 | 导入中断再跑 → 无重复行，`already_present` 递增 | 幂等 |
-| C8 | `HAS WAL` 的源库 → 需确认才继续 | 安全 |
-| C9 | 导出后抽样回读 `y` 与写入 `y` 互为翻转 | 一次翻转 |
-| C10 | `reject_if_missing` + 缺口非空 → 不产生 staging 目录 | 策略 |
-| C11 | `local_only` + 缺口 → 照常发布，报告含缺口 | 策略 |
-| C12 | 发布失败 → final 不动、`.building` 已清 | 原子性 |
-| C13 | 两个进程写同一分片 → 第二个 `Busy`（不写坏） | 并发 |
-| C14 | 删一个分片文件的 `contents` 行 → `health_check` 报 `Corrupt` | 恢复 |
-| C15 | `prune(dry_run=True)` 不删任何东西 | 安全 |
-| C16 | manifest 加 `contentId` 后，Android 侧契约测试仍通过 | 跨端 |
-| C17 | delta 生成的包经 Android 契约测试（双端元组一致） | 跨端 |
+**现在的状态**：C1~C5、C13~C15 已落地并被测试钉住（"落地"列给出文件，用例名可用
+`grep -n "def 用例名" tests/` 复核）；C6~C12 依赖旧包导入与导出（43 / 45），
+C16~C17 依赖增量交付（48），届时补列。**没落地的不打勾、不假装通过**。
+
+| # | 断言 | 类型 | 落地 |
+| --- | --- | --- | --- |
+| C1 | 同坐标同摘要写入两次 → 第二次 `Unchanged`，`coords` 仍一行 | 幂等 | `test_tilerepo_store.py::test_same_content_twice_is_unchanged` |
+| C2 | 同坐标不同摘要、未授权 → `Conflict`，旧内容不变 | 冲突 | `test_tilerepo_store.py::test_conflict_is_rejected_by_default` |
+| C3 | 授权替换后旧行 `superseded`、`contents` 两行都在 | 版本 | `test_tilerepo_store.py::test_authorized_replace_keeps_one_generation` |
+| C4 | 快照冻结两次（同 selector、同数据）→ 同 fingerprint | 可复现 | `test_tilerepo_snapshot.py::test_same_data_yields_same_fingerprint` |
+| C5 | 快照引用的内容被删 → `read_snapshot` 抛 `SnapshotExpired` | 快照 | `test_tilerepo_snapshot.py::test_snapshot_expires_when_content_is_gone` |
+| C6 | 导入后源文件 mtime 与大小不变 | 只读 | Slice 43 |
+| C7 | 导入中断再跑 → 无重复行，`already_present` 递增 | 幂等 | Slice 43 |
+| C8 | `HAS WAL` 的源库 → 需确认才继续 | 安全 | Slice 43 |
+| C9 | 导出后抽样回读 `y` 与写入 `y` 互为翻转 | 一次翻转 | Slice 45 |
+| C10 | `reject_if_missing` + 缺口非空 → 不产生 staging 目录 | 策略 | Slice 45 |
+| C11 | `local_only` + 缺口 → 照常发布，报告含缺口 | 策略 | Slice 45 |
+| C12 | 发布失败 → final 不动、`.building` 已清 | 原子性 | Slice 45（快照侧已有 `test_cancel_leaves_no_partial_snapshot`） |
+| C13 | 两个进程写同一分片 → 第二个 `Busy`（不写坏） | 并发 | `test_tilerepo_crash.py::test_live_holder_blocks_with_busy` |
+| C14 | 删一个分片文件的 `contents` 行 → `health_check` 报 `Corrupt` | 恢复 | `test_tilerepo_health.py::test_dangling_reference_is_an_error` / `test_digest_mismatch_is_detected_by_full_check` |
+| C15 | `prune(dry_run=True)` 不删任何东西 | 安全 | `test_tilerepo_health.py::test_prune_reports_orphans_without_touching_bytes` |
+| C16 | manifest 加 `contentId` 后，Android 侧契约测试仍通过 | 跨端 | Slice 48 |
+| C17 | delta 生成的包经 Android 契约测试（双端元组一致） | 跨端 | Slice 48 |
+
+**C1~C5 之外的实现侧证据**（同样由用例钉住，不在本表编号里）：分片路径穿越、
+schema 版本不认识就拒服务、查询计划走主键、Token 不进身份、报告不含图片字节与绝对路径、
+12,000 张批量写入的流式顺序 —— 见 `tests/test_tilerepo_shard.py`、`test_tilerepo_layers.py`。

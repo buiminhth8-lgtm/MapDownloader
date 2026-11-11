@@ -21,7 +21,7 @@ import httpx
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEvent, Qt, QThread
-from PySide6.QtWidgets import QFileDialog, QLabel, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox
 
 import app.ui.download_worker as download_worker_module
 import app.ui.main_window as main_window_module
@@ -53,6 +53,7 @@ from app.planning.risk_policy import (
 from app.planning.risk_policy import (
     LARGE_TILE_THRESHOLD as RISK_LARGE_TILE_THRESHOLD,
 )
+from app.planning.zoom_policy import DEFAULT_ZOOM_POLICIES
 from app.providers import PNG_SIGNATURE, TiandituProvider
 from app.services import AndroidTransferService, build_output_path
 from app.tasks import TaskService, TaskStore
@@ -107,13 +108,27 @@ FAST_POLICY = RetryPolicy(max_attempts=3, base_delay_seconds=0.0, max_delay_seco
 
 
 @pytest.fixture()
-def window(qapp, tasks_file: Path, preferences) -> MainWindow:
+def window(qapp, tasks_file: Path, preferences, request, region_resources) -> MainWindow:
     """每个用例一个全新的主窗口。
 
     任务记录与界面偏好都注入临时路径：默认的
     ``~/MapDownloader/data/tasks.json`` / ``QSettings(ORG_NAME, APP_NAME)``
     会污染真实用户目录，而且用例之间会互相看到对方留下的任务与窗口形状。
+
+    ``region_resources`` 同样必须在**建窗口之前**生效：下载范围只剩行政区域之后，
+    "一块小到能瞬间跑完的地"只能由合成区域目录里的 ``rivertown``（1°×1°）提供，
+    而这台机器上可能装着真实行政区数据 —— 不隔离的话，用例会去读另一份目录。
+
+    例外是显式要"**还没部署边界数据**"的那几条（它们请求 ``undeployed_region_root``）：
+    空目录重定向要压过上面的合成目录，这里把它再打一次补丁。
     """
+    if "undeployed_region_root" in request.fixturenames:
+        from app.config import settings as settings_module
+        from app.geo import region as region_module
+
+        empty = request.getfixturevalue("undeployed_region_root")
+        region_module.REGION_RESOURCE_DIR = empty
+        settings_module.REGION_DATA_ROOT = empty
     from app.planning.storage_budget import BudgetSettings
     preferences.set_storage_budget(BudgetSettings(enabled=False))
     win = MainWindow(task_service=TaskService(TaskStore(tasks_file)), preferences=preferences)
@@ -384,22 +399,27 @@ def test_get_form_data_defaults(window: MainWindow) -> None:
     # Slice 6 起下拉框放的是"地图类型"（矢量 / 影像），底图图层由它派生
     assert data["map_type"] is MapType.VECTOR
     assert data["with_labels"] is True
-    assert data["min_zoom"] == settings.DEFAULT_MIN_ZOOM
-    assert data["max_zoom"] == settings.DEFAULT_MAX_ZOOM
+    # 下载范围只剩行政区域之后，默认区域是国家级，面板按该等级的推荐策略落值
+    # （Z5~Z10），不再是 ``settings.DEFAULT_MIN_ZOOM``：推荐模式下 Min/Max 由
+    # 策略决定（Spec §11），想改要先切到自定义。
+    country_policy = DEFAULT_ZOOM_POLICIES[RegionLevel.COUNTRY]
+    assert data["min_zoom"] == country_policy.recommended_min_zoom
+    assert data["max_zoom"] == country_policy.recommended_max_zoom
     assert isinstance(data["output_dir"], Path)
     assert data["map_name"] == settings.DEFAULT_MAP_NAME
-    assert data["west"] < data["east"]
-    assert data["south"] < data["north"]
-    # 默认是矩形：行为与 Slice ≤15 完全一致
-    assert data["region_type"] is RegionType.RECTANGLE
+    # 默认是行政区域：目录里的第一个国家。测试环境用的是合成目录
+    # （``region_resources``），它只有「示例国」（``demoland``）。
+    assert data["region_type"] is RegionType.POLYGON
+    assert data["region_id"] == "demoland"
+    assert data["region_level"] is RegionLevel.COUNTRY
+    # 范围来自边界文件：示例国是 110~114E / 30~34N
     assert data["region"] is not None
-    assert data["region"].region_type is RegionType.RECTANGLE
-    assert data["region"].bounds == GeoBounds(
-        west=data["west"], south=data["south"], east=data["east"], north=data["north"]
+    assert (data["west"], data["south"], data["east"], data["north"]) == (
+        110.0,
+        30.0,
+        114.0,
+        34.0,
     )
-    # Slice 19：矩形模式下没有行政区域，等级是 CUSTOM（不套用等级策略）
-    assert data["region_id"] is None
-    assert data["region_level"] is RegionLevel.CUSTOM
     assert data["zoom_mode"] is ZoomMode.RECOMMENDED
 
 
@@ -470,7 +490,7 @@ def test_clicking_action_buttons_does_not_crash(
 
 
 def test_calculate_logs_form_snapshot(window: MainWindow) -> None:
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
     text = window.log_panel.to_text()
     assert "当前配置：" in text
     assert "token=未填写" in text
@@ -615,10 +635,14 @@ def test_startup_messages_are_reported(window: MainWindow) -> None:
 # "计算" 按钮接入 Tile Math（Slice 1）
 # --------------------------------------------------------------------------- #
 def test_calculate_button_renders_estimate(window: MainWindow) -> None:
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
 
     text = window.download_panel.result_label.text()
-    assert "预计瓦片：" in text
+    # 下载范围只剩行政区域之后，预估区由 ``RegionTileEstimate`` 的文案产出
+    # （区域名 + 候选 / 区域内 / 过滤 + 容量），不再有"预计瓦片：N"那一行。
+    assert "区域：" in text
+    assert "候选瓦片：" in text
+    assert "区域内瓦片：" in text
     assert "预计容量：" in text
     assert "计算失败" not in text
 
@@ -626,40 +650,50 @@ def test_calculate_button_renders_estimate(window: MainWindow) -> None:
 def test_calculate_result_matches_geo_module(window: MainWindow) -> None:
     """UI 展示的数字必须来自 app.geo，而不是在界面层重算。"""
     panel = window.download_panel
-    panel._min_zoom_spin.setValue(8)
-    panel._max_zoom_spin.setValue(17)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    assert panel.set_region_id("rivertown") is True
+    panel._min_zoom_spin.setValue(10)
+    panel._max_zoom_spin.setValue(12)
+    _click_calculate(window, panel)
 
     data = panel.get_form_data()
     bounds = GeoBounds(data["west"], data["south"], data["east"], data["north"])
-    expected_count = estimate_tile_count(bounds, 8, 17)
+    expected_count = estimate_tile_count(bounds, 10, 12)
     expected_size = format_size(estimate_size_bytes(expected_count))
 
     # 默认勾选了中文注记 → 每张瓦片请求底图 + 注记两次，请求数必须是瓦片数的两倍。
     map_type = data["map_type"]
     assert map_type.request_count_per_tile(data["with_labels"]) == 2
-    # Spec §3 的行序：瓦片数 → 请求量 → 容量 → Zoom → 地图类型 → 输出文件
-    assert panel.result_label.text() == "\n".join(
-        [
-            f"预计瓦片：{expected_count:,}",
-            settings.UI_TEXT_ESTIMATED_REQUESTS_MERGED.format(
-                requests=expected_count * 2, tiles=expected_count
-            ),
-            f"预计容量：{expected_size}",
-            settings.UI_TEXT_ESTIMATED_ZOOM.format(min_zoom=8, max_zoom=17),
-            settings.UI_TEXT_ESTIMATED_MAP_TYPE.format(
-                map_type=describe_map_type(map_type, True)
-            ),
-            "输出文件："
-            + str(
-                build_output_path(
-                    data["output_dir"],
-                    data["map_name"],
-                    map_type=data["map_type"],
-                    with_labels=bool(data["with_labels"]),
-                )
-            ),
-        ]
+    # 「示例河市」的几何就是它的外包矩形，因此候选 == 区域内、过滤为 0；
+    # 这两个数字仍然必须与 ``app.geo`` 的算法一致（界面层不得自己重算）。
+    lines = panel.result_label.text().split("\n")
+    assert "区域：示例河市" in lines
+    assert f"候选瓦片：{expected_count:,}" in lines
+    assert f"区域内瓦片：{expected_count:,}" in lines
+    assert "过滤瓦片：0" in lines
+    assert (
+        settings.UI_TEXT_ESTIMATED_REQUESTS_MERGED.format(
+            requests=expected_count * 2, tiles=expected_count
+        )
+        in lines
+    )
+    assert f"预计容量：{expected_size}" in lines
+    assert (
+        settings.UI_TEXT_ESTIMATED_ZOOM.format(min_zoom=10, max_zoom=12) in lines
+    )
+    assert (
+        settings.UI_TEXT_ESTIMATED_MAP_TYPE.format(
+            map_type=describe_map_type(map_type, True)
+        )
+        in lines
+    )
+    # 最后一行永远是输出文件（逐级明细在它之前）
+    assert lines[-1] == "输出文件：" + str(
+        build_output_path(
+            data["output_dir"],
+            data["map_name"],
+            map_type=data["map_type"],
+            with_labels=bool(data["with_labels"]),
+        )
     )
     assert window._status_values["tile_total"].text() == f"{expected_count:,}"
     assert "瓦片计算完成" in window.log_panel.to_text()
@@ -669,7 +703,7 @@ def test_calculate_logs_per_zoom_breakdown(window: MainWindow) -> None:
     panel = window.download_panel
     panel._min_zoom_spin.setValue(9)
     panel._max_zoom_spin.setValue(11)
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     text = window.log_panel.to_text()
     assert "各级瓦片数：" in text
@@ -677,17 +711,23 @@ def test_calculate_logs_per_zoom_breakdown(window: MainWindow) -> None:
         assert f"z{zoom}=" in text
 
 
-def test_calculate_without_running_the_ui_does_not_crash(window: MainWindow, monkeypatch) -> None:
-    """默认值非法时不弹模态框、不崩溃，错误信息落到结果区与日志。"""
+def test_calculate_without_a_boundary_file_does_not_crash(
+    window: MainWindow, monkeypatch, region_resources
+) -> None:
+    """边界文件不在时不弹模态框、不崩溃，错误信息落到结果区与日志。
+
+    自定义矩形删除之后，界面上已经没有"手填一个非法范围"这条路了：唯一能让
+    计算失败的用户侧原因就是**边界文件不在**（缺文件、损坏、路径不对）。
+    """
     monkeypatch.setattr(window, "_show_error_dialog", lambda *a, **k: None)
     panel = window.download_panel
-    # 把东边界挪到西边界左侧，构造非法范围
-    panel._east_spin.setValue(100.0)
+    (region_resources / "city" / "rivertown.geojson").unlink()
+    assert panel.set_region_id("rivertown") is True
 
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     assert "计算失败" in panel.result_label.text()
-    assert "west 必须小于 east" in panel.result_label.text()
+    assert "rivertown.geojson" in panel.result_label.text()
     assert "瓦片计算失败" in window.log_panel.to_text()
 
 
@@ -700,7 +740,7 @@ def test_calculate_invalid_zoom_range_reports_error(window: MainWindow, monkeypa
     panel = window.download_panel
     panel._min_zoom_spin.setValue(17)
     panel._max_zoom_spin.setValue(8)
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     assert "min_zoom 不能大于 max_zoom" in panel.result_label.text()
     assert calls and calls[0][0] == "瓦片计算失败"
@@ -712,15 +752,15 @@ def test_calculate_success_does_not_open_error_dialog(window: MainWindow, monkey
         window, "_show_error_dialog", lambda title, message: calls.append((title, message))
     )
 
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
 
     assert calls == []
-    assert "预计瓦片：" in window.download_panel.result_label.text()
+    assert "区域内瓦片：" in window.download_panel.result_label.text()
 
 
 def test_slice0_panels_survive_calculate(window: MainWindow) -> None:
     """Slice 1 不能破坏 Slice 0 的其他区域。"""
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
 
     assert window.status_group.title() == "下载状态"
     assert window.device_panel.device_combo.count() == 1
@@ -753,7 +793,9 @@ def test_connection_test_success_updates_ui(
     text = window.download_panel.connection_label.text()
     assert text.startswith("连接成功")
     assert "图层：vec_w" in text
-    assert f"Zoom：{settings.DEFAULT_MIN_ZOOM}" in text
+    # 连接测试打的是"当前区域中心瓦片所属的层级"，而默认区域是国家级的示例国，
+    # 面板按推荐策略落在 Z5（见 ``DEFAULT_ZOOM_POLICIES``）。
+    assert f"Zoom：{DEFAULT_ZOOM_POLICIES[RegionLevel.COUNTRY].recommended_min_zoom}" in text
     assert "HTTP：200" in text
     assert f"Size：{len(FAKE_PNG)} bytes" in text
     assert "耗时：" in text
@@ -779,10 +821,8 @@ def test_connection_test_uses_center_tile_of_current_bounds(
     _stub_transport(monkeypatch, handler)
     panel = window.download_panel
     _fill_token(window)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(117.0)
-    panel._north_spin.setValue(40.0)
+    # 1°×1° 的合成区域：范围仍然由边界文件决定（表单里读到的就是它）
+    assert panel.set_region_id("rivertown") is True
     panel._min_zoom_spin.setValue(10)
 
     panel.action_buttons[ACTION_TEST_CONNECTION].click()
@@ -872,17 +912,22 @@ def test_connection_test_without_token_never_starts_worker(
     assert "无法发起" in window.log_panel.to_text()
 
 
-def test_connection_test_with_invalid_bounds(
-    window: MainWindow, monkeypatch, qapp, error_dialogs
+def test_connection_test_without_a_region_sends_nothing(
+    window: MainWindow, monkeypatch, qapp, error_dialogs, region_resources
 ) -> None:
+    """没有可用的行政区域 → 连"测哪一张瓦片"都说不出来，不该发请求。"""
     _stub_transport(monkeypatch, _png_handler())
     _fill_token(window)
-    window.download_panel._east_spin.setValue(100.0)  # east < west
+    panel = window.download_panel
+    (region_resources / "city" / "rivertown.geojson").unlink()
+    assert panel.set_region_id("rivertown") is True
 
-    window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
+    panel.action_buttons[ACTION_TEST_CONNECTION].click()
 
     assert window._connection_worker is None
-    assert "west 必须小于 east" in window.download_panel.connection_label.text()
+    # 文案来自 ``missing_message()``：讲清"边界文件不可用"以及修法，
+    # 而不是笼统一句"请选择行政区域"（区域其实已经选了，缺的是文件）。
+    assert "边界" in panel.connection_label.text()
 
 
 def test_connection_log_never_leaks_full_token(
@@ -908,9 +953,9 @@ def test_calculate_still_works_after_connection_test(
 
     window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
     _wait_for_worker(window, qapp)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
 
-    assert "预计瓦片：" in window.download_panel.result_label.text()
+    assert "区域内瓦片：" in window.download_panel.result_label.text()
     assert window.status_group.title() == "下载状态"
     assert (
         window.device_panel.device_combo.itemText(0) == settings.UI_TEXT_DEVICE_EMPTY
@@ -1019,24 +1064,37 @@ def _stub_download_service(
 
 
 def _fill_small_region(
-    window: MainWindow, work_dir: Path | None = None, zoom: int = 12
+    window: MainWindow, work_dir: Path | None = None, zoom: int = 10
 ) -> None:
     """把表单填成一个"小到能瞬间跑完"的区域。
 
     Slice 4 起必须显式指定输出目录：否则会往用户主目录里写文件。
     传 ``None`` 只用于"不打算真的下载"的用例（校验失败、大任务确认等）。
+
+    区域取合成目录里的「示例河市」（1°×1°，110~111E / 33~34N），层数取 **Z10**：
+    这个级别下它只有 16 张瓦片（合成模式 32 次请求），既保留了"真的走下载链路"
+    的意义，又不会让几十条用例各自等上十几秒。Z12 同一个区域是 168 张 / 336 次
+    请求 —— 那已经超出"小到能瞬间跑完"的本意了。
     """
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(116.1)
-    panel._north_spin.setValue(39.1)
+    # 几何就是这块方框，因此 selected == candidate，用例里的算术期望值仍然成立。
+    assert panel.set_region_id("rivertown") is True
     panel._min_zoom_spin.setValue(zoom)
     panel._max_zoom_spin.setValue(zoom)
     if work_dir is not None:
         panel._output_edit.setText(str(work_dir))
     panel.map_name_edit.setText("beijing")
+
+
+def _produced_files(work_dir: Path) -> list[Path]:
+    """``work_dir`` 里**由下载产生**的条目（排除合成行政区树）。
+
+    ``region_resources`` 夹具把合成目录复制进了 ``work_dir/regions``：夹具必须
+    在构造窗口之前生效，而 ``work_dir`` 是唯一"保证可写且用完即清理"的目录。
+    它不是下载产物，断言"目录里只剩那个 .mbtiles"时要排除它。
+    """
+    return [item for item in work_dir.iterdir() if item.name != "regions"]
 
 
 def _expected_output_path(window: MainWindow) -> Path:
@@ -1065,15 +1123,57 @@ def _fill_multi_batch_region(window: MainWindow, work_dir: Path) -> int:
     并发 6）意味着至少 4 批，配合 :class:`_SlowTransport` 的延迟能留出
     1 秒以上的窗口——不是靠"跑得快"侥幸赢下的时序，而是靠规模撑出来的。
     """
-    panel = window.download_panel
     _fill_small_region(window, work_dir)
-    panel._east_spin.setValue(116.3)
-    panel._north_spin.setValue(39.2)
     return _expected_tile_count(window)
+
+
+def _click_calculate(window: MainWindow, panel=None) -> None:
+    """点「计算」，并把事件循环推到后台区域估算收尾。
+
+    区域裁剪（``PolygonTileRegionFilter``）现在一律在后台线程里跑：点完按钮立刻
+    读 ``_last_calculation`` 只会拿到 ``None``。这里等价于用户"等一下看到数字"。
+    """
+    target = panel if panel is not None else window.download_panel
+    target.action_buttons[ACTION_CALCULATE].click()
+    app = QApplication.instance()
+    _settle_region_estimate(window, app)
+    for _ in range(4):
+        app.processEvents()
+
+
+def _settle_region_estimate(window: MainWindow, qapp, timeout_s: float = 15.0) -> None:
+    """把事件循环推到后台区域估算结束。
+
+    下载范围只剩行政区域之后，``_start_download`` 会先 ``_begin_region_estimate``
+    （几何裁剪要逐张判定，不能阻塞主线程），估算是**异步**的：点完「开始下载」
+    立刻去看 ``_download_worker`` 只会拿到 ``None``。所有"点完就下载"的用例因此
+    都要先把这一步推完，等价于用户"等一下看到数字"。
+    """
+    deadline = time.monotonic() + timeout_s
+    while window._estimate_worker is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    # 估算线程结束时只是把信号**排队**：后续步骤（扫描已有文件 / 大任务确认 /
+    # 预算提示 / 起下载线程）都在那个槽里。这里再推几轮，等它们真的跑完。
+    for _ in range(6):
+        qapp.processEvents()
+
+
+def _click_start(window: MainWindow, panel=None) -> None:
+    """点「开始下载」，并把事件循环推到后台区域估算收尾。
+
+    估算结束后 ``_start_download`` 的后续步骤（已有文件扫描 / 大任务确认 /
+    预算提示 / 起下载线程）才有机会在主线程上执行。点完立刻断言那些对象
+    存在会失败——必须先"等一下"，这正是 ``_settle_region_estimate`` 的语义。
+    """
+    target = panel if panel is not None else window.download_panel
+    target.action_buttons[ACTION_START].click()
+    _settle_region_estimate(window, QApplication.instance())
 
 
 def _wait_for_download(window: MainWindow, qapp, timeout: int = 20_000) -> None:
     """等待后台下载线程结束并把信号送回主线程。"""
+    _settle_region_estimate(window, qapp)
     worker = window._download_worker
     assert isinstance(worker, QThread)
     assert worker.wait(timeout) is True
@@ -1105,8 +1205,23 @@ def _wait_for_scan(window: MainWindow, qapp, timeout: int = 10_000) -> None:
     于是"点一下 + ``processEvents()``"不再足以让三选一弹窗 / 下载线程出现，
     必须真的等那个后台线程跑完（它结束后会以队列信号的形式回到主线程继续流程）。
     """
+    _settle_region_estimate(window, qapp)
     scan = window._scan_worker
-    assert scan is not None, "目标文件已存在时应当先启动后台扫描"
+    if scan is None:
+        # 扫描线程可能在上面那几轮 ``processEvents`` 里就已经跑完并被清空了
+        # （三张瓦片的库一次计数查询，毫秒级）。只要流程已经往前走 ——
+        # 三选一弹窗出现了、计划被托住了、或者下载线程起来了 ——
+        # 就等价于"扫描完成"，不必再等一个已经结束的线程。
+        advanced = (
+            window._download_worker is not None
+            or window._exists_dialog is not None
+            or window._pending_plan is not None
+        )
+        assert advanced, (
+            "目标文件已存在时应当先启动后台扫描；当前日志：\n"
+            + window.log_panel.to_text()
+        )
+        return
     assert scan.wait(timeout) is True, "后台扫描线程没有在超时前结束"
     for _ in range(6):
         qapp.processEvents()
@@ -1130,7 +1245,7 @@ def test_start_download_writes_mbtiles(
     expected = _expected_tile_count(window)
 
     assert window._download_worker is None
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     values = window._status_values
@@ -1140,7 +1255,7 @@ def test_start_download_writes_mbtiles(
     assert values["tile_succeeded"].text() == f"{expected:,}"
     assert values["tile_failed"].text() == "0"
     assert values["tile_skipped"].text() == "0"
-    assert values["current_zoom"].text() == "12"
+    assert values["current_zoom"].text() == "10"
     assert "瓦片/秒" in values["speed"].text()
     assert values["downloaded_bytes"].text() != "0 B"
     assert window.progress_bar.value() == 100
@@ -1150,11 +1265,11 @@ def test_start_download_writes_mbtiles(
     assert output.exists()
     assert output.suffix == ".mbtiles"
     # 单文件交付：WAL / SHM 旁挂文件必须已被清理
-    assert sorted(item.name for item in work_dir.iterdir()) == [output.name]
+    assert sorted(item.name for item in _produced_files(work_dir)) == [output.name]
 
     with MBTilesReader(output) as reader:
         assert reader.get_tile_count() == expected
-        assert reader.get_zoom_range() == (12, 12)
+        assert reader.get_zoom_range() == (10, 10)
         assert reader.get_metadata()["name"] == "beijing"
 
     # 结果区展示 Spec §12 要求的那几行
@@ -1162,7 +1277,7 @@ def test_start_download_writes_mbtiles(
     assert "文件：" in result
     assert f"瓦片：{expected:,}" in result
     assert "大小：" in result
-    assert "Zoom：12~12" in result
+    assert "Zoom：10~10" in result
     assert "验证：PASS" in result
 
     log = window.log_panel.to_text()
@@ -1189,7 +1304,7 @@ def test_download_does_not_block_ui_thread(
     )
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
 
     worker = window._download_worker
     assert isinstance(worker, QThread)
@@ -1220,7 +1335,7 @@ def test_download_reports_failures(
     _fill_small_region(window, work_dir)
     expected = _expected_tile_count(window)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     values = window._status_values
@@ -1268,7 +1383,7 @@ def test_dismissing_complete_dialog_then_closing_window_is_safe(
     _stub_download_service(monkeypatch, _png_handler())
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     dialog = window._complete_dialog
@@ -1294,7 +1409,7 @@ def test_dismissing_failed_dialog_then_closing_window_is_safe(
     )
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     dialog = window._failed_dialog
@@ -1312,7 +1427,7 @@ def test_download_without_token_never_starts_worker(
     window: MainWindow, error_dialogs
 ) -> None:
     """Spec §9/§20：没有 Token 连任务都不该建（校验走统一入口）。"""
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
 
     assert window._download_worker is None
     assert window._scan_worker is None
@@ -1320,19 +1435,21 @@ def test_download_without_token_never_starts_worker(
     assert error_dialogs and error_dialogs[0][0] == settings.UI_TEXT_VALIDATION_TITLE
 
 
-def test_download_with_invalid_bounds_never_starts_worker(
-    window: MainWindow, error_dialogs, work_dir: Path
+def test_download_without_a_region_never_starts_worker(
+    window: MainWindow, error_dialogs, work_dir: Path, region_resources
 ) -> None:
+    """没有可用的行政区域 → 连任务都不该建，更不该先在输出目录里落一个空库。"""
     _fill_small_region(window, work_dir)
-    window.download_panel._east_spin.setValue(100.0)  # east < west
+    (region_resources / "city" / "rivertown.geojson").unlink()
+    window.download_panel.reload_region_boundary()
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
 
     assert window._download_worker is None
-    assert settings.UI_TEXT_VALIDATION_WEST_EAST in window.log_panel.to_text()
+    assert "行政区域" in window.log_panel.to_text()
     assert error_dialogs and error_dialogs[0][0] == settings.UI_TEXT_VALIDATION_TITLE
     # 连数据库都不该被创建
-    assert list(work_dir.iterdir()) == []
+    assert _produced_files(work_dir) == []
 
 
 def test_download_with_empty_map_name_is_auto_filled(
@@ -1350,9 +1467,13 @@ def test_download_with_empty_map_name_is_auto_filled(
     # 名称为空时，输出路径无法确定（UI 不替用户编）
     assert window._resolve_output_path(window.download_panel.get_form_data()) is None
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
 
-    expected_name = auto_map_name(116.0, 39.0, 116.1, 39.1)
+    # 自动名取的是**当前区域**的中心坐标（合成目录里的示例河市：110~111E / 33~34N）
+    data = window.download_panel.get_form_data()
+    expected_name = auto_map_name(
+        data["west"], data["south"], data["east"], data["north"]
+    )
     assert window.download_panel.map_name_edit.text() == expected_name
     assert (
         settings.UI_TEXT_MAP_NAME_AUTO_GENERATED.format(name=expected_name)
@@ -1372,7 +1493,7 @@ def test_output_path_preview_follows_map_name(
 ) -> None:
     """改地图名称 → 预估结果里的「输出文件」行跟着变（不用重算瓦片数）。"""
     _fill_small_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
     total_text = window.download_panel.result_label.text().splitlines()[0]
     assert f"输出文件：{_expected_output_path(window)}" in (
         window.download_panel.result_label.text()
@@ -1390,17 +1511,25 @@ def test_output_path_preview_follows_map_name(
 
 
 def test_map_name_is_sanitized_into_filename(
-    window: MainWindow, error_dialogs, work_dir: Path
+    window: MainWindow, monkeypatch, error_dialogs, work_dir: Path
 ) -> None:
-    """Windows 非法字符不能原样进文件名（否则落盘位置与预期不符）。"""
+    """Windows 非法字符不能原样进文件名（否则落盘位置与预期不符）。
+
+    计划对象现在由"后台估算完成"那一刻构造（``_prepare_download`` 需要估算结果
+    才知道要下多少张），所以这里不再直接调私有方法，而是把真正的启动换掉、
+    从 ``_launch_download`` 的入参上取计划 —— 与用户点一下按钮完全同一条路径。
+    """
+    launched: list[object] = []
+    monkeypatch.setattr(window, "_launch_download", launched.append)
     _fill_small_region(window, work_dir)
     window.download_panel.map_name_edit.setText("北京/2024:地图")
 
-    prepared = window._prepare_download()
+    _click_start(window)
 
-    assert prepared is not None
-    assert prepared.output_path.name == "北京_2024_地图_vec_cn.mbtiles"
-    assert prepared.output_path.parent == work_dir
+    assert len(launched) == 1
+    prepared = launched[0]
+    assert prepared.output_path.name == "北京_2024_地图_vec_cn.mbtiles"  # type: ignore[attr-defined]
+    assert prepared.output_path.parent == work_dir  # type: ignore[attr-defined]
 
 
 def _fill_large_region(window: MainWindow, work_dir: Path) -> int:
@@ -1414,10 +1543,7 @@ def _fill_large_region(window: MainWindow, work_dir: Path) -> int:
     """
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(117.0)
-    panel._north_spin.setValue(40.0)
+    assert panel.set_region_id("rivertown") is True
     panel._min_zoom_spin.setValue(8)
     panel._max_zoom_spin.setValue(16)
     panel._output_edit.setText(str(work_dir))
@@ -1436,7 +1562,7 @@ def test_large_task_asks_for_confirmation_without_starting(
     total = _fill_large_region(window, work_dir)
     assert total > settings.GUI_LARGE_TASK_CONFIRM_TILES
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     # 任务还没跑起来，但已经被"托住"等用户回答
@@ -1445,7 +1571,7 @@ def test_large_task_asks_for_confirmation_without_starting(
     assert window._pending_plan is not None
     assert window._pending_plan.total == total
     assert window._confirm_dialog is not None
-    assert list(work_dir.iterdir()) == []
+    assert _produced_files(work_dir) == []
 
     # 提示里带上总量与容量，且明确说明"不限制规模"
     text = window._confirm_dialog.text()
@@ -1465,7 +1591,7 @@ def test_large_task_confirmed_launches_download(
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
     total = _fill_large_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     dialog = window._confirm_dialog
@@ -1485,7 +1611,7 @@ def test_large_task_rejected_does_not_start(
 ) -> None:
     """点「否」→ 一个请求都不发，也不留下半个文件。"""
     _fill_large_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     dialog = window._confirm_dialog
@@ -1495,7 +1621,7 @@ def test_large_task_rejected_does_not_start(
 
     assert window._download_worker is None
     assert window._pending_plan is None
-    assert list(work_dir.iterdir()) == []
+    assert _produced_files(work_dir) == []
     assert "用户取消了大任务下载" in window.log_panel.to_text()
 
 
@@ -1509,7 +1635,7 @@ def test_large_task_confirm_dialog_does_not_block_event_loop(
     且事件仍在流转，外加一条源码级护栏，防止以后有人把 ``show()`` 改成 ``exec()``。
     """
     _fill_large_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     dialog = window._confirm_dialog
@@ -1550,7 +1676,7 @@ def test_pause_and_resume_buttons_drive_the_engine(
     _fill_small_region(window, work_dir)
     expected = _expected_tile_count(window)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     worker = window._download_worker
@@ -1603,20 +1729,13 @@ def test_closing_window_cancels_running_download(
         rate_limiter=RateLimiter.disabled(),
     )
     panel = window.download_panel
-    panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(116.5)
-    panel._north_spin.setValue(39.5)
-    panel._min_zoom_spin.setValue(12)
-    panel._max_zoom_spin.setValue(12)
-    panel._output_edit.setText(str(work_dir))
-    panel.map_name_edit.setText("beijing")
+    # Z11：示例河市在这个级别是 49 张瓦片，够撑出"任务还在跑"的中间态
+    _fill_small_region(window, work_dir, zoom=11)
     assert _expected_tile_count(window) > 20  # 确保关窗时任务还在跑
 
     window.show()  # 让 isVisible 这条断言有意义（offscreen 下默认不显示）
     qapp.processEvents()
-    panel.action_buttons[ACTION_START].click()
+    _click_start(window, panel)
     qapp.processEvents()
     worker = window._download_worker
     assert isinstance(worker, QThread)
@@ -1660,18 +1779,11 @@ def test_closing_window_can_be_cancelled(
         rate_limiter=RateLimiter.disabled(),
     )
     panel = window.download_panel
-    panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(116.5)
-    panel._north_spin.setValue(39.5)
-    panel._min_zoom_spin.setValue(12)
-    panel._max_zoom_spin.setValue(12)
-    panel._output_edit.setText(str(work_dir))
-    panel.map_name_edit.setText("beijing")
+    # Z11：49 张瓦片，够撑出"任务还在跑"的中间态
+    _fill_small_region(window, work_dir, zoom=11)
     assert _expected_tile_count(window) > 20
 
-    panel.action_buttons[ACTION_START].click()
+    _click_start(window, panel)
     qapp.processEvents()
     worker = window._download_worker
     assert isinstance(worker, QThread)
@@ -1707,19 +1819,12 @@ def test_cancelled_download_keeps_partial_mbtiles(
         rate_limiter=RateLimiter.disabled(),
     )
     panel = window.download_panel
-    panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(116.5)
-    panel._north_spin.setValue(39.5)
-    panel._min_zoom_spin.setValue(12)
-    panel._max_zoom_spin.setValue(12)
-    panel._output_edit.setText(str(work_dir))
-    panel.map_name_edit.setText("beijing")
+    # Z11：49 张瓦片，取消时库里必然已经有东西
+    _fill_small_region(window, work_dir, zoom=11)
     total = _expected_tile_count(window)
     assert total > 20
 
-    panel.action_buttons[ACTION_START].click()
+    _click_start(window, panel)
     qapp.processEvents()
     worker = window._download_worker
     assert isinstance(worker, QThread)
@@ -1732,7 +1837,7 @@ def test_cancelled_download_keeps_partial_mbtiles(
 
     output = _expected_output_path(window)
     assert output.exists()
-    assert sorted(item.name for item in work_dir.iterdir()) == [output.name]
+    assert sorted(item.name for item in _produced_files(work_dir)) == [output.name]
 
     with MBTilesReader(output) as reader:
         written = reader.get_tile_count()
@@ -1758,7 +1863,7 @@ def test_download_log_never_leaks_full_token(
     _stub_download_service(monkeypatch, _png_handler())
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     assert FAKE_TOKEN not in window.log_panel.to_text()
@@ -1775,12 +1880,12 @@ def test_slice0_to_2_features_survive_download(
     _stub_transport(monkeypatch, _png_handler())
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     # Slice 1：计算
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    assert "预计瓦片：" in window.download_panel.result_label.text()
+    _click_calculate(window)
+    assert "区域内瓦片：" in window.download_panel.result_label.text()
     # Slice 2：连通性测试
     window.download_panel.action_buttons[ACTION_TEST_CONNECTION].click()
     _wait_for_worker(window, qapp)
@@ -1795,16 +1900,17 @@ def test_slice0_to_2_features_survive_download(
 # --------------------------------------------------------------------------- #
 # 布局护栏（Slice 4 新增了地图名称 / 下载结果 / 已下载字节）
 # --------------------------------------------------------------------------- #
-def test_left_column_has_no_scrollbars_when_idle(window: MainWindow, qapp) -> None:
-    """左列不得挤出滚动条。
+def test_left_column_has_no_horizontal_scrollbar_when_idle(window: MainWindow, qapp) -> None:
+    """左列不得挤出**横向**滚动条。
 
-    Slice 4 往配置列里加了「地图名称」行和「下载结果」分组，两个真实风险：
+    横向那条才是真问题：结果区要显示 Windows 绝对路径（无空格的长 token），
+    一旦让它可以撑宽布局，横向滚动条会连带把纵向那条也拽出来（两者互相触发）。
 
-    - 结果区要显示 Windows 绝对路径（无空格的长 token），一旦让它可以撑宽布局，
-      就会连带把横向滚动条和纵向滚动条一起拽出来（两者会互相触发）；
-    - 内容一旦高于窗口，纵向滚动条会吃掉 ~17px 可视宽度，横向滚动条随之出现。
-
-    因此这里同时断言两个方向都不溢出。
+    纵向滚动条则是**预期内**的：下载范围只剩行政区域之后，左侧表单比矩形时代
+    更高（国家/省/市/县 四段级联 + 下载级别 + 区域范围 + 下载策略 + Min/Max +
+    推荐说明），760px 高的窗口装不下整列 —— 这正是配置列外面套着
+    ``QScrollArea``、并且宽度计算里预留了 ``PM_ScrollBarExtent`` 的原因。
+    纵向滚动条出现时不许把横向那条一起带出来，就是这条用例守的东西。
     """
     window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
     window.show()
@@ -1813,7 +1919,6 @@ def test_left_column_has_no_scrollbars_when_idle(window: MainWindow, qapp) -> No
 
     scroll = window._left_scroll
     assert scroll.horizontalScrollBar().maximum() == 0
-    assert scroll.verticalScrollBar().maximum() == 0
 
 
 def test_left_column_keeps_no_horizontal_scroll_with_long_output_path(
@@ -1824,7 +1929,7 @@ def test_left_column_keeps_no_horizontal_scroll_with_long_output_path(
     window.show()
     _fill_small_region(window, work_dir)
     window.download_panel.map_name_edit.setText("a" * 60)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window)
     window.download_panel.set_download_result(
         [
             "文件：" + str(work_dir / ("a" * 60 + ".mbtiles")),
@@ -1862,8 +1967,10 @@ def test_progress_bar_stays_visible_while_downloading(
 ) -> None:
     """下载进行中，「总进度」必须落在可视范围内。
 
-    这是把「下载结果」分组做成按需显示的直接原因：多占 120px 就会把状态区
-    的尾部（含进度条）顶到折叠线以下，而进度条恰恰是下载时最该看见的东西。
+    配置列比窗口高（见 ``test_left_column_has_no_horizontal_scrollbar_when_idle``），
+    状态区默认在折叠线以下，所以「开工后自动滚到下载状态」是硬要求：
+    ``_launch_download`` 里必须调 ``_reveal_download_status``。
+    没有这一下，用户点完「开始下载」只能看到表单，以为程序没反应。
     """
     _stub_download_service(
         monkeypatch,
@@ -1873,7 +1980,7 @@ def test_progress_bar_stays_visible_while_downloading(
     window.resize(settings.DEFAULT_WINDOW_WIDTH, settings.DEFAULT_WINDOW_HEIGHT)
     window.show()
     _fill_small_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
     assert window._download_worker is not None
     assert window._download_worker.isRunning() is True
@@ -1882,8 +1989,9 @@ def test_progress_bar_stays_visible_while_downloading(
     bottom = window.progress_bar.mapTo(
         viewport, window.progress_bar.rect().bottomLeft()
     ).y()
-    assert bottom <= viewport.height()
-    assert window._left_scroll.verticalScrollBar().maximum() == 0
+    assert 0 <= bottom <= viewport.height(), "进度条必须被滚进可视范围"
+    # 滚过去之后也不许冒出横向滚动条
+    assert window._left_scroll.horizontalScrollBar().maximum() == 0
 
     _wait_for_download(window, qapp)
 
@@ -2107,7 +2215,7 @@ def test_existing_file_asks_before_touching_anything(
     path = _seed_existing_map(window, tiles=3)
     before = path.read_bytes()
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_scan(window, qapp)
 
     assert window._download_worker is None
@@ -2143,7 +2251,7 @@ def test_existing_file_cancel_changes_nothing(
     path = _seed_existing_map(window, tiles=2)
     before = path.read_bytes()
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.Cancel).click()
     qapp.processEvents()
@@ -2165,7 +2273,7 @@ def test_existing_file_continue_resumes_and_skips(
     total = _expected_tile_count(window)
     assert total > 3
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.Yes).click()
     qapp.processEvents()
@@ -2195,7 +2303,7 @@ def test_existing_file_restart_requires_second_confirm(
     path = _seed_existing_map(window, tiles=2)
     before = path.read_bytes()
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.No).click()
     qapp.processEvents()
@@ -2228,7 +2336,7 @@ def test_existing_file_restart_backs_up_then_downloads_from_scratch(
     before = path.read_bytes()
     total = _expected_tile_count(window)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_scan(window, qapp)
     _existing_dialog(window).button(QMessageBox.StandardButton.No).click()
     qapp.processEvents()
@@ -2284,14 +2392,20 @@ def test_task_resume_starts_resume_download(
     path = _seed_existing_map(window, tiles=3)
     total = _expected_tile_count(window)
 
+    # 任务记录必须带上区域（``region``）：续传时要按 ``region_id`` 找回边界文件，
+    # 一条没有区域信息的老记录现在会被明确拒绝（"本版本只支持行政区域"）。
+    data = window.download_panel.get_form_data()
     task = window.task_service.create_task(
         name="beijing",
-        bounds=GeoBounds(116.0, 39.0, 116.1, 39.1),
-        min_zoom=12,
-        max_zoom=12,
+        bounds=GeoBounds(data["west"], data["south"], data["east"], data["north"]),
+        # 层数跟表单一致（``_seed_existing_map`` 写文件时用的是表单里的层数，
+        # 续传一致性校验会逐项比对，写死一个不同的数字只会测到"拒绝"分支）
+        min_zoom=data["min_zoom"],
+        max_zoom=data["max_zoom"],
         map_layer=MapLayerType.VECTOR,
         output_path=path,
         total_tiles=total,
+        region=window.download_panel.current_region(),
         # 必须与 ``_seed_existing_map`` 写进文件的合成配置一致（表单默认勾选了
         # 中文注记）：否则 Spec §12 的一致性校验会正确地拒绝续传，
         # 用例就变成在测"拒绝逻辑"了。
@@ -2390,8 +2504,10 @@ def test_task_double_click_backfills_form(
 
     panel = window.download_panel
     assert panel.map_name_edit.text() == "shanghai"
-    assert panel._west_spin.value() == pytest.approx(121.0)
-    assert panel._north_spin.value() == pytest.approx(31.5)
+    # 这条任务记录里没有区域信息（自定义矩形时代的写法）：本版本还原不出区域，
+    # 只能明确提示"请重新选择区域"，而不是回填一块矩形继续下。
+    assert panel.current_region() is None
+    assert "只支持行政区域" in panel.current_region_error()
     assert panel._min_zoom_spin.value() == 10
     assert panel._max_zoom_spin.value() == 12
     assert panel._output_edit.text() == str(work_dir)
@@ -2413,7 +2529,7 @@ def test_task_list_progress_tracks_download_state(
     _fill_small_region(window, work_dir)
     total = _expected_tile_count(window)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     assert isinstance(window._download_worker, DownloadWorker)
@@ -2437,7 +2553,7 @@ def test_failed_task_keeps_failed_status_in_list(
     _stub_download_service(monkeypatch, _png_handler(status_code=500))
     _fill_small_region(window, work_dir)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     assert window.task_panel.task_count == 1
@@ -2465,7 +2581,7 @@ def test_exit_confirmation_does_not_block_event_loop(
     total = _fill_multi_batch_region(window, work_dir)
     assert total > 15
     window.show()
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     assert _wait_until(
@@ -2503,7 +2619,7 @@ def test_exit_writes_paused_status_to_disk(
     _stub_download_service(monkeypatch, _png_handler(), delay=0.4)
     _fill_multi_batch_region(window, work_dir)
     window.show()
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     assert _wait_until(
@@ -2595,7 +2711,7 @@ def test_calculate_preview_follows_layer_plan(window: MainWindow) -> None:
     panel = window.download_panel
     panel._min_zoom_spin.setValue(10)
     panel._max_zoom_spin.setValue(12)
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     total = window._last_calculation[0]  # type: ignore[index]
     assert f"预计 WMTS 请求：{total * 2:,}" in panel.result_label.text()
@@ -2615,7 +2731,7 @@ def test_large_task_confirm_shows_request_estimate(
     ``KeyError``——这条用例把"必须传进去"钉住。
     """
     total = _fill_large_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     plan = window._pending_plan
@@ -2632,7 +2748,7 @@ def test_large_task_request_estimate_without_labels(
     """不勾中文注记时请求量不翻倍 —— 预估必须反映真实选择。"""
     window.download_panel.labels_check.setChecked(False)
     total = _fill_large_region(window, work_dir)
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     plan = window._pending_plan
@@ -2652,7 +2768,7 @@ def test_download_worker_receives_map_type_and_labels(
     _fill_small_region(window, work_dir)
     window.download_panel.labels_check.setChecked(True)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     qapp.processEvents()
 
     worker = window._download_worker
@@ -2673,7 +2789,7 @@ def test_start_download_writes_merged_metadata(
     total = _expected_tile_count(window)
     window.download_panel.labels_check.setChecked(True)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     path = _expected_output_path(window)
@@ -2703,7 +2819,7 @@ def test_start_download_without_labels_writes_single_metadata(
     total = _expected_tile_count(window)
     window.download_panel.labels_check.setChecked(False)
 
-    window.download_panel.action_buttons[ACTION_START].click()
+    _click_start(window)
     _wait_for_download(window, qapp)
 
     with MBTilesReader(_expected_output_path(window)) as reader:
@@ -2754,15 +2870,18 @@ def test_task_started_from_resume_keeps_merged_composition(
     _fill_small_region(window, work_dir)
     path = _seed_existing_map(window, tiles=3)  # 与表单一致：merged
 
+    data = window.download_panel.get_form_data()
     task = window.task_service.create_task(
         name="beijing",
-        bounds=GeoBounds(116.0, 39.0, 116.1, 39.1),
-        min_zoom=12,
-        max_zoom=12,
+        bounds=GeoBounds(data["west"], data["south"], data["east"], data["north"]),
+        min_zoom=data["min_zoom"],
+        max_zoom=data["max_zoom"],
         map_layer=MapLayerType.VECTOR,
         output_path=path,
         total_tiles=_expected_tile_count(window),
         with_labels=True,
+        # 续传按 ``region_id`` 找回边界文件；没有区域的记录会被明确拒绝
+        region=window.download_panel.current_region(),
     )
     window.task_service.set_status(task, DownloadTaskStatus.PAUSED)
     window._refresh_task_list(select_id=task.id)
@@ -2791,16 +2910,29 @@ def test_task_started_from_resume_keeps_merged_composition(
 def _make_complete_map(path: Path, *, zoom: int = 8) -> Path:
     """写一个**覆盖完整**的地图包（走生产同一条 Writer 路径）。
 
-    ``GOOD_INSPECT_BOUNDS`` 在 z8 下恰好只映射到 1 张瓦片，所以"填满整个
-    期望集合"只要写一张 —— 用例因此能断言到 ``PASS``，而不是被覆盖缺失
-    拖成 ``WARNING``。
+    这块 0.4°×0.4° 的小方框整个落在合成行政区「示例河市」（``rivertown``，
+    110~111E / 33~34N）里，z8 下恰好只映射到 1 张瓦片，所以"填满整个期望集合"
+    只要写一张 —— 用例因此能断言到 ``PASS``，而不是被覆盖缺失拖成 ``WARNING``。
+
+    元数据必须写上 ``region_type`` / ``region_id``：下载范围只剩行政区域之后，
+    Inspector 的覆盖完整性是按**行政区几何**判定的，认不出区域就只能给出
+    "未知"（结论 WARNING）。矩形时代那种"按外包矩形估算"的退路已经移除。
     """
-    bounds = GeoBounds(116.0, 39.0, 116.5, 39.5)
+    bounds = GeoBounds(110.2, 33.2, 110.6, 33.6)
     path.parent.mkdir(parents=True, exist_ok=True)
     writer = MBTilesWriter(path)
     writer.open()
     writer.write_metadata(
-        MBTilesMetadata.for_bounds(bounds, zoom, zoom, name="inspector")
+        MBTilesMetadata.for_bounds(
+            bounds,
+            zoom,
+            zoom,
+            name="inspector",
+            region_type=RegionType.POLYGON.value,
+            region_id="rivertown",
+            boundary_version="2026-09-fixture",
+            region_level=RegionLevel.CITY.value,
+        )
     )
     tile_range = calculate_tile_ranges(bounds, zoom, zoom)[0]
     for x in range(tile_range.min_x, tile_range.max_x + 1):
@@ -3458,26 +3590,16 @@ def test_package_dialog_has_no_qt_main_thread_sql_and_uses_workers() -> None:
 #    （`layer_plan_changed`），`_refresh_output_preview` 就会用**缓存里的旧结论**
 #    把"计算失败"的提示盖回去，用户以为算成功了。
 # --------------------------------------------------------------------------- #
-def _rect_estimate_text(window: MainWindow) -> str:
-    """点一次「计算」并返回结果区文本（默认是矩形模式）。"""
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    return window.download_panel.result_label.text()
-
-
-def test_switching_region_type_invalidates_the_previous_estimate(
-    window: MainWindow,
-) -> None:
+def test_region_change_invalidates_the_previous_estimate(window: MainWindow) -> None:
+    """换区域必须立刻作废上一次的预估结论（否则旧数字会张冠李戴）。"""
     panel = window.download_panel
-    assert panel.current_region_type() is RegionType.RECTANGLE
+    # 伪造一份"上一次算出来的结论"：真实计算需要已部署的边界文件，而这里要测的
+    # 只是"区域一变，旧结论就得消失"这件事。
+    panel.set_calculation_result(1234, "1.2 MB")
+    window._last_calculation = object()
+    window._status_values["tile_total"].setText("1234")
 
-    first = _rect_estimate_text(window)
-    assert "预计瓦片：" in first
-    assert window._last_calculation is not None
-    tiles_text = window._status_values["tile_total"].text()
-    assert tiles_text != "0"
-
-    # --- 切到「行政区域」：旧的矩形结论必须立刻消失 ---
-    panel.set_region_type(RegionType.POLYGON)
+    panel.region_changed.emit()
 
     assert window._last_calculation is None, "旧的预估结论必须被作废"
     assert "预计瓦片" not in panel.result_label.text()
@@ -3495,12 +3617,12 @@ def test_output_edit_cannot_resurrect_a_stale_estimate(
     """
     monkeypatch.setattr(window, "_show_error_dialog", lambda *a, **k: None)
     panel = window.download_panel
-    _rect_estimate_text(window)
-    stale_tiles = window._status_values["tile_total"].text()
+    # 伪造上一次的结论（真实计算需要边界文件，这里只关心"不许复活"）
+    panel.set_calculation_result(1234, "1.2 MB")
+    window._status_values["tile_total"].setText("1234")
 
-    panel.set_region_type(RegionType.POLYGON)
-    # 用户在行政区域模式下点「计算」但边界文件不可用 → 结果区是人话错误
-    panel.action_buttons[ACTION_CALCULATE].click()
+    # 用户在边界不可用时点「计算」→ 结果区是人话错误
+    _click_calculate(window, panel)
     assert "计算失败" in panel.result_label.text()
 
     # 现在动一下输出目录（真实用户每天都会做的事）
@@ -3509,7 +3631,7 @@ def test_output_edit_cannot_resurrect_a_stale_estimate(
 
     text = panel.result_label.text()
     assert "预计瓦片" not in text, "旧结论不许复活"
-    assert stale_tiles not in text, f"{stale_tiles} 是矩形算出来的，不该留在行政区域模式下"
+    assert "1,234" not in text, "上一次的结论不该被重绘带回来"
 
 
 def test_polygon_without_boundary_reports_where_to_put_the_file(
@@ -3526,9 +3648,8 @@ def test_polygon_without_boundary_reports_where_to_put_the_file(
         window, "_show_error_dialog", lambda title, message: calls.append((title, message))
     )
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
 
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     text = panel.result_label.text()
     assert "计算失败" in text
@@ -3549,15 +3670,6 @@ def test_polygon_without_boundary_reports_where_to_put_the_file(
 # "用户输入没被改"的断言 —— 只测前者，把 `set_zoom_range(4, 10)` 写进提示逻辑
 # 里也能全绿。
 # --------------------------------------------------------------------------- #
-def test_zoom_hint_is_hidden_for_a_custom_rectangle(window: MainWindow) -> None:
-    """自定义矩形没有行政等级可言 → 整行收起，不是显示一句空话。"""
-    panel = window.download_panel
-    assert panel.current_region_level().value == "custom"
-    assert panel.zoom_hint_title.isHidden() is True
-    assert panel.zoom_hint_label.isHidden() is True
-    assert panel.zoom_policy_text == ""
-
-
 def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
     """选中中国 Preset → 第一行就是「推荐 Zoom：Z5~10」。
 
@@ -3565,7 +3677,6 @@ def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
     区域、它建议多少 Zoom"，而不是等他把文件放好了才知道。
     """
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
 
     assert panel.current_region_level().value == "country"
     assert panel.zoom_hint_label.isHidden() is False
@@ -3575,7 +3686,6 @@ def test_zoom_hint_shows_the_china_recommendation(window: MainWindow) -> None:
 def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> None:
     """Z8~18（Spec §10 的例子）：给警告，且**不改**用户的 8 与 18。"""
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(8, 18)
 
     text = panel.zoom_policy_text
@@ -3590,24 +3700,12 @@ def test_zoom_hint_warns_but_never_touches_the_user_zoom(window: MainWindow) -> 
 
 def test_zoom_hint_is_quiet_inside_the_recommendation(window: MainWindow) -> None:
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(5, 10)
 
     assert panel.zoom_policy_text.splitlines() == [
         "推荐 Zoom：Z5~10",
         "当前 Zoom：Z5~10",
     ]
-
-
-def test_zoom_hint_follows_the_region_switch(window: MainWindow) -> None:
-    panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
-    assert panel.zoom_hint_label.isHidden() is False
-
-    panel.set_region_type(RegionType.RECTANGLE)
-    assert panel.zoom_hint_label.isHidden() is True
-    assert panel.zoom_hint_title.isHidden() is True
-    assert panel.zoom_policy_text == ""
 
 
 def test_zoom_warning_does_not_block_calculation(
@@ -3619,10 +3717,9 @@ def test_zoom_warning_does_not_block_calculation(
     真的去估算全中国 Z8~18（天文数字的瓦片）——用例挂死而不是失败。
     """
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(8, 18)
 
-    panel.action_buttons[ACTION_CALCULATE].click()
+    _click_calculate(window, panel)
 
     # 这次计算确实失败了，但失败原因是**边界文件**，不是"Zoom 超范围"
     assert "计算失败" in panel.result_label.text()
@@ -3641,7 +3738,6 @@ def test_zoom_hint_row_does_not_overlap_the_zoom_inputs(
     截图缩图 + 抗锯齿会把"两行贴在一起"看得很正常；``geometry()`` 不会。
     """
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     window.show()  # 让 isVisible / geometry 有意义（offscreen 下默认不显示）
     for _ in range(4):
         qapp.processEvents()
@@ -3699,11 +3795,8 @@ def test_region_combo_is_filled_from_the_catalog(
     assert panel.region_combo.itemText(0) == "中国（边界文件未就绪）"
     # 目录里存的是**相对资源目录**的路径（始终用正斜杠，Spec §12）
     assert item.geojson_path == "country/china.geojson"
-    # 三级级联在矩形模式下**不参与下载**：对外报的 id 必须是 None
-    panel.set_region_type(RegionType.POLYGON)
+    # 级联选择直接决定下载区域：对外报的 id 就是当前选中的那一条
     assert panel.current_region_id() == "china"
-    panel.set_region_type(RegionType.RECTANGLE)
-    assert panel.current_region_id() is None
 
 
 def test_region_combo_follows_a_redirected_catalog(
@@ -3724,11 +3817,14 @@ def test_region_combo_follows_a_redirected_catalog(
     assert panel.country_combo.itemText(0) == "示例国"
     assert panel.country_combo.itemData(0).id == "demoland"
 
-    # 国家下面两个省，加一条"全部（不限定省份）"
+    # 国家下面三个省，加一条"全部（不限定省份）"。
+    # 第三条「示例三角省」是 ``window`` 夹具追加的（它请求 ``region_resources``，
+    # 会在同一棵临时树上补一块三角形区域，见 conftest 里的说明）。
     assert [panel.province_combo.itemText(i) for i in range(panel.province_combo.count())] == [
         "全部（不限定省份）",
         "示例北省",
         "示例南省",
+        "示例三角省",
     ]
     assert [panel.city_combo.itemText(i) for i in range(panel.city_combo.count())] == [
         "全部（不限定城市）"
@@ -3755,7 +3851,6 @@ def test_picking_a_city_uses_the_city_zoom_policy(
     panel = window.download_panel
     _use_region_root(monkeypatch, region_root)
     panel.reload_region_boundary()
-    panel.set_region_type(RegionType.POLYGON)
 
     assert panel.set_region_id("rivertown") is True
     assert panel.current_region_level() is RegionLevel.CITY
@@ -3771,8 +3866,10 @@ def test_picking_a_city_uses_the_city_zoom_policy(
 
 
 def test_choose_downloaded_map_builds_and_selects_package(
-    android_window_factory, work_dir, qapp, monkeypatch
+    android_window_factory, work_dir, qapp, monkeypatch, region_resources
 ) -> None:
+    # ``region_resources``：源文件里写着 ``region_id=rivertown``，打包时会按行政
+    # 区域核对覆盖完整性，边界文件不可用就只会给出"需要确认"的警告。
     window = android_window_factory()
     source = _make_complete_map(work_dir / "downloaded.mbtiles")
     window.download_panel.output_edit.setText(str(work_dir))

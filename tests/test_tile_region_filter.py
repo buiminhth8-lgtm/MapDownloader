@@ -283,21 +283,11 @@ def test_boundary_tiles_are_never_lost_along_a_half_tile_offset() -> None:
 # --------------------------------------------------------------------------- #
 # build_region_filter：什么时候**不该**构造过滤器
 # --------------------------------------------------------------------------- #
+# 只有"没有下载区域"这一种可能。自定义矩形随界面入口一起删除之后，不再有
+# "有区域但故意不过滤"的第二条分支 —— 那正是 Spec §7 里"静默下载区域外瓦片"
+# 的来源，现在由 ``DownloadRegion`` 在构造阶段就拦掉（见文件末尾那条用例）。
 def test_build_region_filter_returns_none_for_none_region() -> None:
     assert build_region_filter(None) is None
-
-
-def test_build_region_filter_returns_none_for_rectangle() -> None:
-    """矩形必须返回 ``None``（表示"不过滤"）。
-
-    这是 Spec §7 的兼容红线：矩形任务走的必须还是 Slice 0~15 那条链路，
-    一旦这里返回了过滤器，矩形下载就会多出一层几何判定 —— 数字仍可能对，
-    但"矩形行为逐位一致"的保证就没了。
-    """
-    region = DownloadRegion.rectangle("自定义矩形", SQUARE_BOUNDS)
-
-    assert region.region_type is RegionType.RECTANGLE
-    assert build_region_filter(region) is None
 
 
 def test_build_region_filter_loads_the_boundary_file() -> None:

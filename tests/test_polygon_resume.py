@@ -262,19 +262,17 @@ def test_fixture_counts_add_up() -> None:
 
 
 def test_region_target_tiles_uses_selected_for_polygon(preset: RegionPreset) -> None:
-    """分母：多边形取选中数（60），矩形取候选数（100）。"""
+    """分母：有区域取选中数（60），没有区域取候选数（100）。
+
+    自定义矩形删除之后，"有区域但不过滤"这条中间态不再存在：要么有行政区域
+    边界文件（按几何裁剪），要么压根没有区域（``region is None``，纯范围下载）。
+    """
     region = region_for(preset)
 
     assert region_target_tiles(region, block_bounds(), ZOOM, ZOOM) == 60
     assert region_target_tiles(None, block_bounds(), ZOOM, ZOOM) == 100
-    assert (
-        region_target_tiles(
-            DownloadRegion.rectangle("自定义矩形", block_bounds()),
-            block_bounds(),
-            ZOOM,
-            ZOOM,
-        )
-        == estimate_tile_count(block_bounds(), ZOOM, ZOOM)
+    assert region_target_tiles(None, block_bounds(), ZOOM, ZOOM) == estimate_tile_count(
+        block_bounds(), ZOOM, ZOOM
     )
 
 
@@ -404,16 +402,16 @@ async def test_resume_from_a_full_rectangle_file_counts_only_in_region_existing(
 async def test_resume_denominator_follows_the_recorded_region_type(
     preset: RegionPreset, work_dir: Path, tasks_file: Path
 ) -> None:
-    """分母跟着**记录里的**区域类型走：矩形记录 → 100，多边形记录 → 60。
+    """分母跟着**记录里的**区域走：多边形记录 → 60；老矩形记录 → 直接拒绝续传。
 
     两条记录指向内容完全相同的文件（只有 40 张），差别只在 ``region_type``
-    这一个字段上。把两种情况放在同一个用例里，是为了让"分母由记录决定、
-    而不是由文件内容决定"这件事一眼可见。
+    与 ``region_id`` 上。把两种情况放在同一个用例里，是为了让"续传目标由记录
+    决定、而不是由文件内容决定"这件事一眼可见。
     """
     region = region_for(preset)
     inside_first_40 = set(sorted(in_region_tiles())[:40])
 
-    # --- 情况 A：记录里没有区域字段（老记录）→ 按矩形办，分母 100 ---
+    # --- 情况 A：老的自定义矩形记录（没有 region_id）→ 拒绝，并说清原因 ---
     rect_path = work_dir / "as_rectangle.mbtiles"
     write_file_with(rect_path, inside_first_40)
     rect_task = make_task(tasks_file, rect_path, region, total_tiles=60)
@@ -421,10 +419,10 @@ async def test_resume_denominator_follows_the_recorded_region_type(
     rect_task.region_id = ""
     rect_task.boundary_version = ""
 
-    outcome_rect = await make_service(TileServer()).resume_task(rect_task, FAKE_TOKEN)
-
-    assert outcome_rect.summary.total == 100
-    assert outcome_rect.existing_tiles == 40
+    with pytest.raises(MapResumeError, match="只支持行政区域"):
+        await make_service(TileServer()).resume_task(rect_task, FAKE_TOKEN)
+    # 拒绝必须发生在写盘之前：已有文件原封不动
+    assert len(tiles_in(rect_path)) == 40
 
     # --- 情况 B：同一个文件、记录里写着多边形 → 分母 60 ---
     poly_path = work_dir / "as_polygon.mbtiles"
@@ -522,7 +520,10 @@ def test_old_task_without_region_fields_reads_as_rectangle(
 
     assert reloaded is not None
     assert reloaded.region_type == ""
-    assert region_module.region_from_task(reloaded).region_type is region_module.RegionType.RECTANGLE
+    # 没有区域信息的记录（自定义矩形时代的产物）已经还原不出"一块区域"：
+    # 返回 None，让调用方提示"区域不可用"，而不是猜一块矩形继续往里写。
+    assert region_module.region_from_task(reloaded) is None
+    # 分母退回候选数 —— 恰好等于老矩形任务当时要下的那一批瓦片。
     assert region_target_tiles(region_module.region_from_task(reloaded), block_bounds(), ZOOM, ZOOM) == 100
 
 
@@ -593,17 +594,22 @@ def test_boundary_version_change_warns(
     assert any("边界版本不同" in item for item in result.warnings)
 
 
-def test_rectangle_task_gets_no_region_warnings(work_dir: Path, tasks_file: Path) -> None:
-    """矩形任务不该被这些规则波及（Spec §7 的兼容红线）。"""
+def test_a_task_without_a_region_gets_no_region_warnings(
+    work_dir: Path, tasks_file: Path
+) -> None:
+    """没有区域信息的任务不该被这三条规则波及。
+
+    老记录（自定义矩形时代）与"纯范围下载"都是这种情况：任务里没有
+    ``region_id``，于是"两边都说得清才比对"这条原则让它一条提示都不该出。
+    """
     task = TaskService(TaskStore(tasks_file)).create_task(
-        name="rect",
+        name="bare",
         bounds=block_bounds(),
         min_zoom=ZOOM,
         max_zoom=ZOOM,
         map_layer=LAYER,
         output_path=work_dir / "r.mbtiles",
         total_tiles=100,
-        region=DownloadRegion.rectangle("自定义矩形", block_bounds()),
     )
 
     for metadata in (

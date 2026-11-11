@@ -41,6 +41,7 @@ from app.planning import (
     ZoomStrategyService,
     get_zoom_policy,
 )
+from tests.region_helpers import rect_region
 
 ZOOM = 12
 
@@ -101,9 +102,15 @@ def _inset_polygon() -> list[list[list[float]]]:
 
 
 @pytest.fixture()
-def rectangle() -> DownloadRegion:
-    """自定义矩形区域（不读任何文件）。"""
-    return DownloadRegion.rectangle("测试矩形", block_bounds())
+def bounds_region(work_dir: Path) -> DownloadRegion:
+    """边界**恰好等于外包矩形**的行政区（现场写一份矩形 GeoJSON）。
+
+    下载范围只剩行政区域之后不再有"矩形区域"，但"候选集合 == 命中集合"这条
+    性质仍要覆盖：这些用例真正要的是"一块不裁掉任何瓦片的范围"，所以这里给
+    一块与 :func:`block_bounds` 完全重合的多边形 —— 走的是生产同一条
+    ``PolygonTileRegionFilter`` 链路，而不是假的矩形分支。
+    """
+    return rect_region("测试区域", block_bounds(), work_dir)
 
 
 @pytest.fixture()
@@ -337,12 +344,12 @@ def test_evaluate_rejects_unknown_level(
 # recommend_with_estimate：复用 RegionTileEstimator（Spec §9）
 # --------------------------------------------------------------------------- #
 def test_estimate_reuses_the_region_tile_estimator(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     """期望值不是写死的：直接调一次估算器，两边必须逐字段一致。"""
-    plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
+    plan = service.recommend_with_estimate(bounds_region, RegionLevel.COUNTRY)
     low, high = _policy_range(RegionLevel.COUNTRY)
-    expected = RegionTileEstimator(rectangle).estimate(low, high)
+    expected = RegionTileEstimator(bounds_region).estimate(low, high)
 
     assert plan.estimate is not None
     assert plan.selected_tiles == expected.selected_tiles
@@ -354,12 +361,12 @@ def test_estimate_reuses_the_region_tile_estimator(
 
 
 def test_estimate_reports_candidate_and_selected_truthfully(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     low, high = _policy_range(RegionLevel.COUNTRY)
-    plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
+    plan = service.recommend_with_estimate(bounds_region, RegionLevel.COUNTRY)
     expected_candidate = sum(
-        calculate_tile_range(rectangle.bounds, zoom).tile_count
+        calculate_tile_range(bounds_region.bounds, zoom).tile_count
         for zoom in range(low, high + 1)
     )
     assert plan.candidate_tiles == expected_candidate
@@ -367,21 +374,21 @@ def test_estimate_reports_candidate_and_selected_truthfully(
 
 
 def test_estimate_honours_the_user_zoom_range(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     """给了用户 Zoom 就按用户区间预估，并把 warning 一并带回来。"""
     plan = service.recommend_with_estimate(
-        rectangle, RegionLevel.COUNTRY, min_zoom=12, max_zoom=12
+        bounds_region, RegionLevel.COUNTRY, min_zoom=12, max_zoom=12
     )
     assert plan.used_recommended_zoom is False
     assert (plan.estimated_min_zoom, plan.estimated_max_zoom) == (12, 12)
     assert plan.recommendation.warning is True
-    expected = RegionTileEstimator(rectangle).estimate(12, 12)
+    expected = RegionTileEstimator(bounds_region).estimate(12, 12)
     assert plan.selected_tiles == expected.selected_tiles
 
 
 def test_estimate_rejects_a_reversed_user_range(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     """``18 ~ 8`` 是非法输入：**炸**，不要顺手调成 8~18。
 
@@ -390,7 +397,7 @@ def test_estimate_rejects_a_reversed_user_range(
     """
     with pytest.raises(ValueError, match="min_zoom"):
         service.recommend_with_estimate(
-            rectangle, RegionLevel.COUNTRY, min_zoom=18, max_zoom=8
+            bounds_region, RegionLevel.COUNTRY, min_zoom=18, max_zoom=8
         )
 
 
@@ -410,10 +417,10 @@ def test_estimate_on_a_polygon_uses_the_real_geometry(
 
 
 def test_estimate_lines_show_recommendation_tiles_and_size(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     low, high = _policy_range(RegionLevel.COUNTRY)
-    plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
+    plan = service.recommend_with_estimate(bounds_region, RegionLevel.COUNTRY)
     lines = plan.as_lines()
     assert lines[0] == f"推荐 Zoom：Z{low}~{high}"
     assert f"{PLAN_TILES_LABEL}{plan.selected_tiles:,}" in lines
@@ -421,36 +428,36 @@ def test_estimate_lines_show_recommendation_tiles_and_size(
 
 
 def test_estimate_uses_the_given_average_tile_size(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     plan = service.recommend_with_estimate(
-        rectangle, RegionLevel.COUNTRY, average_tile_size=1024
+        bounds_region, RegionLevel.COUNTRY, average_tile_size=1024
     )
     assert plan.average_tile_size == 1024
     assert plan.size_text == format_size(plan.selected_tiles * 1024)
 
 
 def test_estimate_requires_both_zoom_bounds(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     with pytest.raises(ValueError, match="同时给出"):
-        service.recommend_with_estimate(rectangle, RegionLevel.CITY, min_zoom=12)
+        service.recommend_with_estimate(bounds_region, RegionLevel.CITY, min_zoom=12)
     with pytest.raises(ValueError, match="同时给出"):
-        service.recommend_with_estimate(rectangle, RegionLevel.CITY, max_zoom=16)
+        service.recommend_with_estimate(bounds_region, RegionLevel.CITY, max_zoom=16)
 
 
 def test_estimate_rejects_a_non_region(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     with pytest.raises(ValueError, match="DownloadRegion"):
         service.recommend_with_estimate(block_bounds(), RegionLevel.CITY)  # type: ignore[arg-type]
 
 
 def test_estimate_rejects_an_inconsistent_zoom_detail(
-    service: ZoomStrategyService, rectangle: DownloadRegion
+    service: ZoomStrategyService, bounds_region: DownloadRegion
 ) -> None:
     """明细区间与自报区间对不上时必须炸 —— 那种对象会静默算出错的容量。"""
-    plan = service.recommend_with_estimate(rectangle, RegionLevel.COUNTRY)
+    plan = service.recommend_with_estimate(bounds_region, RegionLevel.COUNTRY)
     with pytest.raises(ValueError, match="预估明细"):
         ZoomPlanEstimate(
             recommendation=plan.recommendation,

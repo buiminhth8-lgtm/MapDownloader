@@ -19,7 +19,7 @@ import httpx  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from app.downloader import RateLimiter, ResumePolicy, RetryPolicy, iter_tile_coordinates  # noqa: E402
-from app.geo import GeoBounds, xyz_y_to_tms_y  # noqa: E402
+from app.geo import DownloadRegion, GeoBounds, RegionType, xyz_y_to_tms_y  # noqa: E402
 from app.mbtiles import MBTilesReader  # noqa: E402
 from app.models import DownloadTaskStatus, MapLayerType  # noqa: E402
 from app.providers import PNG_SIGNATURE, TiandituProvider  # noqa: E402
@@ -65,6 +65,56 @@ def service_for(server, **kwargs):
     )
 
 
+def region_for(bounds, directory):
+    """造一块**恰好等于 ``bounds``** 的行政区域，并挂进动态解析表。
+
+    任务记录只落盘 ``region_type`` / ``region_id``，续传时按 id 找回边界文件。
+    矩形下载已删除，验证脚本因此要自己提供那块地 —— 写一份与 ``bounds`` 完全
+    一致的矩形 GeoJSON，后续下载 / 修复 / 诊断的链路与生产完全一致。
+    """
+    import json
+
+    from app.geo import region as region_module
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    region_id = "repair-acceptance"
+    path = directory / f"{region_id}.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "Feature",
+                "properties": {"name": "修复验收区", "id": region_id},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [bounds.west, bounds.south],
+                            [bounds.east, bounds.south],
+                            [bounds.east, bounds.north],
+                            [bounds.west, bounds.north],
+                            [bounds.west, bounds.south],
+                        ]
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    region = DownloadRegion(
+        region_type=RegionType.POLYGON,
+        name="修复验收区",
+        bounds=bounds,
+        region_id=region_id,
+        geojson_path=str(path),
+    )
+    region_module.register_region_resolver(
+        lambda wanted, _bounds: (region, "") if wanted == region_id else None
+    )
+    return region
+
+
 def overwrite_tile(path, key, content):
     z, x, y = key
     with closing(sqlite3.connect(path)) as connection, connection:
@@ -80,6 +130,7 @@ async def seed(work_dir, server=None):
     task = tasks.create_task(
         name="repair-acceptance", bounds=BOUNDS, min_zoom=ZOOM, max_zoom=ZOOM,
         map_layer=MapLayerType.VECTOR, output_path=work_dir / "map.mbtiles",
+        region=region_for(BOUNDS, Path(work_dir) / "region_geojson"),
     )
     service = service_for(server)
     outcome = await service.resume_task(task, task_service=tasks)

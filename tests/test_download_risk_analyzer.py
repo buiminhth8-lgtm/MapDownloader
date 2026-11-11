@@ -171,7 +171,7 @@ def test_the_size_dimension_can_raise_the_level(
 
     huge = RegionTileEstimate(
         region_name="容量怪物",
-        region_type=RegionType.RECTANGLE,
+        region_type=RegionType.POLYGON,
         candidate_tiles=50_000,
         selected_tiles=50_000,
         filtered_tiles=0,
@@ -333,16 +333,20 @@ def test_custom_level_has_no_recommendation_but_still_gets_graded(
 def test_the_analyzer_is_geometry_agnostic(
     analyzer: DownloadRiskAnalyzer,
 ) -> None:
-    """矩形与多边形走同一条分析路径（Spec §19）。"""
+    """区域类型只影响展示，不影响结论（Spec §19）。
+
+    自定义矩形删除之后只剩"行政区域"与"多级覆盖"两种，它们的外包矩形与几何
+    完全可能不同；只要张数一样，风险等级与总量就必须一样。
+    """
     counts = {9: 400_000}
-    rectangle = analyzer.analyze(
-        RegionLevel.PROVINCE, 9, 9, _estimate(counts, region_type=RegionType.RECTANGLE)
-    )
     polygon = analyzer.analyze(
         RegionLevel.PROVINCE, 9, 9, _estimate(counts, region_type=RegionType.POLYGON)
     )
-    assert rectangle.level is polygon.level
-    assert rectangle.total_tiles == polygon.total_tiles
+    coverage = analyzer.analyze(
+        RegionLevel.PROVINCE, 9, 9, _estimate(counts, region_type=RegionType.COVERAGE)
+    )
+    assert coverage.level is polygon.level
+    assert coverage.total_tiles == polygon.total_tiles
 
 
 # --------------------------------------------------------------------------- #

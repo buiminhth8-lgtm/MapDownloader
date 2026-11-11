@@ -4,11 +4,8 @@
 
 1. **分级正确**：候选 / 选中 / 过滤三个数必须自洽（``候选 - 选中 = 过滤``），
    且逐级明细加起来等于总数；
-2. **矩形零变化**：矩形任务的每个数字都要与 Slice 0~15 逐位一致
-   （``selected == candidate``、不出现候选/过滤那几行）。
-
-第 2 条不是"顺便兼容一下"，而是 Spec §7 的验收项：矩形是既有用户的主力用法，
-它一旦多出"过滤 0 张"这种行、或者数字变了，都算破坏性变更。
+2. **按选中数计价**：容量与请求量一律以 ``selected`` 为准，不许拿候选数充数
+   （自定义矩形移除后，所有区域都要过几何过滤）。
 """
 
 from __future__ import annotations
@@ -26,10 +23,8 @@ from app.geo import (
     RegionType,
     ZoomRegionStats,
     build_region_filter,
-    calculate_tile_range,
     estimate_region_tiles,
     estimate_size_bytes,
-    estimate_tile_count,
     format_size,
 )
 
@@ -50,49 +45,6 @@ def polygon_region(name: str = "测试方框", path: str = SQUARE) -> DownloadRe
         region_id="test-square",
         geojson_path=path,
     )
-
-
-# --------------------------------------------------------------------------- #
-# 矩形：与 Slice ≤15 逐位一致
-# --------------------------------------------------------------------------- #
-def test_rectangle_selected_equals_candidate() -> None:
-    region = DownloadRegion.rectangle("自定义矩形", ENVELOPE)
-    estimate = RegionTileEstimator(region).estimate(8, 12)
-
-    assert estimate.region_type is RegionType.RECTANGLE
-    assert estimate.is_polygon is False
-    # 逐位等于老公式算出来的数 —— 不是"差不多"
-    assert estimate.candidate_tiles == estimate_tile_count(ENVELOPE, 8, 12)
-    assert estimate.selected_tiles == estimate.candidate_tiles
-    assert estimate.filtered_tiles == 0
-    assert estimate.filtered_percent == 0.0
-
-
-def test_rectangle_per_zoom_matches_calculate_tile_range() -> None:
-    region = DownloadRegion.rectangle("自定义矩形", ENVELOPE)
-    estimate = RegionTileEstimator(region).estimate(6, 12)
-
-    assert [item.zoom for item in estimate.per_zoom] == list(range(6, 13))
-    for item in estimate.per_zoom:
-        expected = calculate_tile_range(ENVELOPE, item.zoom).tile_count
-        assert item.candidate_tiles == expected
-        assert item.selected_tiles == expected
-        assert item.filtered_tiles == 0
-
-
-def test_rectangle_does_not_build_a_region_filter() -> None:
-    """矩形路径**不构造过滤器**（因此不会去碰 shapely、更不会读边界文件）。
-
-    ``DownloadRegion.rectangle()`` 根本没有 ``geojson_path``；一旦有人给矩形
-    也挂上过滤器，Spec §7 "矩形行为逐位一致"的保证就没了 —— 数字也许还对，
-    但一条本该与几何库无关的链路被拖进了几何依赖。
-    """
-    region = DownloadRegion.rectangle("自定义矩形", ENVELOPE)
-    estimator = RegionTileEstimator(region)
-
-    assert region.geojson_path is None
-    assert estimator.region_filter is None
-    assert estimator.estimate(10, 10).selected_tiles > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -234,30 +186,6 @@ def test_filtered_percent_text_is_one_decimal() -> None:
 # --------------------------------------------------------------------------- #
 # 展示文案
 # --------------------------------------------------------------------------- #
-def test_rectangle_lines_look_like_slice_15() -> None:
-    """矩形**不出现**属于多边形的那几行汇总（区域 / 候选 / 区域内 / 过滤 / 比例）。
-
-    对矩形而言它们恒等于"候选 = 选中、过滤 = 0"，是纯噪音；而且会让
-    Slice ≤15 的消息式验收（"结果区就那几行"）失效。
-
-    逐 Zoom 明细是**两种模式共有**的行（Slice 1 起日志里就有"各级瓦片数"），
-    所以这里只按**行首标记**判断，不对 "过滤" 这个词做全局否定 —— 那样会把
-    共有的明细行一起否掉。
-    """
-    estimate = RegionTileEstimator(DownloadRegion.rectangle("自定义矩形", ENVELOPE)).estimate(
-        8, 10
-    )
-
-    lines = estimate.as_lines()
-
-    assert lines[0] == "区域：自定义矩形"
-    assert "预计瓦片：74" in lines or any(line.startswith("预计瓦片：") for line in lines)
-    for marker in ("候选瓦片：", "区域内瓦片：", "过滤瓦片：", "过滤比例："):
-        assert not any(line.startswith(marker) for line in lines), marker
-    # 逐 Zoom 明细照旧（矩形也有）
-    assert any(line.startswith("  z10") for line in lines)
-
-
 def test_polygon_lines_show_candidate_selected_filtered_and_zoom_detail() -> None:
     """Spec §17：五件事一个都不能少（区域 / 候选 / 区域内 / 过滤 / 比例）。"""
     estimate = RegionTileEstimator(polygon_region()).estimate(10, 12)
@@ -303,12 +231,12 @@ def test_lines_report_the_merged_request_count() -> None:
 # --------------------------------------------------------------------------- #
 def test_min_zoom_greater_than_max_zoom_is_rejected() -> None:
     with pytest.raises(ValueError, match="min_zoom 不能大于 max_zoom"):
-        RegionTileEstimator(DownloadRegion.rectangle("x", ENVELOPE)).estimate(12, 8)
+        RegionTileEstimator(polygon_region("x")).estimate(12, 8)
 
 
 @pytest.mark.parametrize("zoom", [-1, 23])
 def test_out_of_range_zoom_is_rejected(zoom: int) -> None:
-    estimator = RegionTileEstimator(DownloadRegion.rectangle("x", ENVELOPE))
+    estimator = RegionTileEstimator(polygon_region("x"))
 
     with pytest.raises(ValueError):
         estimator.estimate(zoom, 10)

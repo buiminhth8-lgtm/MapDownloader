@@ -9,7 +9,7 @@ import pytest
 from PIL import Image
 from scripts.verify_storage_optimization import run_checks, seed_source
 
-from app.geo import DownloadRegion, GeoBounds
+from app.geo import GeoBounds
 from app.mbtiles import MBTilesReader, MBTilesWriter
 from app.models import DownloadTask, MapType
 from app.services import mbtiles_optimizer as module
@@ -23,6 +23,7 @@ from app.services.mbtiles_optimizer import (
     prepare_export,
     verify_osmdroid_reads,
 )
+from tests.region_helpers import rect_region, register_for_resume
 
 
 @pytest.fixture
@@ -210,7 +211,11 @@ def test_exported_files_are_readable_but_protected_against_writer(source,dedupli
 async def test_resume_does_not_write_to_readonly_optimized_artifact(source):
     _,_,path=optimized(source)
     before=path.read_bytes()
-    task=DownloadTask(name='export',output_path=path,west=116,south=39,east=117,north=40,map_layer='vec_w')
+    # 记录里必须带区域：续传先按 region_id 找回边界文件，再检查目标文件。
+    # 这条用例要守的是"只读产物不许被改写"，region 只是必经的第一步。
+    region=register_for_resume(rect_region('测试区域',GeoBounds(116,39,117,40),path.parent/'region_geojson'))
+    task=DownloadTask(name='export',output_path=path,west=116,south=39,east=117,north=40,map_layer='vec_w',
+                      region_type=region.region_type.value,region_id=region.region_id)
     with pytest.raises(MapResumeError,match='只读'):
         await MapDownloadService().resume_task(task,'offline-token')
     assert path.read_bytes()==before
@@ -224,8 +229,8 @@ def test_dangling_normalized_images_are_not_hidden_by_tiles_join(source):
     assert not result.valid and any('引用' in text for text in result.errors)
 
 
-def test_region_export_is_clipped_to_source_high_zoom_coverage(source):
-    requested=DownloadRegion.rectangle('large-request',GeoBounds(115,38,118,42))
+def test_region_export_is_clipped_to_source_high_zoom_coverage(source, tmp_path):
+    requested=rect_region('large-request',GeoBounds(115,38,118,42),tmp_path)
     _,report,path=optimized(source,targets=[ExportTarget('high-only',requested,12,12)])
     with MBTilesReader(source) as a,MBTilesReader(path) as b:
         expected={coord for coord in a.iter_tile_coordinates() if coord[0]==12}
@@ -233,8 +238,8 @@ def test_region_export_is_clipped_to_source_high_zoom_coverage(source):
     assert report['outputs'][0]['tiles']==len(expected)
 
 
-def test_outside_region_does_not_fabricate_empty_package(source):
-    requested=DownloadRegion.rectangle('outside',GeoBounds(100,20,101,21))
+def test_outside_region_does_not_fabricate_empty_package(source, tmp_path):
+    requested=rect_region('outside',GeoBounds(100,20,101,21),tmp_path)
     with pytest.raises(ValueError,match='没有面积'):
         plan_for(source,targets=[ExportTarget('outside',requested,8,12)])
 
@@ -268,7 +273,7 @@ def test_no_savings_is_reported_honestly_when_duplicate_storage_is_disabled(sour
     assert len(report['outputs'])==3 and plan.destination.exists()
 
 
-def test_unavailable_legacy_boundary_can_only_be_copied_whole(source):
+def test_unavailable_legacy_boundary_can_only_be_copied_whole(source, tmp_path):
     with closing(sqlite3.connect(source)) as db,db:
         db.execute("UPDATE metadata SET value='polygon' WHERE name='region_type'")
         db.execute("UPDATE metadata SET value='unknown-region' WHERE name='region_id'")
@@ -276,7 +281,7 @@ def test_unavailable_legacy_boundary_can_only_be_copied_whole(source):
     _,report,path=optimized(source)
     assert any('无法冻结' in w for w in report['warnings'])
     assert verify_osmdroid_reads(path)==report['sourceTiles']
-    requested=DownloadRegion.rectangle('clip',GeoBounds(116,39,117,40))
+    requested=rect_region('clip',GeoBounds(116,39,117,40),tmp_path)
     with pytest.raises(ValueError):
         plan_for(source,destination=source.parent/'split',targets=[ExportTarget('clip',requested,8,12)])
 
@@ -328,12 +333,12 @@ def test_osmdroid_validation_rejects_payload_format_metadata_mismatch(source):
         verify_osmdroid_reads(path)
 
 
-def test_regional_export_keeps_requested_level_for_android_selection(source):
+def test_regional_export_keeps_requested_level_for_android_selection(source, tmp_path):
     from dataclasses import replace
 
     from app.geo.zoom_coverage import decode_coverage
     from app.planning.region_level import RegionLevel
-    requested=replace(DownloadRegion.rectangle('province',GeoBounds(115,38,118,42)),region_level=RegionLevel.parse('province'))
+    requested=replace(rect_region('province',GeoBounds(115,38,118,42),tmp_path),region_level=RegionLevel.parse('province'))
     _,_,path=optimized(source,targets=[ExportTarget('province',requested,12,12)])
     with MBTilesReader(path) as reader:
         metadata=reader.get_metadata()

@@ -4,6 +4,10 @@
 
 先给结论，再给证据，最后给取舍。证据全部来自代码与实测产物，不引用 README 的功能描述。
 
+> **落地状态**：本文的架构已是活代码 `app/tilerepo/`（能存、能读、能自检；**还没**接下载与导出）。
+> 想直接用它看 [tile_repository_usage](tile_repository_usage.md)；
+> 本文设计与实做的差异见 §13。§3 的证据表写的是**设计前**的代码状态，仍然有效。
+
 ---
 
 ## 0. 阅读前提
@@ -703,10 +707,39 @@ provider(z,x,y XYZ) → 仓库 coords(z,x,y XYZ)
 
 ---
 
-## 13. 相关文档
+## 13. 落地状态（Slice 42 已实做）
+
+§5~§7 的架构已成活代码。**本节只记"设计与实做不同"的地方** —— 逐条对照（10 条）与原因、
+以及版本号、恢复步骤、容量口径，都在 [tile_repository_usage](tile_repository_usage.md) §12，
+不在这里复述第二遍（两份文档写同一件事，迟早有一份是错的）。
+
+| 设计（本文） | 实做 | 一句话原因 |
+| --- | --- | --- |
+| catalog 与分片各一层文件租约（§7.3） | 只有分片有租约，catalog 用 SQLite 写者锁 + `busy_timeout` | 两把锁必然出现"谁先谁后"的新故障模式，写者锁本身已跨进程互斥 |
+| 可见性靠"catalog 登记了什么"（§7.2） | 新增 `shards.published_epoch` 发布水位，未发布行是显式 `UNPUBLISHED` | 推断出来的状态既不能测，也没法在报告里说清 |
+| 版本 = current + `superseded`（§7.1） | 同前，但明确**只保留一代**历史 | 主键 `(z,x,y,state)` 决定；多代要改主键，代价已写进 usage §2.1 |
+| 快照 payload 直接哈希全部 entries（契约 §1.5） | payload 只含 `entriesDigest`（逐条 JSON 行的哈希） | 百万级 entries 读进内存算摘要 = 导出前先 OOM；"同数据同指纹"语义不变 |
+| 租约"90 秒无心跳可接管"（§7.3） | 另加"持有者进程已死则立即接管" | 崩溃的用户不该白等 90 秒 |
+| `verify_asset` 断言式接口（契约 §5.8） | `health_check(scope)` + `read_tile(verify=True)` | 只读诊断要一次报全，不能遇错即抛 |
+
+**两条不在本文设计范围内、但实现时必须先解决的本机事实**（会误导后来者，所以写进架构层）：
+
+1. Windows 上 `-wal`/`-shm` 的清理竞态会让写入偶发
+   `sqlite3.OperationalError: attempt to write a readonly database`（本机压测 6/300，
+   留一个空闲常驻连接后 0/300）—— 所以 `Catalog` 与每个分片各留一个不做查询的常驻连接。
+2. `os.kill(pid, 0)` 在 Windows 上会被 CPython 映射成 `TerminateProcess`，**真的会杀掉别的写入者**；
+   判活必须走 `OpenProcess` + `GetExitCodeProcess`（实现在 `shard._pid_alive`）。
+
+**未变的部分**（与 §6/§7 一致，不再重复）：分片路径规则与 band 表、三张表 + `WITHOUT ROWID`、
+去重范围 = 单个分片内、XYZ 只翻转一次（翻转在导入侧）、依赖方向禁止 `app.tilerepo` 触达 UI。
+
+---
+
+## 14. 相关文档
 
 - 字段级契约、接口草案、预算与打包契约：[tile_repository_contracts](tile_repository_contracts.md)
 - Slice 42~49 实施计划与验收矩阵：[tile_repository_roadmap](tile_repository_roadmap.md)
+- **实际能跑什么、坏了怎么修**（落地补充）：[tile_repository_usage](tile_repository_usage.md)
 - 现有打包与跨端字段：[map_package_v1](map_package_v1.md)
 - 现有压缩/去重/分包：[storage_optimization](storage_optimization.md)
 - 现有混合 Zoom 覆盖：[zoom_coverage](zoom_coverage.md)

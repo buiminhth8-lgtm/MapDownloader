@@ -35,6 +35,7 @@ Lazy load（Spec §5）
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,22 @@ def region_resource_root() -> Path:
     return Path(region_module.REGION_RESOURCE_DIR)
 
 
+#: "生成数据集是否可以顶上"的判定缓存：``生成目录 → (index.json 的
+#: (mtime_ns, size), 判定结果)``。
+#:
+#: 为什么必须有这一层：确认"发布的那份数据真的能读"要**完整解析一遍**
+#: index.json（实测 1.19 MB / 3,253 条 = **74 ms**），而下面对它的调用极其密集 ——
+#: :attr:`RegionService.root` 每次访问都会走到这里，``boundary_available()``
+#: 又要访问 catalog 两遍。于是"在下载面板里点一下省份"（列 11 个市 + 90 个县，
+#: 逐个问边界在不在）实测阻塞主线程 **9~11 秒**，用户看到的就是程序卡死。
+#:
+#: 缓存键取 ``(mtime_ns, size)`` 而不是"只按路径缓存"：导入管线发布的就是这个
+#: 文件，重新发布必然改动 mtime/size，于是"导入后不重启也能看到新数据"
+#: （Spec §17）一个字都没丢；而"同一份文件"不必反反复复解析。
+_ROOT_CACHE: dict[Path, tuple[tuple[int, int], Path]] = {}
+_ROOT_CACHE_LOCK = threading.Lock()
+
+
 def effective_region_root() -> Path:
     """当前生效的行政区数据根目录（Slice 26，Spec §16 / §17）。
 
@@ -107,6 +124,12 @@ def effective_region_root() -> Path:
     :class:`~app.regions.service.RegionService` 的 ``prefer_generated``），
     默认路径的行为与 Slice 18 逐字节一致。
 
+    **本函数按 index.json 的 ``(mtime_ns, size)`` 缓存判定结果**。这不是可选
+    优化：旧实现在这里无条件 ``RegionCatalog.load``，一次 74 ms，而
+    :attr:`RegionService.root` 每次访问都会调它 —— 下载面板填一次"市 / 县"
+    下拉要问上百次"边界在不在"，界面因此冻住 10 秒。缓存后同一份数据的判定
+    只付一次，重新发布（mtime/size 变）立刻生效，Spec §17 的语义不变。
+
     **隔离时要注意两个常量是分开的**：本函数读
     :data:`app.config.settings.REGION_DATA_ROOT`，而
     :func:`region_resource_root` 读 ``app.geo.region.REGION_RESOURCE_DIR``
@@ -117,18 +140,33 @@ def effective_region_root() -> Path:
     from app.config import settings as settings_module
 
     generated = Path(settings_module.REGION_DATA_ROOT)
-    index = generated / INDEX_FILENAME
-    if index.is_file():
-        # 光有 index.json 还不够：发布是原子的，正常不会留下坏文件，但
-        # 目录可能被外部弄坏（手删、半截写入）。"文件在但读不出"时不能算
-        # "已发布"，否则用户会从上一份能用的数据退化成扁平内置预设
-        # （Spec §17"Reload 失败时继续保留旧 Catalog"）。
-        try:
-            RegionCatalog.load(root=generated)
-        except RegionCatalogError:
-            return region_resource_root()
-        return generated
-    return region_resource_root()
+    stamp = _stat_stamp(generated / INDEX_FILENAME)
+    if stamp is None:
+        # 没有 index.json = 没发布（或刚被删掉）→ 手工目录。这条不进缓存：
+        # 一次 stat 只要 0.01 ms，而"发布"随时可能发生 —— 缓存"没有"
+        # 会让用户放好数据后还得重启一次。
+        return region_resource_root()
+
+    with _ROOT_CACHE_LOCK:
+        cached = _ROOT_CACHE.get(generated)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
+    # 光有 index.json 还不够：发布是原子的，正常不会留下坏文件，但
+    # 目录可能被外部弄坏（手删、半截写入）。"文件在但读不出"时不能算
+    # "已发布"，否则用户会从上一份能用的数据退化成扁平内置预设
+    # （Spec §17"Reload 失败时继续保留旧 Catalog"）。
+    # 坏文件的结论**同样缓存**：同一份读不出来的数据不必每次都重试 74 ms。
+    try:
+        RegionCatalog.load(root=generated)
+    except RegionCatalogError:
+        resolved = region_resource_root()
+    else:
+        resolved = generated
+
+    with _ROOT_CACHE_LOCK:
+        _ROOT_CACHE[generated] = (stamp, resolved)
+    return resolved
 
 
 # --------------------------------------------------------------------------- #

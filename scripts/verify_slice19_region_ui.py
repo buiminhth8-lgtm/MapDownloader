@@ -261,24 +261,16 @@ def scene_cascade(app, window, checker: Checker, shots: bool) -> None:
     province = panel.province_combo
     city = panel.city_combo
 
-    # --- 初始是矩形：三段下拉都该是隐藏的 ---
+    # --- 下拉一开始就在：下载范围只剩行政区域，没有"先切模式"这一步 ---
     checker.check(
-        panel.current_region_type() is RegionType.RECTANGLE,
-        "冷启动仍然是自定义矩形（Slice ≤18 的默认行为不变）",
+        panel.current_region_type() is RegionType.POLYGON,
+        "区域类型恒为「行政区域」（自定义矩形已删除）",
         panel.current_region_type().value,
     )
-    checker.check(
-        all(combo.isHidden() for combo in (country, province, city)),
-        "矩形模式下三段下拉收起（行政区域那一块整体不可见）",
-        str([combo.isHidden() for combo in (country, province, city)]),
-    )
-
-    panel.set_region_type(RegionType.POLYGON)
     _pump(app)
-
     checker.check(
         not any(combo.isHidden() for combo in (country, province, city)),
-        "切到「行政区域」后三段下拉都露出来了",
+        "三段下拉一开始就露出来（不必先切模式）",
         str([combo.isHidden() for combo in (country, province, city)]),
     )
     country_texts = _texts(country)
@@ -421,7 +413,6 @@ def scene_cascade(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 def scene_recommended_zoom(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 B：推荐 Zoom 随等级自动填值（真窗口）")
-    from app.geo import RegionType
     from app.planning import RegionLevel, ZoomStrategyService
     from app.ui.region_selection import ZoomMode
 
@@ -429,8 +420,6 @@ def scene_recommended_zoom(app, window, checker: Checker, shots: bool) -> None:
     strategy = ZoomStrategyService()
     recommended, custom = panel.zoom_mode_buttons
 
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
     panel.country_combo.setCurrentIndex(0)
     _pump(app)
 
@@ -523,22 +512,23 @@ def scene_recommended_zoom(app, window, checker: Checker, shots: bool) -> None:
         f"min={min_spin.isReadOnly()}",
     )
 
-    # --- 矩形模式下不许强制策略 ---
-    panel.set_region_type(RegionType.RECTANGLE)
+    # --- 换一块区域：推荐值跟着新等级重算（不是"出厂时填一次"） ---
+    before_text = panel.zoom_range_text()
+    panel.province_combo.setCurrentIndex(1)
     _pump(app)
-    rect_before = panel.zoom_range_text()
+    panel.city_combo.setCurrentIndex(1)
+    _pump(app)
+    recomputed = strategy.recommend(RegionLevel.CITY)
     checker.check(
-        panel.zoom_range_text() == rect_before,
-        "矩形模式下「推荐 Zoom」不干预 Zoom（CUSTOM 等级没有建议值可言）",
-        rect_before,
+        panel.zoom_range_text() == f"{recomputed.min_zoom} ~ {recomputed.max_zoom}",
+        "换到市级区域后推荐值按该等级重新算一次",
+        f"{before_text} → {panel.zoom_range_text()}",
     )
     checker.check(
-        panel.zoom_policy_text == "" and panel.zoom_explain_text == "",
-        "矩形模式下建议行与推荐说明都收起（不显示一行恒定的噪音）",
+        panel.zoom_policy_text != "" ,
+        "建议行仍然在（等级一直来自目录条目，不依赖边界文件）",
         repr(panel.zoom_policy_text),
     )
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
 
 
 # --------------------------------------------------------------------------- #
@@ -546,12 +536,9 @@ def scene_recommended_zoom(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 def scene_zoom_warning(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 C：自定义 Zoom 超范围只警告，不阻塞也不改值")
-    from app.geo import RegionType
     from app.ui.download_panel import ACTION_CALCULATE, ACTION_START
 
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
     panel.province_combo.setCurrentIndex(1)
     _pump(app)
     panel.city_combo.setCurrentIndex(1)  # 河城 → CITY，建议 Z12~15
@@ -612,12 +599,10 @@ def scene_zoom_warning(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 def scene_polygon_estimate(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 D：范围来自 GeoJSON、估算与 Zoom 明细（真点「计算」）")
-    from app.geo import RegionType, geometry_to_bounds
+    from app.geo import geometry_to_bounds
     from app.ui.download_panel import ACTION_CALCULATE
 
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
     panel.province_combo.setCurrentIndex(1)
     _pump(app)
     panel.city_combo.setCurrentIndex(1)  # 河城
@@ -630,7 +615,7 @@ def scene_polygon_estimate(app, window, checker: Checker, shots: bool) -> None:
     checker.check(
         (data["west"], data["south"], data["east"], data["north"])
         == (bounds.west, bounds.south, bounds.east, bounds.north),
-        "四个范围框是按 GeoJSON 的 geometry 回填的（不是默认矩形）",
+        "表单里的范围是按 GeoJSON 的 geometry 算出来的",
         f"{data['west']},{data['south']},{data['east']},{data['north']}",
     )
     checker.check(
@@ -640,9 +625,9 @@ def scene_polygon_estimate(app, window, checker: Checker, shots: bool) -> None:
         f"{bounds.west},{bounds.south},{bounds.east},{bounds.north}",
     )
     checker.check(
-        all(spin.isReadOnly() for spin in panel.bounds_spins),
-        "行政区域模式下经纬度只读（手改会让「显示的范围」与「裁剪依据」对不上）",
-        str([spin.isReadOnly() for spin in panel.bounds_spins]),
+        not hasattr(panel, "bounds_spins") and not hasattr(panel, "_west_spin"),
+        "面板上没有可编辑的经纬度框（范围只从边界文件来，手改会让"
+        "「显示的范围」与「裁剪依据」对不上）",
     )
 
     # --- 真的点一次「计算」（Zoom 收窄到 12~13：验链路，不是验算力）---
@@ -697,13 +682,10 @@ def scene_polygon_estimate(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 def scene_missing_boundary(app, window, checker: Checker) -> None:
     checker.section("场景 E：缺边界文件 / 目录不可用（不许崩，要给得出人话）")
-    from app.geo import RegionType
     from app.planning import RegionLevel
     from app.ui.download_panel import ACTION_CALCULATE
 
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
 
     dry_index = _texts(panel.province_combo).index("旱省（边界文件未就绪）")
     panel.province_combo.setCurrentIndex(dry_index)
@@ -752,8 +734,6 @@ def scene_preferences_roundtrip(app, checker: Checker, make_window, preferences)
     # --- 造一个有内容的界面状态，然后**关窗**（走 closeEvent → _save_preferences）---
     window = make_window(preferences)
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
     panel.province_combo.setCurrentIndex(1)
     _pump(app)
     panel.city_combo.setCurrentIndex(1)  # 河城
@@ -831,7 +811,7 @@ def scene_preferences_roundtrip(app, checker: Checker, make_window, preferences)
         f"{window.download_panel.current_region_id()}",
     )
 
-    # --- 全脏：落回矩形 ---
+    # --- 全脏：保持默认区域（不再有"落回矩形"这条路） ---
     window._exit_confirmed = True
     window.close()
     _pump(app)
@@ -846,13 +826,15 @@ def scene_preferences_roundtrip(app, checker: Checker, make_window, preferences)
     window = make_window(preferences)
     _pump(app, 12)
     checker.check(
-        window.download_panel.current_region_type() is RegionType.RECTANGLE,
-        "三段 id 全都认不出来 → 安全落回自定义矩形（不许卡在一个空的多边形模式上）",
-        window.download_panel.current_region_type().value,
+        window.download_panel.current_region_type() is RegionType.POLYGON
+        and window.download_panel.current_region_id() == "demoland",
+        "三段 id 全都认不出来 → 保持默认区域（自定义矩形那条兜底已删除）",
+        f"{window.download_panel.current_region_type().value} / "
+        f"{window.download_panel.current_region_id()}",
     )
     checker.check(
         window.download_panel.zoom_range_text() == expected_zoom,
-        "回退到矩形时，上次的 Zoom 值没有被丢掉",
+        "保持默认区域时，上次的 Zoom 值没有被丢掉",
         window.download_panel.zoom_range_text(),
     )
     window._exit_confirmed = True

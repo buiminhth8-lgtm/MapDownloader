@@ -24,6 +24,26 @@ def until(qapp, condition, timeout=5):
     pytest.fail("容量预测界面没有在时限内完成")
 
 
+def start(window, qapp):
+    """点「开始下载」，并等**后台区域估算**跑完。
+
+    下载范围只剩行政区域之后，估算一律在后台线程里做（``_start_download``
+    会先 ``_begin_region_estimate``），所以「点完立刻断言弹窗/回调」不再成立：
+    必须先让事件循环把估算收尾，预算检查才会被触发。
+    """
+    window._start_download()
+    until(qapp, lambda: window._estimate_worker is None)
+    for _ in range(4):
+        qapp.processEvents()
+
+
+def budget_dialog(window, qapp):
+    """开始下载并等到容量预测弹窗出现（弹窗在估算收尾后才建）。"""
+    start(window, qapp)
+    until(qapp, lambda: window._storage_budget_dialog is not None)
+    return window._storage_budget_dialog
+
+
 @pytest.fixture
 def window(qapp, tasks_file, preferences, region_resources, work_dir):
     win = MainWindow(task_service=TaskService(TaskStore(tasks_file)), preferences=preferences)
@@ -32,8 +52,9 @@ def window(qapp, tasks_file, preferences, region_resources, work_dir):
     panel.set_zoom_range(12, 12)
     panel.map_name_edit.setText("budget-map")
     panel._token_edit.setText("offline-test-token")
-    for spin, value in zip(panel.bounds_spins, (116.2, 39.7, 116.3, 39.8), strict=True):
-        spin.setValue(value)
+    # 下载范围只剩行政区域：选一块小区域（1°×1° 的示例河市），
+    # 让后台估算在用例时限内收敛，同时保留"真的有瓦片要下"的前提。
+    panel.set_region_id("rivertown")
     yield win
     win._exit_confirmed = True
     win.close()
@@ -61,7 +82,7 @@ def test_manual_prediction_needs_no_token_and_runs_in_worker(window, qapp):
 def test_single_start_checks_budget_before_network_and_risk(window, qapp, monkeypatch):
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
+    start(window, qapp)
     assert window._download_worker is None
     until(qapp, lambda: bool(reached))
     assert reached[0].budget_checked
@@ -75,8 +96,7 @@ def test_over_budget_waits_for_explicit_continue(window, qapp, monkeypatch):
     window.download_panel.set_zoom_range(16, 16)
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
-    dialog = window._storage_budget_dialog
+    dialog = budget_dialog(window, qapp)
     until(qapp, lambda: dialog.worker is None)
     assert dialog.report.over_budget and dialog.guarding
     assert reached == [] and window._download_worker is None
@@ -90,8 +110,7 @@ def test_insufficient_disk_disables_continue_and_slot_rechecks(window, qapp, mon
                         assess_budget(requests, settings, disk_probe=lambda p: ("disk", 0), **kwargs))
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
-    dialog = window._storage_budget_dialog
+    dialog = budget_dialog(window, qapp)
     until(qapp, lambda: dialog.worker is None)
     assert not dialog.continue_button.isEnabled()
     dialog._approve()
@@ -103,8 +122,7 @@ def test_form_changes_invalidate_pending_prediction(window, qapp, monkeypatch):
     window.download_panel.set_zoom_range(16, 16)
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
-    dialog = window._storage_budget_dialog
+    dialog = budget_dialog(window, qapp)
     until(qapp, lambda: dialog.worker is None)
     window.download_panel.set_map_name("changed-after-prediction")
     dialog.continue_button.click()
@@ -117,8 +135,7 @@ def test_user_can_apply_zoom_advice_without_downloading_or_removing_files(window
     window.download_panel.set_zoom_range(15, 16)
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
-    dialog = window._storage_budget_dialog
+    dialog = budget_dialog(window, qapp)
     until(qapp, lambda: dialog.worker is None)
     assert dialog.report.over_budget and dialog.apply_button.isEnabled()
     dialog.apply_button.click()
@@ -139,8 +156,7 @@ def test_cancel_stops_background_prediction_and_releases_shared_download_channel
         raise BudgetCancelled()
 
     monkeypatch.setattr(budget_ui, "assess_budget", slow)
-    window._start_download()
-    dialog = window._storage_budget_dialog
+    dialog = budget_dialog(window, qapp)
     until(qapp, started.is_set)
     assert window.download_channel_busy()
     window._cancel_download()
@@ -172,7 +188,7 @@ def test_disabled_automatic_check_still_allows_manual_prediction(window, qapp, m
     window.preferences.set_storage_budget(BudgetSettings(enabled=False))
     reached = []
     monkeypatch.setattr(window, "_continue_plan_after_budget", reached.append)
-    window._start_download()
+    start(window, qapp)
     assert reached and window._storage_budget_dialog is None
     window.open_storage_budget()
     until(qapp, lambda: window._storage_budget_dialog.worker is None)

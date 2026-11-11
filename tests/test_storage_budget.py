@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from app.geo import DownloadRegion, GeoBounds
+from app.geo import GeoBounds
 from app.geo.region_estimator import ZoomRegionStats
 from app.mbtiles import MBTilesMetadata, MBTilesWriter
 from app.models import MapType
@@ -15,12 +15,13 @@ from app.planning.storage_budget import (
     BudgetSettings,
     assess_budget,
 )
+from tests.region_helpers import polygon_region
 
 BOUNDS = GeoBounds(116.2, 39.7, 116.6, 40.1)
 
 
 def request(work_dir, *, mode=MapType.VECTOR, labels=True, counts=((12, 100),), resume=True):
-    return BudgetInput("map", "测试地图", DownloadRegion.rectangle("测试", BOUNDS),
+    return BudgetInput("map", "测试地图", polygon_region("测试", BOUNDS),
                        min(z for z, _ in counts), max(z for z, _ in counts),
                        work_dir / "target.mbtiles", mode, labels,
                        tuple(ZoomRegionStats(z, n, n, 0) for z, n in counts), resume)

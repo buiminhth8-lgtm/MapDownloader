@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from app.geo import RegionType
+from app.geo import GeoBounds, RegionType
 from app.planning import RegionLevel
 from app.tasks import TaskService, TaskStore
 from app.ui.download_panel import DownloadPanel
@@ -240,38 +240,35 @@ def _select(panel: DownloadPanel, country=None, province=None, city=None) -> Non
 
 
 # --------------------------------------------------------------------------- #
-# 初值：矩形模式与 Slice ≤18 一模一样（Spec §7）
+# 初值：面板打开就是行政区域（自定义矩形已移除）
 # --------------------------------------------------------------------------- #
-def test_rectangle_mode_is_unchanged(panel: DownloadPanel) -> None:
-    assert panel.current_region_type() is RegionType.RECTANGLE
-    assert panel.current_region_level() is RegionLevel.CUSTOM
-    assert panel.current_region_id() is None
-    assert panel.zoom_mode is ZoomMode.RECOMMENDED, "模式本身有默认值……"
-    assert panel._min_zoom_spin.isReadOnly() is False, "……但矩形模式下不生效"
-    assert panel._max_zoom_spin.value() > panel._min_zoom_spin.value()
+def test_default_mode_is_administrative(panel: DownloadPanel) -> None:
+    """打开面板只可能是行政区域：级联可见、默认选中目录里的第一个国家。"""
+    assert panel.current_region_type() is RegionType.POLYGON
+    assert panel.current_region_level() is RegionLevel.COUNTRY
+    assert panel.current_region_id() == "demoland"
+    assert panel.zoom_mode is ZoomMode.RECOMMENDED
 
-    for widget in panel._polygon_only_widgets():
-        assert widget.isHidden() is True, f"{widget} 在矩形模式下必须收起"
+    for widget in (
+        panel.country_combo,
+        panel.province_combo,
+        panel.city_combo,
+        panel.county_combo,
+        panel.level_label,
+        panel.bounds_hint_label,
+    ):
+        assert widget.isHidden() is False, f"{widget} 必须可见"
 
-
-def test_rectangle_mode_does_not_apply_any_level_policy(panel: DownloadPanel) -> None:
-    """Spec §7：不强制使用国家 / 省 / 市的推荐策略。"""
-    panel.set_zoom_range(8, 17)
-    panel.set_region_type(RegionType.RECTANGLE)
-
-    assert (panel._min_zoom_spin.value(), panel._max_zoom_spin.value()) == (8, 17)
-    assert panel.zoom_policy_text == ""
+    # 没有任何手填经纬度的控件
+    assert not hasattr(panel, "_west_spin")
+    assert not hasattr(panel, "_north_spin")
 
 
 # --------------------------------------------------------------------------- #
-# 切到行政区域：级联出现 + 推荐值自动填入（Spec §1 / §4）
+# 行政区域：级联出现 + 推荐值自动填入（Spec §1 / §4）
 # --------------------------------------------------------------------------- #
 def test_polygon_mode_shows_the_cascade(panel: DownloadPanel) -> None:
-    panel.set_region_type(RegionType.POLYGON)
-
     assert panel.country_combo.itemData(0).id == "demoland"  # type: ignore[union-attr]
-    for widget in panel._polygon_only_widgets():
-        assert widget.isHidden() is False
 
     assert panel.current_region_level() is RegionLevel.COUNTRY
     # 「下载级别」是**推导**出来的（Spec §2）：等级中文名 + 面包屑，都来自目录
@@ -280,7 +277,6 @@ def test_polygon_mode_shows_the_cascade(panel: DownloadPanel) -> None:
 
 def test_recommended_zoom_is_applied_and_readonly(panel: DownloadPanel) -> None:
     """Spec §4：推荐模式下 Min/Max 自动更新为推荐值。"""
-    panel.set_region_type(RegionType.POLYGON)
     expected = panel.region_controller.recommended_range
     assert expected is not None
 
@@ -302,7 +298,6 @@ def test_zoom_follows_the_level(
     panel: DownloadPanel, region_id: str, level: RegionLevel
 ) -> None:
     """选不同的级别 → 推荐值与界面文案都跟着换（值来自策略表）。"""
-    panel.set_region_type(RegionType.POLYGON)
     assert panel.set_region_id(region_id) is True
 
     recommendation = panel.region_controller.recommendation(
@@ -324,7 +319,6 @@ def test_zoom_follows_the_level(
 
 def test_switching_region_reapplies_the_recommendation(panel: DownloadPanel) -> None:
     """Spec §4：区域切换后重新应用对应推荐。"""
-    panel.set_region_type(RegionType.POLYGON)
     country_range = panel.region_controller.recommended_range
 
     assert panel.set_region_id("rivertown") is True
@@ -337,7 +331,6 @@ def test_switching_region_reapplies_the_recommendation(panel: DownloadPanel) -> 
 # 级联刷新（Spec §2）
 # --------------------------------------------------------------------------- #
 def test_cascade_refreshes_provinces_and_cities(panel: DownloadPanel) -> None:
-    panel.set_region_type(RegionType.POLYGON)
 
     _select(panel, province="northland")
     north = [
@@ -357,7 +350,6 @@ def test_cascade_refreshes_provinces_and_cities(panel: DownloadPanel) -> None:
 
 def test_unlimited_city_falls_back_to_the_province(panel: DownloadPanel) -> None:
     """Spec §2：选了省但没选市 → PROVINCE。"""
-    panel.set_region_type(RegionType.POLYGON)
     _select(panel, province="northland")
 
     panel.city_combo.setCurrentIndex(0)  # 「全部（不限定城市）」
@@ -366,7 +358,6 @@ def test_unlimited_city_falls_back_to_the_province(panel: DownloadPanel) -> None
 
 
 def test_all_three_levels_reach_the_city(panel: DownloadPanel) -> None:
-    panel.set_region_type(RegionType.POLYGON)
     _select(panel, province="northland", city="rivertown")
 
     assert panel.current_region_id() == "rivertown"
@@ -391,7 +382,6 @@ def test_set_region_id_fills_the_whole_cascade(panel: DownloadPanel) -> None:
 # --------------------------------------------------------------------------- #
 def test_switching_to_custom_keeps_the_current_values(panel: DownloadPanel) -> None:
     """Spec §6：推荐 → 自定义，保留当前 Min/Max 作为初始值。"""
-    panel.set_region_type(RegionType.POLYGON)
     before = (panel._min_zoom_spin.value(), panel._max_zoom_spin.value())
 
     panel.zoom_mode_buttons[1].click()
@@ -404,7 +394,6 @@ def test_switching_to_custom_keeps_the_current_values(panel: DownloadPanel) -> N
 
 def test_switching_back_to_recommended_reapplies(panel: DownloadPanel) -> None:
     """Spec §6：自定义 → 推荐，重新应用当前 Region 的推荐 Zoom。"""
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(8, 18)
     assert (panel._min_zoom_spin.value(), panel._max_zoom_spin.value()) == (8, 18)
 
@@ -418,7 +407,6 @@ def test_switching_back_to_recommended_reapplies(panel: DownloadPanel) -> None:
 
 def test_custom_warning_never_touches_the_user_values(panel: DownloadPanel) -> None:
     """中国 + Z8~18：只出警告，值一个都不改（Spec §5）。"""
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(8, 18)
 
     assert "警告：" in panel.zoom_policy_text
@@ -433,7 +421,6 @@ def test_custom_warning_never_touches_the_user_values(panel: DownloadPanel) -> N
 def test_set_zoom_range_switches_to_custom(panel: DownloadPanel) -> None:
     """``set_zoom_range`` 的语义是"这就是我要用的两个数" → 必须切到自定义，
     否则下一次区域变化会把它们**悄悄**换成推荐值。"""
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(10, 12)
 
     assert panel.zoom_mode is ZoomMode.CUSTOM
@@ -442,7 +429,6 @@ def test_set_zoom_range_switches_to_custom(panel: DownloadPanel) -> None:
 
 
 def test_zoom_mode_radios_are_mutually_exclusive(panel: DownloadPanel) -> None:
-    panel.set_region_type(RegionType.POLYGON)
 
     panel.zoom_mode_buttons[0].click()
     assert panel.zoom_mode_buttons[0].isChecked() is True
@@ -458,7 +444,6 @@ def test_inverted_custom_range_shows_a_message_instead_of_raising(
     panel: DownloadPanel,
 ) -> None:
     """Min > Max：显示一句人话，不抛异常（抛了会被 Qt 槽静默吞掉）。"""
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_zoom_range(18, 4)
 
     assert "Zoom 策略不可用" in panel.zoom_policy_text
@@ -478,7 +463,6 @@ def test_polygon_estimate_uses_the_selected_tiles(window_factory, qapp) -> None:
 
     window = window_factory()
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
     panel.set_zoom_range(10, 10)
     panel.action_buttons[ACTION_CALCULATE].click()
@@ -495,17 +479,10 @@ def test_polygon_estimate_uses_the_selected_tiles(window_factory, qapp) -> None:
 
 
 def test_bounds_come_from_the_geojson(panel: DownloadPanel) -> None:
-    """Spec §8：只读框里是 GeoJSON 的真实外包矩形。"""
-    panel.set_region_type(RegionType.POLYGON)
+    """Spec §8：候选范围就是 GeoJSON 的真实外包矩形（按 6 位小数取值）。"""
     panel.set_region_id("rivertown")
 
-    assert panel._west_spin.isReadOnly() is True
-    assert (
-        panel._west_spin.value(),
-        panel._south_spin.value(),
-        panel._east_spin.value(),
-        panel._north_spin.value(),
-    ) == (110.0, 33.0, 111.0, 34.0)
+    assert panel.current_bounds() == GeoBounds(110.0, 33.0, 111.0, 34.0)
     assert "110.0000" in panel.bounds_hint_label.text()
 
 
@@ -526,7 +503,6 @@ def test_download_region_bounds_are_the_ones_on_screen(panel: DownloadPanel) -> 
     """
     import json
 
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
 
     # 夹具里那条边是 ``110.0``（正好 6 位小数以内）—— 不改成带更多位小数的坐标，
@@ -564,7 +540,6 @@ def test_missing_boundary_keeps_the_polygon_mode(window_factory, monkeypatch) ->
         window, "_show_error_dialog", lambda title, message: dropped.append((title, message))
     )
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
     panel.region_controller.service.root.joinpath("city", "rivertown.geojson").unlink()
     panel.reload_region_boundary()
@@ -620,7 +595,7 @@ def test_unknown_region_falls_back_to_the_surviving_ancestor(
     assert panel.current_region_id() == "northland"
 
 
-def test_completely_unknown_region_falls_back_to_rectangle(
+def test_completely_unknown_region_keeps_the_default(
     window_factory, preferences
 ) -> None:
     preferences.set_region_selection(
@@ -634,12 +609,15 @@ def test_completely_unknown_region_falls_back_to_rectangle(
 
     panel = window_factory().download_panel
 
-    assert panel.current_region_type() is RegionType.RECTANGLE
-    assert panel.current_region_id() is None
+    # 一个都不认识 → 不动面板，保留默认的"第一个国家 + 不限定省/市"
+    assert panel.current_region_type() is RegionType.POLYGON
+    assert panel.current_region_id() == "demoland"
 
 
 def test_no_stored_selection_keeps_the_default(window_factory, preferences) -> None:
-    assert window_factory().download_panel.current_region_type() is RegionType.RECTANGLE
+    panel = window_factory().download_panel
+    assert panel.current_region_type() is RegionType.POLYGON
+    assert panel.current_region_id() == "demoland"
 
 
 def test_preferences_round_trip(window_factory, preferences) -> None:
@@ -835,116 +813,102 @@ def test_county_under_a_province_survives_restart(
 
 
 # --------------------------------------------------------------------------- #
-# Slice 30：两条"要下哪块地"互斥
-#
-# 「自定义矩形」与「行政区域」本来就在同一个下拉里二选一，但界面上两组控件
-# 曾经**同时存在**：选了行政区，四个经纬度框还在（只读、被边界文件回填），
-# 看不见"这到底是选区域还是填范围"。这里守的是"选了这边就没有那边"，
-# 以及更隐蔽的一半 —— 切换模式时两边的值不许互相污染。
+# 界面形态：只有行政区域，没有手填范围
 # --------------------------------------------------------------------------- #
-def test_polygon_mode_has_no_manual_bounds_row(panel: DownloadPanel) -> None:
-    """选行政区域 → 没有边界范围输入：四个手填框连同标签整行收起。
+def test_panel_has_no_manual_bounds_controls(panel: DownloadPanel) -> None:
+    """界面上没有经纬度输入框，只有一行只读的「区域范围」。
 
     ``isVisibleTo(panel)`` 而不是 ``isVisible()``：裸面板没有 ``show()``，
     后者一律返回 ``False``（假绿）。前者问的是"面板显示出来时它会不会显示"。
     """
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
 
-    assert [spin.isVisibleTo(panel) for spin in panel.bounds_spins] == [False] * 4
+    # 手填控件整个被移除（不是隐藏）：属性都不存在
+    assert not hasattr(panel, "_west_spin")
+    assert not hasattr(panel, "_south_spin")
+    assert not hasattr(panel, "_east_spin")
+    assert not hasattr(panel, "_north_spin")
     # 取而代之的是那一行只读的范围（它才是"这块地有多大"的显示）
     assert panel.bounds_hint_label.isVisibleTo(panel) is True
-    # 值仍然被回填：`get_form_data()` / `current_region()` 读的还是这四个框，
-    # "收起"不等于"失效"
     assert panel.current_bounds().west == 110.0
-
-
-def test_rectangle_mode_has_no_region_rows(panel: DownloadPanel) -> None:
-    """反过来：自定义矩形模式下四级级联与「区域范围」行全部收起。"""
-    assert panel.current_region_type() is RegionType.RECTANGLE
-
-    for widget in (
-        panel.country_combo,
-        panel.province_combo,
-        panel.city_combo,
-        panel.county_combo,
-        panel.level_label,
-        panel.bounds_hint_label,
-    ):
-        assert widget.isVisibleTo(panel) is False
-    assert [spin.isVisibleTo(panel) for spin in panel.bounds_spins] == [True] * 4
-
-
-def test_switching_to_rectangle_drops_the_selected_region(panel: DownloadPanel) -> None:
-    """选了边界范围就意味着**没有**行政区域：选择本身被清掉，不是只藏起来。
-
-    这条用 ``region_controller`` 断言而不是看界面：藏起来的控件照样有值，
-    而"还留着上次那个市"正是切回来时会骗人的地方。
-    """
-    panel.set_region_type(RegionType.POLYGON)
-    panel.set_region_id("rivertown")
-    assert panel.current_region_id() == "rivertown"
-
-    panel.set_region_type(RegionType.RECTANGLE)
-
-    assert panel.current_region_id() is None
-    assert panel.current_region_level() is RegionLevel.CUSTOM
-    # 四级级联真的清空了 —— 停在"国家 = 中国、其余全部"（与刚打开界面一致），
-    # 而不是继续挂着刚才那个市。清空≠空白：`_fill_country_combo` 的既有行为是
-    # 目录里只有一个国家时自动选中它。
-    controller = panel.region_controller
-    assert (controller.province, controller.city, controller.county) == (None, None, None)
-    assert controller.level is RegionLevel.COUNTRY
 
 
 def test_region_extent_row_says_it_is_derived(panel: DownloadPanel) -> None:
     """那行范围必须自报家门是**算出来的**，否则它看起来还是"边界范围输入"。"""
-    panel.set_region_type(RegionType.POLYGON)
     panel.set_region_id("rivertown")
 
     text = panel.bounds_hint_label.text()
     assert "110.0000" in text and "111.0000" in text
     assert "由行政区边界决定" in text
-    assert "不可编辑" in text
 
 
-def test_switching_modes_never_carries_bounds_across(panel: DownloadPanel) -> None:
-    """两边的值互不污染：矩形填的数不会被行政区外包矩形顶掉。
-
-    这是"互斥"里最容易漏的一半 —— 只清控件可见性的话，切回来的四个框里躺着的是
-    上一个行政区的外包矩形，用户会以为"我上次填的就是这个"。
-    """
-    panel._west_spin.setValue(100.0)
-    panel._south_spin.setValue(20.0)
-    panel._east_spin.setValue(101.0)
-    panel._north_spin.setValue(21.0)
-    assert panel.manual_bounds == (100.0, 20.0, 101.0, 21.0)
-
-    panel.set_region_type(RegionType.POLYGON)
-    panel.set_region_id("rivertown")
-    assert panel.current_bounds().west == 110.0, "行政区域模式下由边界文件回填"
-
-    panel.set_region_type(RegionType.RECTANGLE)
-    assert (
-        panel._west_spin.value(),
-        panel._south_spin.value(),
-        panel._east_spin.value(),
-        panel._north_spin.value(),
-    ) == (100.0, 20.0, 101.0, 21.0)
+# --------------------------------------------------------------------------- #
+# 切省不该"重造一遍界面"（卡顿回归）
+# --------------------------------------------------------------------------- #
+def _combo_index(combo, region_id: str) -> int:
+    """按 id 找下拉里的一条；找不到直接失败（不许静默跳过）。"""
+    for index in range(combo.count()):
+        data = combo.itemData(index)
+        if data is not None and data.id == region_id:
+            return index
+    raise AssertionError(f"下拉里没有 {region_id}：{combo.count()} 条")
 
 
-def test_rectangle_restores_the_defaults_when_the_user_never_typed(
-    qapp, region_resources
+def test_selecting_a_province_does_not_rebuild_the_province_combo(
+    panel: DownloadPanel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """用户从没填过矩形 → 切回矩形拿到的是默认的北京那一小块，不是上次那个区。"""
-    fresh = DownloadPanel()
-    fresh.set_region_type(RegionType.POLYGON)
-    fresh.set_region_id("rivertown")
-    fresh.set_region_type(RegionType.RECTANGLE)
+    """点一个省，**省份列表一条都不该重加** —— 它根本没变。
 
-    assert (
-        fresh._west_spin.value(),
-        fresh._south_spin.value(),
-        fresh._east_spin.value(),
-        fresh._north_spin.value(),
-    ) == (116.0, 39.0, 117.0, 40.0)
+    旧实现每次级联刷新都把三个下拉整体清空重填。清空会把当前项打成 -1 再打
+    回来，于是每次"点省份"都白重走一遍"选中项变了 → 重新加载边界"；条目多的
+    机器上（本机会员数据 34 省 / 3253 条区域）这就是肉眼可见的停顿。这里量的是
+    **调用次数**而不是耗时：耗时断言在快机器上永远绿、在慢机器上随机红。
+    """
+    touched: list[object] = []
+    original = panel._add_entry
+
+    def counting(combo, entry, ready):
+        touched.append(combo)
+        return original(combo, entry, ready)
+
+    monkeypatch.setattr(panel, "_add_entry", counting)
+    panel._province_combo.setCurrentIndex(_combo_index(panel._province_combo, "northland"))
+
+    rebuilt = sum(1 for item in touched if item is panel._province_combo)
+    assert panel._province_combo not in touched, (
+        f"省份列表没变，不该清空重填（{rebuilt} 次 addItem）"
+    )
+    # 反面证据：市下拉的条目**真的**变了（北省下有两个市），该重建还得重建
+    assert touched, "市下拉应该被重建 —— 否则这条用例只是在测'什么都不做'"
+
+
+def test_filling_the_cascade_asks_for_availability_in_batches(
+    panel: DownloadPanel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """填级联只许问**批量**接口；单条 ``boundary_available`` 最多问一次。
+
+    旧实现是反过来的：``_add_entry`` 给下拉里**每一条**都单独问一次
+    ``boundary_available``，而单条版为了一次存在性判断要解析两次真实路径
+    （``Path.resolve`` → Windows 上 ``nt._getfinalpathname``）。真实目录一个省
+    上百个县，磁盘一慢就是秒级 —— 这条用例把"逐条问"钉死。
+
+    为什么补丁打在 ``boundary_available`` 而不是 ``resolve_region_path``：后者
+    在 ``app.regions.models`` 里被直接绑定，补在 ``app.geo.region`` 上拦不住
+    （第一版就踩了，计数恒为 0，白绿）。这里守的是**调用方式**，不依赖实现放在
+    哪一层。
+    """
+    service = panel._controller.service
+    single: list[str] = []
+    real_single = type(service).boundary_available
+
+    def counting_single(self, region_id):
+        single.append(region_id)
+        return real_single(self, region_id)
+
+    monkeypatch.setattr(type(service), "boundary_available", counting_single)
+    single.clear()
+
+    panel.set_region_id("rivertown")
+
+    # 只剩"当前选中的那一份"需要单条确认（面板据此决定要不要读边界文件）
+    assert len(single) <= 1, f"填一次级联不该逐条问：{single}"

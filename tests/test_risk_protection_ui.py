@@ -32,7 +32,6 @@ from PySide6.QtWidgets import QMessageBox
 
 import app.ui.main_window as main_window_module
 from app.config.settings import DANGEROUS_CONFIRM_WORD
-from app.geo import RegionType
 from app.geo.region_estimator import ZoomRegionStats
 from app.geo.tile_math import estimate_size_bytes, format_size, format_tile_count
 from app.planning.download_risk_analyzer import DownloadRiskAnalyzer
@@ -106,19 +105,36 @@ def _flush(qapp, rounds: int = 4) -> None:
     qapp.processEvents()
 
 
-def _fill_small_rectangle(window: MainWindow, work_dir: Path) -> None:
-    """一个 0.1°×0.1° / Z12 的小矩形（**6 张**瓦片，纯算术、不枚举）。
+def _calculate(window: MainWindow, qapp) -> None:
+    """点「计算」并等后台估算收尾。
 
-    矩形区域是 CUSTOM 等级（不套用等级建议），因此这条夹具天然覆盖
-    "自定义区域没有推荐区间"的那条分支；需要推荐区间的用例走
-    :func:`_city_report`。
+    区域裁剪（``PolygonTileRegionFilter``）现在一律在后台线程里跑：点完按钮
+    立刻断言 ``_last_risk`` 会读到 ``None``，因为主线程还没收到 ``estimated``
+    信号。这里把事件循环推到估算线程退出为止，等价于用户"等一下看到数字"。
+    """
+    import time
+
+    window.download_panel.action_buttons[ACTION_CALCULATE].click()
+    _flush(qapp)
+    deadline = time.monotonic() + 10
+    while window._estimate_worker is not None:
+        assert time.monotonic() < deadline, "后台区域估算没有及时结束"
+        qapp.processEvents()
+        time.sleep(0.002)
+    _flush(qapp)
+
+
+def _fill_small_region(window: MainWindow, work_dir: Path) -> None:
+    """选一块小行政区（1°×1° 的示例河市，Z12 约一百多张瓦片）。
+
+    下载范围只剩行政区域之后，这里不再填经纬度——候选范围由边界文件算出来，
+    界面上没有可编辑的输入框了。"没有推荐区间"那条分支（自定义等级）改由
+    ``test_the_apply_button_is_grey_without_a_recommendation`` 直接构造
+    ``RegionLevel.CUSTOM`` 报告来覆盖，不再依赖一块假的矩形区域。
     """
     panel = window.download_panel
     panel._token_edit.setText(FAKE_TOKEN)
-    panel._west_spin.setValue(116.0)
-    panel._south_spin.setValue(39.0)
-    panel._east_spin.setValue(116.1)
-    panel._north_spin.setValue(39.1)
+    panel.set_region_id("rivertown")
     panel._min_zoom_spin.setValue(12)
     panel._max_zoom_spin.setValue(12)
     panel._output_edit.setText(str(work_dir))
@@ -226,9 +242,8 @@ def test_the_panel_shows_the_risk_right_after_calculating(
     window: MainWindow, work_dir: Path, qapp, error_dialogs
 ) -> None:
     """「计算」之后风险提示立刻出来（不必等到点「开始下载」）。"""
-    _fill_small_rectangle(window, work_dir)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    _flush(qapp)
+    _fill_small_region(window, work_dir)
+    _calculate(window, qapp)
 
     report = window._last_risk
     assert report is not None
@@ -243,13 +258,12 @@ def test_the_panel_shows_the_risk_right_after_calculating(
 def test_switching_the_region_throws_the_risk_away(
     window: MainWindow, work_dir: Path, qapp, error_dialogs
 ) -> None:
-    """旧结论不能配新配置：换区域类型 → 风险区立刻收起（Spec §16 的同一规则）。"""
-    _fill_small_rectangle(window, work_dir)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    _flush(qapp)
+    """旧结论不能配新配置：换行政区 → 风险区立刻收起（Spec §16 的同一规则）。"""
+    _fill_small_region(window, work_dir)
+    _calculate(window, qapp)
     assert window.download_panel.risk_group().isHidden() is False
 
-    assert window.download_panel.set_region_type(RegionType.POLYGON) is True
+    window.download_panel.set_region_id("hilltown")
     _flush(qapp)
 
     assert window._last_risk is None
@@ -299,9 +313,8 @@ def test_the_details_entry_reuses_one_dialog_and_follows_the_new_report(
     window: MainWindow, work_dir: Path, qapp, error_dialogs
 ) -> None:
     """详情窗口由面板按钮打开，结论换了就地换成新报告（不留旧数字）。"""
-    _fill_small_rectangle(window, work_dir)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    _flush(qapp)
+    _fill_small_region(window, work_dir)
+    _calculate(window, qapp)
 
     window.download_panel.risk_buttons()[ACTION_RISK_DETAILS].click()
     _flush(qapp)
@@ -317,8 +330,7 @@ def test_the_details_entry_reuses_one_dialog_and_follows_the_new_report(
     # 重新计算（换了 Zoom）之后再打开：窗口里的报告必须跟着换
     window.download_panel._max_zoom_spin.setValue(13)
     window._last_risk = None
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    _flush(qapp)
+    _calculate(window, qapp)
     window.download_panel.risk_buttons()[ACTION_RISK_DETAILS].click()
     _flush(qapp)
     assert window._risk_dialog.report is window._last_risk
@@ -368,7 +380,7 @@ def test_a_normal_task_starts_without_asking(
     launched: list[object] = []
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -385,7 +397,7 @@ def test_a_large_task_asks_once_before_starting(
     launched: list[object] = []
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -409,7 +421,7 @@ def test_a_very_large_task_is_a_warning_not_a_question(
 ) -> None:
     """``VERY_LARGE``：图标与标题都要变成"警告"（Spec §12 分了三档）。"""
     _report_at(RiskLevel.VERY_LARGE, monkeypatch, window)
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -437,7 +449,7 @@ def test_only_one_gate_fires_per_task(
     launched: list[object] = []
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -459,7 +471,7 @@ def test_a_dangerous_task_needs_the_confirmation_word(
     launched: list[object] = []
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -494,7 +506,7 @@ def test_a_dangerous_task_rejected_never_starts(
     launched: list[object] = []
     monkeypatch.setattr(window, "_launch_download", launched.append)
 
-    _fill_small_rectangle(window, work_dir)
+    _fill_small_region(window, work_dir)
     window.download_panel.action_buttons[ACTION_START].click()
     _flush(qapp)
 
@@ -520,9 +532,8 @@ def test_a_real_strict_policy_reaches_the_strong_confirmation(
     上面几条用例注入的是"指定等级的报告"，它们证明不了"真分析器算出来的等级
     也能触发强确认"。这条从 ``_run_tile_math`` 开始，一路到强确认窗口。
     """
-    _fill_small_rectangle(window, work_dir)
-    window.download_panel.action_buttons[ACTION_CALCULATE].click()
-    _flush(qapp)
+    _fill_small_region(window, work_dir)
+    _calculate(window, qapp)
 
     report = window._last_risk
     assert report is not None

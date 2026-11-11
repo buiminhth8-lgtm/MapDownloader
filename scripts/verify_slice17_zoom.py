@@ -224,47 +224,32 @@ def _plan(region, level, *, min_zoom: int | None = None, max_zoom: int | None = 
 
 
 # --------------------------------------------------------------------------- #
-# 场景 A：自定义矩形（老行为）
+# 场景 A：界面上没有自定义矩形（本版本只剩行政区域）
 # --------------------------------------------------------------------------- #
-def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
-    checker.section("场景 A：自定义矩形（没有行政等级）→ 建议行整行收起")
-    from app.geo import RegionType
-    from app.planning import RegionLevel
-    from app.ui.download_panel import ACTION_CALCULATE
-
+def scene_no_rectangle_baseline(app, window, checker: Checker, shots: bool) -> None:
+    checker.section("场景 A：没有自定义矩形入口 → Zoom 建议只看行政等级")
     panel = window.download_panel
-    panel.set_region_type(RegionType.RECTANGLE)
-    _pump(app)
 
     checker.check(
-        panel.current_region_level() is RegionLevel.CUSTOM,
-        "矩形模式的等级是 CUSTOM（不套用行政等级规则）",
-        panel.current_region_level().value,
+        not hasattr(panel, "set_region_type"),
+        "面板上没有「区域类型」切换（自定义矩形已删除）",
     )
     checker.check(
-        panel.zoom_hint_label.isHidden() is True
-        and panel.zoom_hint_title.isHidden() is True,
-        "「Zoom 建议」整行收起（不留一句恒定不变的空话）",
+        panel.current_region_type().value == "polygon",
+        "区域类型恒为 polygon",
+        panel.current_region_type().value,
     )
-    checker.check(panel.zoom_policy_text == "", "建议行文本为空", repr(panel.zoom_policy_text))
 
-    # 老行为：矩形模式下点「计算」照旧
+    # 老行为：改 Zoom 就是改 Zoom，界面不许自己改回去（Spec §10 的"只提醒不改写"）
     panel.set_zoom_range(8, 17)
-    panel.action_buttons[ACTION_CALCULATE].click()
-    wait_for_region_estimate(app, window)
     _pump(app)
     form = panel.get_form_data()
     checker.check(
         (form["min_zoom"], form["max_zoom"]) == (8, 17),
-        "矩形模式点「计算」不改 Zoom",
+        "界面上改的 Zoom 没有被任何模式逻辑改写",
         f"{form['min_zoom']}~{form['max_zoom']}",
     )
-    checker.check(
-        "预计瓦片" in panel.result_label.text(),
-        "矩形预估照旧（Slice 16 行为无回归）",
-        panel.result_label.text().splitlines()[:1],
-    )
-    _shot(window, "slice17_zoom_rectangle_baseline.png", shots)
+    _shot(window, "slice17_zoom_no_rectangle.png", shots)
 
 
 # --------------------------------------------------------------------------- #
@@ -272,12 +257,10 @@ def scene_rect_baseline(app, window, checker: Checker, shots: bool) -> None:
 # --------------------------------------------------------------------------- #
 def scene_country_hint(app, window, checker: Checker, shots: bool) -> None:
     checker.section("场景 B：选中中国 Preset → 推荐 Zoom + 非阻塞警告")
-    from app.geo import RegionType
     from app.planning import RegionLevel
     from app.ui.download_panel import ACTION_CALCULATE
 
     panel = window.download_panel
-    panel.set_region_type(RegionType.POLYGON)
     _pump(app)
 
     checker.check(
@@ -354,16 +337,15 @@ def scene_country_hint(app, window, checker: Checker, shots: bool) -> None:
         "计算流程没有把警告清掉（它属于当前选择，不是一次性的）",
     )
 
-    # --- 换回矩形：整行收起 ---
-    panel.set_region_type(RegionType.RECTANGLE)
+    # --- 重新加载边界：建议行按当前等级重算，不是一次性文本 ---
+    panel.reload_region_boundary()
     _pump(app)
     checker.check(
-        panel.zoom_hint_label.isHidden() is True and panel.zoom_policy_text == "",
-        "换回自定义矩形后建议行收起",
+        panel.zoom_hint_label.isHidden() is False
+        and panel.zoom_policy_text.startswith("推荐 Zoom："),
+        "重新加载边界后建议行仍然按当前等级算出来",
         repr(panel.zoom_policy_text),
     )
-    panel.set_region_type(RegionType.POLYGON)
-    _pump(app)
 
 
 # --------------------------------------------------------------------------- #
@@ -652,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
         _pump(app)
 
-        scene_rect_baseline(app, window, checker, shots)
+        scene_no_rectangle_baseline(app, window, checker, shots)
         scene_country_hint(app, window, checker, shots)
         scene_strategy_core(checker)
 

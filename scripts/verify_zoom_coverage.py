@@ -20,7 +20,13 @@ if str(ROOT) not in sys.path:
 from scripts.verify_repair import BROKEN_PNG, TileServer, overwrite_tile, service_for  # noqa: E402
 
 from app.downloader import ResumePolicy  # noqa: E402
-from app.geo import DownloadRegion, GeoBounds, RegionTileEstimator, build_region_filter  # noqa: E402
+from app.geo import (  # noqa: E402
+    DownloadRegion,
+    GeoBounds,
+    RegionTileEstimator,
+    RegionType,
+    build_region_filter,
+)
 from app.geo.zoom_coverage import (  # noqa: E402
     CoverageRule,
     build_coverage,
@@ -33,11 +39,45 @@ from app.services.map_package_service import MapPackageService  # noqa: E402
 from app.services.mbtiles_inspection_service import MBTilesInspectionService  # noqa: E402
 from app.tasks import TaskService, TaskStore  # noqa: E402
 
+#: 验收脚本自己的边界文件目录（每次跑都重写，跨进程不共享状态）
+_REGION_DIR = Path(tempfile.mkdtemp(prefix='zoom-coverage-verify-'))
+
+
+def _rect_region(name: str, bounds: GeoBounds, region_id: str) -> DownloadRegion:
+    """按外包矩形造一块行政区域（现场写一份矩形 GeoJSON）。
+
+    自定义矩形能力（``DownloadRegion.rectangle``）已随界面入口一起删除，而本
+    脚本要的只是"一块不裁掉任何瓦片的范围"——写成多边形是等价做法，而且走的
+    正是生产那条 ``PolygonTileRegionFilter`` 链路，验收更有意义。
+    """
+    _REGION_DIR.mkdir(parents=True, exist_ok=True)
+    path = _REGION_DIR / f'{region_id}.geojson'
+    path.write_text(json.dumps({
+        'type': 'Feature',
+        'properties': {'name': name, 'id': region_id, 'boundaryVersion': '2026.09-verify'},
+        'geometry': {
+            'type': 'Polygon',
+            'coordinates': [[
+                [bounds.west, bounds.south], [bounds.east, bounds.south],
+                [bounds.east, bounds.north], [bounds.west, bounds.north],
+                [bounds.west, bounds.south],
+            ]],
+        },
+    }, ensure_ascii=False), encoding='utf-8')
+    return DownloadRegion(
+        region_type=RegionType.POLYGON,
+        name=name,
+        bounds=bounds,
+        region_id=region_id,
+        boundary_version='2026.09-verify',
+        geojson_path=str(path),
+    )
+
 
 def make_strategy():
-    overview = DownloadRegion.rectangle('overview', GeoBounds(116.0, 39.5, 116.8, 40.1))
-    mission = DownloadRegion.rectangle('mission', GeoBounds(116.2, 39.7, 116.3, 39.8))
-    overlap = DownloadRegion.rectangle('mission-overlap', GeoBounds(116.25, 39.75, 116.35, 39.85))
+    overview = _rect_region('overview', GeoBounds(116.0, 39.5, 116.8, 40.1), 'overview')
+    mission = _rect_region('mission', GeoBounds(116.2, 39.7, 116.3, 39.8), 'mission')
+    overlap = _rect_region('mission-overlap', GeoBounds(116.25, 39.75, 116.35, 39.85), 'overlap')
     return build_coverage('多级覆盖验收', (CoverageRule(overview, 8, 9), CoverageRule(mission, 11, 12),
                                           CoverageRule(overlap, 12, 12)))
 

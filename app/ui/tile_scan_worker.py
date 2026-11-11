@@ -30,7 +30,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from app.geo import DownloadRegion, RegionType
+from app.geo import DownloadRegion
 from app.services import count_existing_region_tiles, count_existing_tiles
 
 __all__ = ["ExistingTileScan", "ExistingTileScanWorker"]
@@ -111,7 +111,7 @@ class ExistingTileScanWorker(QThread):
     @property
     def in_region_only(self) -> bool:
         """是否只统计区域内的瓦片。"""
-        return self._region is not None and self._region.region_type is RegionType.POLYGON
+        return self._region is not None
 
     @property
     def abandoned(self) -> bool:

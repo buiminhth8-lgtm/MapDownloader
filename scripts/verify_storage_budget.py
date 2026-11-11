@@ -11,18 +11,47 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PIL import Image
 
-from app.geo import DownloadRegion, GeoBounds
+from app.geo import DownloadRegion, GeoBounds, RegionType
 from app.geo.region_estimator import ZoomRegionStats
 from app.mbtiles import MBTilesMetadata, MBTilesWriter
 from app.models import MapType
 from app.planning.storage_budget import GIB, BudgetInput, BudgetSettings, assess_budget
 
 
+def _bounds_region(name: str, bounds: GeoBounds, directory: Path) -> DownloadRegion:
+    """按给定范围造一块行政区域（写一份矩形 GeoJSON）。
+
+    自定义矩形已随界面入口删除；这份验收只关心容量预估，范围恰好铺满
+    ``bounds`` 的多边形与旧矩形在数字上完全等价。
+    """
+    import json as _json
+
+    region_id = f"verify-{name}"
+    path = directory / f"{region_id}.geojson"
+    path.write_text(_json.dumps({
+        "type": "Feature",
+        "properties": {"name": name, "id": region_id, "boundaryVersion": "2026.09-verify"},
+        "geometry": {"type": "Polygon", "coordinates": [[
+            [bounds.west, bounds.south], [bounds.east, bounds.south],
+            [bounds.east, bounds.north], [bounds.west, bounds.north],
+            [bounds.west, bounds.south],
+        ]]},
+    }, ensure_ascii=False), encoding="utf-8")
+    return DownloadRegion(
+        region_type=RegionType.POLYGON,
+        name=name,
+        bounds=bounds,
+        region_id=region_id,
+        boundary_version="2026.09-verify",
+        geojson_path=str(path),
+    )
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="budget-acceptance-") as directory:
         root = Path(directory)
         bounds = GeoBounds(116.2, 39.7, 116.6, 40.1)
-        region = DownloadRegion.rectangle("验收区域", bounds)
+        region = _bounds_region("验收区域", bounds, root)
         rng = random.Random(37)
         for mode in (MapType.VECTOR, MapType.IMAGE):
             image = Image.new("RGB", (256, 256), "white") if mode is MapType.VECTOR else Image.frombytes(
